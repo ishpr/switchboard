@@ -81,7 +81,7 @@ export function resolveOrchestratorName(input: string, fallback = "cursor"): str
  * configured repository in ~/.switchboard/repos/*.json.
  */
 export function resolveShimCwd(cwd = process.cwd(), home = switchboardHome()): string {
-  const envCwd = process.env.SWITCHBOARD_CWD?.trim();
+  const envCwd = process.env.SWITCHBOARD_CWD?.trim() || process.env.CLAUDE_PROJECT_DIR?.trim();
   if (envCwd && existsSync(envCwd)) return envCwd;
   const root = gitRepoRoot(cwd);
   if (cwd !== "/" && existsSync(path.join(root, ".git"))) {

@@ -620,3 +620,53 @@ test("orchestrator can be configured independently per repo and reassigned dynam
     await fx.daemon.close();
   }
 });
+
+test("multi-turn reply on the same correlationId routes to the other party and live who inherits registered sessionId", async () => {
+  const fx = await fixture();
+  const registrar = await join(fx, "cli", "repo-a", { harness: "cli" });
+  await registrar.request({
+    type: "register",
+    name: "muse",
+    harness: "muse",
+    cwd: "/work/muse",
+    sessionId: "zellij:switchboard:6",
+    wake: true,
+  });
+  registrar.close();
+
+  const muse = await join(fx, "muse", "repo-a", { harness: "muse" });
+  const agy = await join(fx, "agy", "repo-a", { harness: "antigravity", role: "orchestrator" });
+  try {
+    const who = await agy.request({ type: "who" });
+    assert.equal(who.type, "who");
+    if (who.type === "who") {
+      assert.equal(who.agents.find((a) => a.name === "muse")?.sessionId, "zellij:switchboard:6");
+    }
+
+    // 1. muse asks agy
+    const askReceived = waitForMessage(agy);
+    const askRes = await muse.request({ type: "ask", to: "agy", body: "ready for review?" });
+    assert.equal(askRes.type, "published");
+    const askMsg = await askReceived;
+    assert.equal(askMsg.to, "agy");
+    assert.ok(askMsg.correlationId);
+
+    // 2. agy replies to muse on that correlationId
+    const reply1Received = waitForMessage(muse);
+    await agy.request({ type: "reply", correlationId: askMsg.correlationId!, body: "go ahead and push" });
+    const reply1Msg = await reply1Received;
+    assert.equal(reply1Msg.to, "muse");
+
+    // 3. muse replies back to agy on the SAME correlationId (must route to agy, not muse!)
+    const reply2Received = waitForMessage(agy);
+    await muse.request({ type: "reply", correlationId: askMsg.correlationId!, body: "PR #628 is up" });
+    const reply2Msg = await reply2Received;
+    assert.equal(reply2Msg.fromName, "muse");
+    assert.equal(reply2Msg.to, "agy");
+    assert.equal(reply2Msg.body, "PR #628 is up");
+  } finally {
+    muse.close();
+    agy.close();
+    await fx.daemon.close();
+  }
+});

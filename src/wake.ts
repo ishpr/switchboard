@@ -71,7 +71,11 @@ export function launchFor(input: {
       const zSession = parts[1];
       const zPane = parts[2];
       if (zSession && zPane) {
-        const oneLine = `[switchboard] Message from ${input.message.fromName} (id=${input.message.id}): call bus_inbox and reply with bus_reply.`;
+        const actionHint =
+          input.message.kind === "ask"
+            ? "call bus_inbox and reply with bus_reply."
+            : "call bus_inbox to read it and continue.";
+        const oneLine = `[switchboard] Message from ${input.message.fromName} (id=${input.message.id}): ${actionHint}`;
         return {
           cmd: "sh",
           args: [
