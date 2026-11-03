@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -146,6 +147,13 @@ test("multi-account Claude resolution and isolated environment provisioning are 
     ["acct1", "acct2", "acct3"],
   );
 
+  // 1b. Multiple numbers ("1 3") pick 1-based indexes from the discovered list
+  const pickedByIndex = resolveAccountProfiles("1 3", true, byCount, fakeHome);
+  assert.deepEqual(
+    pickedByIndex.map((p) => p.id),
+    ["acct1", "acct3"],
+  );
+
   // 2. Custom id:email:plan specification
   const custom = resolveAccountProfiles(
     "work:alice@corp.com:team,personal:alice@gmail.com:max",
@@ -159,15 +167,29 @@ test("multi-account Claude resolution and isolated environment provisioning are 
   assert.equal(custom[0]?.plan, "team");
   assert.equal(custom[1]?.id, "personal");
 
-  // 3. Provisioning creates ~/.claude-<id>, symlinks shared config, and injects Switchboard MCP
+  // 3. Provisioning creates ~/.claude-<id>, symlinks shared config, injects Switchboard MCP,
+  //    and attaches a worktree even when branch ws/<id> already exists in the git repo.
+  const fakeRepo = path.join(fakeHome, "sample-repo");
+  mkdirSync(fakeRepo, { recursive: true });
+  execFileSync("git", ["-C", fakeRepo, "init"], { stdio: "ignore" });
+  execFileSync("git", ["-C", fakeRepo, "config", "user.email", "test@example.com"], { stdio: "ignore" });
+  execFileSync("git", ["-C", fakeRepo, "config", "user.name", "Test"], { stdio: "ignore" });
+  writeFileSync(path.join(fakeRepo, "README.md"), "# sample\n");
+  execFileSync("git", ["-C", fakeRepo, "add", "README.md"], { stdio: "ignore" });
+  execFileSync("git", ["-C", fakeRepo, "commit", "-m", "init"], { stdio: "ignore" });
+  execFileSync("git", ["-C", fakeRepo, "branch", "ws/alpha"], { stdio: "ignore" });
+
   const profile = buildAccountProfile("alpha:alpha@example.com:max", [], fakeHome);
-  provisionClaudeAccount(profile, {
+  const { worktreeDir } = provisionClaudeAccount(profile, {
+    targetRepo: fakeRepo,
     cliPath: "/opt/switchboard/dist/cli.js",
     nodePath: "/usr/local/bin/node",
     home: fakeHome,
   });
 
   assert.ok(existsSync(profile.configDir));
+  assert.ok(existsSync(path.join(worktreeDir, "README.md")));
+  assert.equal(worktreeDir, path.join(profile.workspaceRoot, "sample-repo"));
   assert.ok(lstatSync(path.join(profile.configDir, "settings.json")).isSymbolicLink());
   assert.ok(lstatSync(path.join(profile.configDir, "CLAUDE.md")).isSymbolicLink());
 
