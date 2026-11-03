@@ -370,7 +370,27 @@ export function panesFor(
     }
     const foundCmd = choices.find((choice) => choice.id === def.id)?.command;
     if (!def.shell && !foundCmd) continue;
-    out.push(paneFrom(def, resume, foundCmd ?? def.candidates[0] ?? null));
+    const cmd = foundCmd ?? def.candidates[0] ?? null;
+    if (resume && opts.targetRepo && cmd && !def.shell && def.resume.length > 0) {
+      out.push({
+        name: def.pane,
+        command: process.execPath,
+        args: [
+          cliPath,
+          "harness-pane",
+          "--command",
+          cmd,
+          "--args",
+          JSON.stringify(def.args),
+          "--resume-args",
+          JSON.stringify(def.resume),
+          "--cwd",
+          gitRepoRoot(opts.targetRepo),
+        ],
+      });
+      continue;
+    }
+    out.push(paneFrom(def, resume, cmd));
   }
   return out.length > 0 ? out : [{ name: "Bus" }];
 }
@@ -451,7 +471,7 @@ function paneBlock(pane: PaneSpec): string {
   const indent = "                ";
   if (!pane.command) return `${indent}pane name="${pane.name}"`;
   if (!pane.args?.length) return `${indent}pane name="${pane.name}" command="${pane.command}"`;
-  const args = pane.args.map((arg) => `"${arg}"`).join(" ");
+  const args = pane.args.map((arg) => JSON.stringify(arg)).join(" ");
   return `${indent}pane name="${pane.name}" command="${pane.command}" {\n                    args ${args}\n${indent}}`;
 }
 
