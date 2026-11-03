@@ -45,6 +45,13 @@ export type AgentRecord = {
   role: Role;
 };
 
+export type PrunedAgent = {
+  repo: string;
+  name: string;
+  sessionId: string | null;
+  reason: "dead_pane" | "stale";
+};
+
 export type WakeMode = "push" | "inject" | "headless" | "skip";
 
 export type ClientHello = {
@@ -71,6 +78,7 @@ export type ClientFrame =
   | { type: "inbox"; since?: number; topic?: string; limit?: number }
   | { type: "ack"; cursor: number }
   | { type: "who" }
+  | { type: "doctor"; all?: boolean; prune?: boolean }
   | { type: "ask"; to: string; body: string; topic?: string }
   | { type: "reply"; correlationId: string; body: string }
   | { type: "report"; body: string }
@@ -98,6 +106,7 @@ export type ServerFrame =
   | { type: "message"; message: BusMessage }
   | { type: "inbox"; messages: BusMessage[]; cursor: number; more: boolean; pendingAsk?: BusMessage | null }
   | { type: "who"; agents: AgentRecord[] }
+  | { type: "doctor"; agents: AgentRecord[]; pruned: PrunedAgent[] }
   | { type: "orchestrator"; orchestrator: string | null }
   | { type: "registered"; name: string }
   | { type: "error"; error: string };
