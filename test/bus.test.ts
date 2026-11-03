@@ -4,10 +4,10 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { BusClient } from "../src/busClient.ts";
-import { startDaemon, type DaemonHandle } from "../src/daemon.ts";
+import { startDaemon, type DaemonHandle, isLoopback } from "../src/daemon.ts";
+import { formatMessage, hookStdout, shouldSkipHookForPrompt } from "../src/hook.ts";
 import { ensureToken } from "../src/token.ts";
 import type { BusMessage, ClientHello, WakeLaunch } from "../src/types.ts";
-import { isLoopback } from "../src/daemon.ts";
 
 type Fixture = {
   daemon: DaemonHandle;
@@ -667,6 +667,66 @@ test("multi-turn reply on the same correlationId routes to the other party and l
   } finally {
     muse.close();
     agy.close();
+    await fx.daemon.close();
+  }
+});
+
+test("inbox tracks unanswered ask for Stop hook and clears it once bus_reply is sent", async () => {
+  const fx = await fixture();
+  const agy = await join(fx, "agy", "repo-a", { harness: "antigravity", role: "orchestrator" });
+  const eg = await join(fx, "eg", "repo-a", { harness: "claude" });
+  try {
+    // 1. UserPromptSubmit skips consuming inbox when prompt is a [switchboard] wake prompt
+    assert.equal(
+      shouldSkipHookForPrompt("UserPromptSubmit", {
+        prompt: "[switchboard] Message from agy (id=1): call bus_inbox and reply with bus_reply.",
+      }),
+      true,
+    );
+    assert.equal(
+      shouldSkipHookForPrompt("UserPromptSubmit", { prompt: "normal user prompt" }),
+      false,
+    );
+    assert.equal(shouldSkipHookForPrompt("Stop", { stop_hook_active: true }), true);
+
+    // 2. agy sends ask to eg
+    const askRes = await agy.request({ type: "ask", to: "eg", body: "stabilize CI step 6" });
+    assert.equal(askRes.type, "published");
+    if (askRes.type !== "published") return;
+    const cid = askRes.correlationId!;
+
+    // 3. eg polls inbox: receives message with REQUIRED bus_reply footer and pendingAsk
+    const inbox1 = await eg.request({ type: "inbox" });
+    assert.equal(inbox1.type, "inbox");
+    if (inbox1.type !== "inbox") return;
+    const askMsg = inbox1.messages.find((m) => m.kind === "ask");
+    assert.ok(askMsg);
+    const formatted = formatMessage(askMsg);
+    assert.match(formatted, /REQUIRED — when finished, call bus_reply/);
+    assert.ok(inbox1.pendingAsk);
+    assert.equal(inbox1.pendingAsk?.correlationId, cid);
+
+    // 4. Subsequent Stop hook check (empty new messages, but pendingAsk still open) blocks Stop!
+    const inbox2 = await eg.request({ type: "inbox" });
+    assert.equal(inbox2.type, "inbox");
+    if (inbox2.type !== "inbox") return;
+    assert.equal(inbox2.messages.length, 0);
+    assert.equal(inbox2.pendingAsk?.correlationId, cid);
+    const stopOut = JSON.parse(hookStdout("claude", "Stop", [], inbox2.pendingAsk, false));
+    assert.equal(stopOut.decision, "block");
+    assert.match(stopOut.reason, new RegExp(cid));
+    assert.equal(hookStdout("claude", "Stop", [], inbox2.pendingAsk, true), "");
+
+    // 5. Once eg calls bus_reply, pendingAsk is cleared and Stop hook does not block
+    await eg.request({ type: "reply", correlationId: cid, body: "CI step 6 green, PR opened" });
+    const inbox3 = await eg.request({ type: "inbox" });
+    assert.equal(inbox3.type, "inbox");
+    if (inbox3.type !== "inbox") return;
+    assert.equal(inbox3.pendingAsk, null);
+    assert.equal(hookStdout("claude", "Stop", [], inbox3.pendingAsk, false), "");
+  } finally {
+    agy.close();
+    eg.close();
     await fx.daemon.close();
   }
 });

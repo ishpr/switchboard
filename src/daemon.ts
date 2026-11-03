@@ -409,11 +409,14 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     const next = messages.length ? messages[messages.length - 1]!.seq : cursor;
     if (messages.length) store.ack(conn.repo, key, next);
     store.touchAgent(conn.repo, conn.name);
+    const updatedCursor = store.cursor(conn.repo, key);
+    const pendingAsk = store.unansweredAsk(conn.repo, conn.name, updatedCursor);
     send(conn.socket, {
       type: "inbox",
       messages,
-      cursor: store.cursor(conn.repo, key),
+      cursor: updatedCursor,
       more: messages.length === pageSize,
+      pendingAsk,
     });
   }
 

@@ -152,6 +152,33 @@ export class Store {
     return row ? mapMessage(row) : undefined;
   }
 
+  unansweredAsk(
+    repo: string,
+    toName: string,
+    cursor: number,
+    minTs = Date.now() - 30 * 60_000,
+  ): BusMessage | null {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM messages a
+         WHERE a.repo = ? AND a.to_name = ? AND a.kind = 'ask'
+           AND a.seq <= ? AND a.ts >= ?
+           AND a.correlation_id IS NOT NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM messages r
+             WHERE r.repo = a.repo
+               AND (
+                 (r.kind = 'reply' AND r.correlation_id = a.correlation_id)
+                 OR (r.from_name = a.to_name AND r.seq > a.seq AND r.topic != 'presence')
+               )
+           )
+         ORDER BY a.seq DESC
+         LIMIT 1`,
+      )
+      .get(repo, toName, cursor, minTs) as Row | undefined;
+    return row ? mapMessage(row) : null;
+  }
+
   inbox(repo: string, since: number, opts: { topic?: string; to?: string; limit: number }): BusMessage[] {
     const limit = Math.max(1, Math.min(opts.limit, 200));
     const topic = opts.topic ?? null;
