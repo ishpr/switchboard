@@ -154,16 +154,17 @@ export class Store {
 
   inbox(repo: string, since: number, opts: { topic?: string; to?: string; limit: number }): BusMessage[] {
     const limit = Math.max(1, Math.min(opts.limit, 200));
+    const topic = opts.topic ?? null;
     const rows = this.db
       .prepare(
         `SELECT * FROM messages
          WHERE repo = ? AND seq > ?
-           AND (to_name IS NULL OR to_name = ?)
+           AND (to_name IS NULL OR to_name = ? OR (? = 'reports' AND topic = 'reports'))
            AND (? IS NULL OR topic = ?)
          ORDER BY seq ASC
          LIMIT ?`,
       )
-      .all(repo, since, opts.to ?? "", opts.topic ?? null, opts.topic ?? null, limit) as Row[];
+      .all(repo, since, opts.to ?? "", topic, topic, topic, limit) as Row[];
     return rows.map(mapMessage);
   }
 

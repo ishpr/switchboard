@@ -4,10 +4,13 @@ import type { BusMessage } from "./types.ts";
 export function hookStdout(harness: string, event: string, messages: BusMessage[]): string {
   if (messages.length === 0) return "";
   const text = messages.map(formatMessage).join("\n\n");
-  if ((harness === "claude" || harness === "codex") && event === "UserPromptSubmit") {
+  if (
+    (harness === "claude" || harness === "codex") &&
+    (event === "UserPromptSubmit" || event === "SessionStart" || event === "PostToolUse")
+  ) {
     return `${JSON.stringify({
       hookSpecificOutput: {
-        hookEventName: "UserPromptSubmit",
+        hookEventName: event,
         additionalContext: text,
       },
     })}\n`;

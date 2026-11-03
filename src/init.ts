@@ -5,6 +5,62 @@ import path from "node:path";
 import { stdin, stdout } from "node:process";
 import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
+import { parseArgs } from "node:util";
+import { switchboardHome } from "./paths.ts";
+import { gitRepoRoot, repoKey } from "./repo.ts";
+
+export type RepoConfig = {
+  repoKey: string;
+  repoRoot: string;
+  orchestrator: string;
+  panes?: string[];
+  updatedAt: number;
+};
+
+export function repoConfigPath(key: string, home = switchboardHome()): string {
+  return path.join(home, "repos", `${key}.json`);
+}
+
+export function readRepoConfig(cwd: string, home = switchboardHome()): RepoConfig | null {
+  const key = repoKey(cwd);
+  const file = repoConfigPath(key, home);
+  if (!existsSync(file)) return null;
+  try {
+    return JSON.parse(readFileSync(file, "utf8")) as RepoConfig;
+  } catch {
+    return null;
+  }
+}
+
+export function writeRepoConfig(
+  cwd: string,
+  update: { orchestrator?: string; panes?: string[] },
+  home = switchboardHome(),
+): RepoConfig {
+  const key = repoKey(cwd);
+  const root = gitRepoRoot(cwd);
+  const existing = readRepoConfig(cwd, home);
+  const next: RepoConfig = {
+    repoKey: key,
+    repoRoot: root,
+    orchestrator: update.orchestrator ?? existing?.orchestrator ?? "cursor",
+    panes: update.panes ?? existing?.panes,
+    updatedAt: Date.now(),
+  };
+  const dir = path.join(home, "repos");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(repoConfigPath(key, home), `${JSON.stringify(next, null, 2)}\n`);
+  return next;
+}
+
+export function resolveOrchestratorName(input: string, fallback = "cursor"): string {
+  const raw = input.trim().toLowerCase();
+  if (!raw) return fallback;
+  if (raw === "antigravity" || raw === "argon" || raw === "argon4" || raw === "argon-4") return "agy";
+  if (raw === "orchestrator" || raw === "cursor-agent") return "cursor";
+  if (raw === "kimi-cli") return "kimi";
+  return raw;
+}
 
 export const GRID_SESSION = "switchboard";
 
@@ -277,9 +333,21 @@ export function repoRoot(): string {
 }
 
 export function installSwitchboard(
-  opts: { zshrc?: string; layoutDir?: string; repo?: string; fresh?: PaneSpec[]; resume?: PaneSpec[] } = {},
+  opts: {
+    zshrc?: string;
+    layoutDir?: string;
+    repo?: string;
+    targetRepo?: string;
+    orchestrator?: string;
+    panes?: string[];
+    home?: string;
+    fresh?: PaneSpec[];
+    resume?: PaneSpec[];
+  } = {},
 ): string[] {
   const repo = opts.repo ?? repoRoot();
+  const targetRepo = opts.targetRepo ? gitRepoRoot(opts.targetRepo) : repo;
+  const key = repoKey(targetRepo);
   const home = homedir();
   const layoutDir = opts.layoutDir ?? path.join(home, ".config/zellij/layouts");
   const zshrc = opts.zshrc ?? path.join(home, ".zshrc");
@@ -291,10 +359,24 @@ export function installSwitchboard(
   mkdirSync(layoutDir, { recursive: true });
   const layoutPath = path.join(layoutDir, "switchboard.kdl");
   const resumePath = path.join(layoutDir, "switchboard-resume.kdl");
-  writeFileSync(layoutPath, switchboardLayout(repo, fresh));
-  writeFileSync(resumePath, switchboardLayout(repo, resume));
+  writeFileSync(layoutPath, switchboardLayout(targetRepo, fresh));
+  writeFileSync(resumePath, switchboardLayout(targetRepo, resume));
   notes.push(`layout ${layoutPath}`);
   notes.push(`layout ${resumePath}`);
+
+  if (opts.targetRepo) {
+    const repoLayoutPath = path.join(layoutDir, `switchboard-${key}.kdl`);
+    const repoResumePath = path.join(layoutDir, `switchboard-${key}-resume.kdl`);
+    writeFileSync(repoLayoutPath, switchboardLayout(targetRepo, fresh));
+    writeFileSync(repoResumePath, switchboardLayout(targetRepo, resume));
+    notes.push(`repo layout ${repoLayoutPath}`);
+    const cfg = writeRepoConfig(
+      targetRepo,
+      { orchestrator: opts.orchestrator, panes: opts.panes },
+      opts.home ?? switchboardHome(),
+    );
+    notes.push(`repo config ${repoConfigPath(cfg.repoKey, opts.home ?? switchboardHome())} (orchestrator=${cfg.orchestrator})`);
+  }
 
   const current = existsSync(zshrc) ? readFileSync(zshrc, "utf8") : "";
   writeFileSync(zshrc, upsertZshBlock(current, zshLauncher(cli)));
@@ -312,6 +394,8 @@ export function installSwitchboard(
         "SWITCHBOARD_HARNESS=antigravity",
         "--env",
         "SWITCHBOARD_NAME=agy",
+        "--env",
+        "SWITCHBOARD_SCOPE=share",
         "switchboard",
         "--",
         process.execPath,
@@ -353,9 +437,21 @@ async function promptPaneSelection(choices: PaneChoice[]): Promise<string> {
   }
 }
 
-export async function init(): Promise<void> {
+export async function init(
+  onOrchestratorChosen?: (cwd: string, orchestrator: string) => Promise<void>,
+): Promise<void> {
+  const { values } = parseArgs({
+    args: process.argv.slice(3),
+    options: {
+      orchestrator: { type: "string" },
+      panes: { type: "string" },
+      cwd: { type: "string" },
+    },
+  });
+  const targetCwd = values.cwd ? path.resolve(values.cwd) : process.cwd();
+  const existingCfg = readRepoConfig(targetCwd);
   const choices = gridChoices();
-  const answer = await promptPaneSelection(choices);
+  const answer = values.panes !== undefined ? values.panes : await promptPaneSelection(choices);
   let ids = chosenIds(answer, choices);
   if (ids.length === 0) {
     stdout.write("Nothing matched. Using the panes found on this machine.\n");
@@ -364,12 +460,30 @@ export async function init(): Promise<void> {
   for (const choice of choices) {
     if (ids.includes(choice.id) && !choice.found) stdout.write(`skipped ${choice.pane}: not found\n`);
   }
+  const defaultOrch = existingCfg?.orchestrator ?? "cursor";
+  let orchRaw = values.orchestrator;
+  if (orchRaw === undefined && stdin.isTTY) {
+    const rl = createInterface({ input: stdin, output: stdout });
+    try {
+      orchRaw = (await rl.question(`Orchestrator for ${gitRepoRoot(targetCwd)} [${defaultOrch}]: `)).trim();
+    } finally {
+      rl.close();
+    }
+  }
+  const orchestrator = resolveOrchestratorName(orchRaw ?? "", defaultOrch);
   const notes = installSwitchboard({
+    targetRepo: targetCwd,
+    orchestrator,
+    panes: ids,
     fresh: panesFor(ids, false, choices),
     resume: panesFor(ids, true, choices),
   });
+  if (onOrchestratorChosen) {
+    await onOrchestratorChosen(targetCwd, orchestrator);
+  }
   for (const note of notes) stdout.write(`${note}\n`);
   const names = panesFor(ids, false, choices).map((pane) => pane.name);
   stdout.write(`panes ${names.join(", ")}\n`);
+  stdout.write(`orchestrator ${orchestrator}\n`);
   stdout.write("Open a new terminal and run: switchboard\n");
 }

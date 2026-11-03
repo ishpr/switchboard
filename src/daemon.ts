@@ -197,6 +197,9 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         store.touchAgent(conn.repo, conn.name, frame.status);
         send(conn.socket, { type: "ok", detail: "status updated" });
         break;
+      case "orchestrator":
+        setOrchestrator(conn, frame.name);
+        break;
       case "register":
         register(conn, frame);
         break;
@@ -233,15 +236,17 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     conn.topics.add("repo");
     conn.topics.add("presence");
     if (conn.role === "orchestrator") conn.topics.add("reports");
-    store.upsertAgent({
-      repo: conn.repo,
-      name: conn.name,
-      harness: conn.harness,
-      sessionId: conn.sessionBound ? conn.declaredSession : null,
-      cwd: conn.cwd,
-      wake: conn.wake,
-      status: frame.status || "online",
-    });
+    if (conn.harness !== "cli") {
+      store.upsertAgent({
+        repo: conn.repo,
+        name: conn.name,
+        harness: conn.harness,
+        sessionId: conn.sessionBound ? conn.declaredSession : (existing?.sessionId ?? null),
+        cwd: conn.cwd,
+        wake: conn.wake,
+        status: frame.status || existing?.status || "online",
+      });
+    }
     send(conn.socket, {
       type: "welcome",
       agentId: conn.agentId,
@@ -254,11 +259,34 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
   }
 
   function elect(repo: string, name: string, wants: boolean): Role {
-    if (!wants) return "worker";
     const stored = store.getOrchestrator(repo);
-    if (stored && stored !== name) return "worker";
+    if (stored) {
+      return stored === name ? "orchestrator" : "worker";
+    }
+    if (!wants) return "worker";
     store.setOrchestrator(repo, name);
     return "orchestrator";
+  }
+
+  function setOrchestrator(conn: Conn, name?: string): void {
+    if (name !== undefined) {
+      requireName(name);
+      store.setOrchestrator(conn.repo, name);
+      for (const peer of conns) {
+        if (!peer.authed || peer.repo !== conn.repo) continue;
+        if (peer.name === name) {
+          peer.role = "orchestrator";
+          peer.topics.add("reports");
+        } else if (peer.role === "orchestrator") {
+          peer.role = "worker";
+          peer.topics.delete("reports");
+        }
+      }
+    }
+    send(conn.socket, {
+      type: "orchestrator",
+      orchestrator: store.getOrchestrator(conn.repo),
+    });
   }
 
   function announce(conn: Conn, state: "online" | "offline"): void {
@@ -304,6 +332,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       correlationId,
       to: frame.to || null,
     });
+    store.touchAgent(conn.repo, conn.name);
     fanout(message, conn);
     const wake = await wakeFor(conn.repo, message);
     send(conn.socket, {
@@ -371,6 +400,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     });
     const next = messages.length ? messages[messages.length - 1]!.seq : cursor;
     if (messages.length) store.ack(conn.repo, key, next);
+    store.touchAgent(conn.repo, conn.name);
     send(conn.socket, {
       type: "inbox",
       messages,
@@ -460,7 +490,9 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     wake: boolean;
     online: boolean;
   } | null {
-    const live = [...conns].find((conn) => conn.authed && conn.repo === repo && conn.name === name);
+    const live = [...conns].find(
+      (conn) => conn.authed && conn.repo === repo && conn.name === name && conn.harness !== "cli",
+    );
     const row = store.getAgent(repo, name);
     if (!live && !row) return null;
     return {
@@ -474,7 +506,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
 
   function agents(repo: string) {
     const orchestrator = store.getOrchestrator(repo);
-    const live = [...conns].filter((conn) => conn.authed && conn.repo === repo);
+    const live = [...conns].filter((conn) => conn.authed && conn.repo === repo && conn.harness !== "cli");
     const liveNames = new Set(live.map((conn) => conn.name));
     const rows = live.map((conn) => ({
       repo,

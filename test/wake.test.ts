@@ -98,6 +98,10 @@ test("hook stdout matches the harness that can actually attach context", () => {
   assert.equal(claude.hookSpecificOutput.hookEventName, "UserPromptSubmit");
   assert.match(claude.hookSpecificOutput.additionalContext, /look at the test/);
 
+  const claudePost = JSON.parse(hookStdout("claude", "PostToolUse", [message]));
+  assert.equal(claudePost.hookSpecificOutput.hookEventName, "PostToolUse");
+  assert.match(claudePost.hookSpecificOutput.additionalContext, /look at the test/);
+
   const grok = JSON.parse(hookStdout("grok", "Stop", [message]));
   assert.equal(grok.decision, "block");
   assert.match(grok.hookSpecificOutput.additionalContext, /correlation=c1/);

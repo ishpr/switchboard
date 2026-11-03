@@ -1,6 +1,21 @@
 import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import test from "node:test";
-import { chosenIds, gridPlan, harnessPanes, panesFor, switchboardLayout, upsertZshBlock, zshLauncher, type PaneChoice } from "../src/init.ts";
+import {
+  chosenIds,
+  gridPlan,
+  harnessPanes,
+  panesFor,
+  readRepoConfig,
+  resolveOrchestratorName,
+  switchboardLayout,
+  upsertZshBlock,
+  writeRepoConfig,
+  zshLauncher,
+  type PaneChoice,
+} from "../src/init.ts";
 
 test("the grid layout opens every harness in the repo", () => {
   const layout = switchboardLayout("/Users/ishprasad/Switchboard");
@@ -81,4 +96,25 @@ test("the zshrc block is replaced instead of duplicated", () => {
   assert.match(second, /switchboard-resume\.kdl/);
   assert.match(second, /\$1 == --resume/);
   assert.match(second, /^export PATH=old\n/);
+});
+
+test("per-repo config persists different orchestrators for different repos", () => {
+  const home = mkdtempSync(path.join(tmpdir(), "sb-repo-cfg-"));
+  const dirA = mkdtempSync(path.join(tmpdir(), "sb-repo-a-"));
+  const dirB = mkdtempSync(path.join(tmpdir(), "sb-repo-b-"));
+
+  assert.equal(resolveOrchestratorName("argon4"), "agy");
+  assert.equal(resolveOrchestratorName("antigravity"), "agy");
+  assert.equal(resolveOrchestratorName("cursor-agent"), "cursor");
+  assert.equal(resolveOrchestratorName("", "agy"), "agy");
+
+  writeRepoConfig(dirA, { orchestrator: "agy", panes: ["antigravity", "claude"] }, home);
+  writeRepoConfig(dirB, { orchestrator: "cursor", panes: ["orchestrator", "codex"] }, home);
+
+  const cfgA = readRepoConfig(dirA, home);
+  const cfgB = readRepoConfig(dirB, home);
+  assert.equal(cfgA?.orchestrator, "agy");
+  assert.deepEqual(cfgA?.panes, ["antigravity", "claude"]);
+  assert.equal(cfgB?.orchestrator, "cursor");
+  assert.deepEqual(cfgB?.panes, ["orchestrator", "codex"]);
 });
