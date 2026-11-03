@@ -46,3 +46,36 @@ export function repoKey(cwd: string, scope: RepoScope = repoScope()): string {
   const root = gitRepoRoot(cwd, scope);
   return createHash("sha256").update(root).digest("hex").slice(0, 16);
 }
+
+export function gitCheckoutInfo(cwd: string): { branch: string | null; head: string | null } {
+  if (!cwd || cwd === "/") return { branch: null, head: null };
+  let branch: string | null = null;
+  let head: string | null = null;
+  try {
+    branch =
+      execFileSync("git", ["-C", cwd, "symbolic-ref", "--quiet", "--short", "HEAD"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      }).trim() || null;
+  } catch {
+    try {
+      branch =
+        execFileSync("git", ["-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"], {
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "ignore"],
+        }).trim() || null;
+    } catch {
+      branch = null;
+    }
+  }
+  try {
+    head =
+      execFileSync("git", ["-C", cwd, "rev-parse", "--short", "HEAD"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      }).trim() || null;
+  } catch {
+    head = null;
+  }
+  return { branch, head };
+}

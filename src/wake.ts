@@ -7,6 +7,18 @@ import type { BusMessage, WakeInfo, WakeLaunch, WakeMode } from "./types.ts";
 const CODEX_APP_BIN =
   "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex";
 
+export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export const TTY_RE = /^tty:\/dev\/ttys\d+$/;
+
+function isPaneOrTtySession(sessionId?: string | null): boolean {
+  if (!sessionId) return false;
+  return (
+    sessionId.startsWith("zellij:") ||
+    /^(?:tmux:)?%\d+$/.test(sessionId) ||
+    TTY_RE.test(sessionId)
+  );
+}
+
 /**
  * An idle agent is not inside a hook. The only way to start work is the
  * harness CLI: inject into a known session, or spawn a headless one-shot.
@@ -52,9 +64,9 @@ export function decideWake(input: {
 }
 
 function canInject(harness: string, sessionId?: string | null): boolean {
-  if (sessionId?.startsWith("zellij:") || /^(?:tmux:)?%\d+$/.test(sessionId ?? "")) return true;
-  if (harness === "muse") return process.env.SWITCHBOARD_MUSE_INJECT === "1";
-  return harness === "codex";
+  if (isPaneOrTtySession(sessionId)) return true;
+  if (harness === "codex") return UUID_RE.test(sessionId ?? "");
+  return false;
 }
 
 // Pane injection uses the multiplexer session, so a removed agent worktree is safe to bypass.
@@ -107,7 +119,39 @@ export function launchFor(input: {
         };
       }
     }
-    if (input.harness === "codex" && input.sessionId) {
+    const tty = /^tty:(\/dev\/ttys\d+)$/.exec(input.sessionId ?? "");
+    if (tty) {
+      return {
+        completion: "exit",
+        cmd: "osascript",
+        args: [
+          "-e",
+          [
+            "on run argv",
+            "  set targetTty to item 1 of argv",
+            "  set msg to item 2 of argv",
+            '  tell application "Terminal"',
+            "    repeat with w in windows",
+            "      repeat with t in tabs of w",
+            "        if (tty of t as text) is targetTty then",
+            "          do script (ASCII character 21) & msg in t",
+            "          delay 0.25",
+            '          do script "" in t',
+            "          return",
+            "        end if",
+            "      end repeat",
+            "    end repeat",
+            '    error "Terminal tab not found for " & targetTty',
+            "  end tell",
+            "end run",
+          ].join("\n"),
+          tty[1]!,
+          panePromptFor(input.message),
+        ],
+        cwd: paneWakeCwd(input.cwd),
+      };
+    }
+    if (input.harness === "codex" && input.sessionId && UUID_RE.test(input.sessionId)) {
       return {
         completion: "exit",
         cmd: codexBin(),
@@ -122,15 +166,6 @@ export function launchFor(input: {
           input.cwd,
         ],
         cwd: input.cwd,
-      };
-    }
-    if (input.harness === "muse" && input.sessionId && process.env.SWITCHBOARD_MUSE_INJECT === "1") {
-      return {
-        completion: "exit",
-        cmd: "muse",
-        args: ["session-message", "send", "--target", input.sessionId, "--json"],
-        cwd: input.cwd,
-        stdin: prompt,
       };
     }
     return null;
@@ -160,35 +195,38 @@ export function headlessLaunch(
   sessionId: string | null,
   prompt: string,
 ): WakeLaunch | null {
+  const resumableId = sessionId && !isPaneOrTtySession(sessionId) ? sessionId : null;
   switch (harness) {
     case "claude":
       return {
         cmd: "claude",
-        args: sessionId ? ["-p", "--resume", sessionId, prompt] : ["-p", prompt],
+        args: resumableId ? ["-p", "--resume", resumableId, prompt] : ["-p", prompt],
         cwd,
       };
     case "codex":
-      return sessionId
+      return resumableId && UUID_RE.test(resumableId)
         ? {
             cmd: codexBin(),
-            args: ["exec", "resume", sessionId, prompt],
+            args: ["exec", "resume", resumableId, prompt],
             cwd,
           }
         : { cmd: codexBin(), args: ["exec", prompt], cwd };
     case "grok":
-      return sessionId
-        ? { cmd: "grok", args: ["-r", sessionId, "-p", prompt], cwd }
+      return resumableId
+        ? { cmd: "grok", args: ["-r", resumableId, "-p", prompt], cwd }
         : { cmd: "grok", args: ["-p", prompt], cwd };
     case "cursor":
-      return sessionId
-        ? { cmd: "cursor-agent", args: ["-p", "--resume", sessionId, prompt], cwd }
+      return resumableId
+        ? { cmd: "cursor-agent", args: ["-p", "--resume", resumableId, prompt], cwd }
         : { cmd: "cursor-agent", args: ["-p", prompt], cwd };
     case "kimi":
-      return sessionId
-        ? { cmd: kimiBin(), args: ["--print", "--session", sessionId, "-p", prompt], cwd }
+      return resumableId
+        ? { cmd: kimiBin(), args: ["--print", "--session", resumableId, "-p", prompt], cwd }
         : { cmd: kimiBin(), args: ["--print", "-p", prompt], cwd };
     case "muse":
-      return { cmd: "muse", args: ["exec", prompt], cwd };
+      return resumableId && UUID_RE.test(resumableId)
+        ? { cmd: "muse", args: ["exec", "--session-id", resumableId, prompt], cwd }
+        : { cmd: "muse", args: ["exec", prompt], cwd };
     default:
       return null;
   }

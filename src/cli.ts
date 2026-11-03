@@ -335,8 +335,9 @@ async function who(doctor = false): Promise<void> {
       const state = agent.online ? "online" : "offline";
       const wake = agent.wake ? "wake" : "no-wake";
       const session = `${agent.sessionId ? ` session=${agent.sessionId}` : ""}${agent.wakeSessionId && agent.wakeSessionId !== agent.sessionId ? ` wake_session=${agent.wakeSessionId}` : ""} connections=${agent.connectionCount ?? (agent.online ? 1 : 0)}`;
+      const git = agent.branch || agent.head ? ` git=${agent.branch ?? "detached"}@${agent.head ?? "unknown"}` : "";
       process.stdout.write(
-        `${values.all ? `${agent.repo}\t` : ""}${agent.name}\t${agent.harness}\t${state}\t${wake}${session}\t${agent.role}\t${agent.status}\t${formatDiagnostics(agent.diagnostics)}\n`,
+        `${values.all ? `${agent.repo}\t` : ""}${agent.name}\t${agent.harness}\t${state}\t${wake}${session}${git}\t${agent.role}\t${agent.status}\t${formatDiagnostics(agent.diagnostics)}\n`,
       );
     }
     if (values.prune) {
@@ -678,7 +679,7 @@ async function orchestratorCmd(): Promise<void> {
 
 async function agent(): Promise<void> {
   const sub = process.argv[3];
-  if (sub !== "add") throw new Error("usage: switchboard agent add --name <name> --harness <harness> [--session <id>] [--wake | --no-wake]");
+  if (sub !== "add") throw new Error("usage: switchboard agent add --name <name> --harness <harness> [--session <id>] [--wake-session <id>] [--wake | --no-wake]");
   const { values } = parseArgs({
     args: process.argv.slice(4),
     allowNegative: true,
@@ -686,6 +687,7 @@ async function agent(): Promise<void> {
       name: { type: "string" },
       harness: { type: "string" },
       session: { type: "string" },
+      "wake-session": { type: "string" },
       cwd: { type: "string" },
       wake: { type: "boolean", default: true },
     },
@@ -700,6 +702,7 @@ async function agent(): Promise<void> {
       harness: values.harness,
       cwd,
       sessionId: values.session,
+      wakeSessionId: values["wake-session"],
       wake: values.wake ?? true,
     });
     if (frame.type !== "registered") throw new Error("unexpected response");

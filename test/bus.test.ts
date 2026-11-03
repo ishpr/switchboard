@@ -216,12 +216,13 @@ test("offline wake starts the headless CLI, and a bound Codex session is queued"
     assert.equal(again.wake.mode, "skip");
     assert.equal(fx.launches.length, 1);
 
+    const codexThreadId = "01a175cd-251c-7571-abb3-21ea77b5d73d";
     await claude.request({
       type: "register",
       name: "codex",
       harness: "codex",
       cwd: "/work/codex",
-      sessionId: "thread-9",
+      sessionId: codexThreadId,
       wake: true,
     });
     const codex = await claude.request({ type: "ask", to: "codex", body: "in the desktop thread" });
@@ -230,7 +231,7 @@ test("offline wake starts the headless CLI, and a bound Codex session is queued"
     assert.equal(codex.wake.mode, "inject");
     const launch = fx.launches.at(-1);
     assert.ok(launch);
-    assert.ok(launch.args.includes("thread-9"));
+    assert.ok(launch.args.includes(codexThreadId));
     assert.ok(launch.args.includes("queue"));
   } finally {
     claude.close();

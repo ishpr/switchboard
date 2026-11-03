@@ -2,7 +2,7 @@
 
 export const PROTOCOL_VERSION = 2;
 export const TOPIC_RE = /^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,127}$/;
-export const NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,63}$/;
+export const NAME_RE = /^[a-zA-Z0-9%][a-zA-Z0-9._:%-]{0,63}$/;
 export const BODY_MAX = 32 * 1024;
 export const DEFAULT_PORT = 8787;
 export const HEARTBEAT_MS = 10_000;
@@ -53,6 +53,8 @@ export type AgentRecord = {
   harness: string;
   sessionId: string | null;
   cwd: string;
+  branch?: string | null;
+  head?: string | null;
   wake: boolean;
   lastSeen: number;
   online: boolean;
@@ -97,7 +99,11 @@ export type ClientHello = {
   harness: string;
   repoKey: string;
   cwd: string;
+  branch?: string | null;
+  head?: string | null;
   sessionId?: string;
+  /** Optional live wake target (e.g. tty:/dev/ttysNNN) when sessionId is a harness UUID. */
+  wakeSessionId?: string;
   /** Persist sessionId for inject. A generated id is this connection only. */
   boundSession?: boolean;
   /** True when the connection is held by a `switchboard wait` monitor rather than an MCP shim. */
@@ -122,7 +128,17 @@ export type ClientFrame = (
   | { type: "report"; body: string }
   | { type: "status"; status?: string; pending?: boolean; limit?: number }
   | { type: "orchestrator"; name?: string }
-  | { type: "register"; name: string; harness: string; cwd: string; sessionId?: string; wake: boolean }
+  | {
+      type: "register";
+      name: string;
+      harness: string;
+      cwd: string;
+      sessionId?: string;
+      wakeSessionId?: string;
+      branch?: string | null;
+      head?: string | null;
+      wake?: boolean;
+    }
   | { type: "heartbeat" }
 ) & { reqId?: string };
 
@@ -148,7 +164,7 @@ export type ServerFrame = (
   | { type: "who"; agents: AgentRecord[]; daemon?: RuntimeInfo }
   | { type: "doctor"; agents: AgentRecord[]; pruned: PrunedAgent[]; daemon?: RuntimeInfo }
   | { type: "orchestrator"; orchestrator: string | null }
-  | { type: "registered"; name: string }
+  | { type: "registered"; name: string; agent?: AgentRecord; created?: boolean }
   | { type: "error"; error: string }
 ) & { reqId?: string };
 

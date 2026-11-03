@@ -1,5 +1,11 @@
 import { DatabaseSync } from "node:sqlite";
 import type { AgentRecord, BusMessage, Kind, PendingAsk, AgentMetrics } from "./types.ts";
+import { TTY_RE } from "./wake.ts";
+
+function isPaneOrTty(sessionId?: string | null): boolean {
+  if (!sessionId) return false;
+  return sessionId.startsWith("zellij:") || /^(?:tmux:)?%\d+$/.test(sessionId) || TTY_RE.test(sessionId);
+}
 
 export function inboxCursorKey(clientKey: string, topic?: string): string {
   return topic ? JSON.stringify([clientKey, "topic", topic]) : clientKey;
@@ -7,7 +13,10 @@ export function inboxCursorKey(clientKey: string, topic?: string): string {
 
 // One definition of task completion for status, metrics, and the Stop gate.
 const ANSWERED_ASK = `SELECT 1 FROM messages r WHERE r.repo = a.repo AND r.kind = 'reply'
-  AND r.correlation_id = a.correlation_id AND r.from_name = a.to_name
+  AND r.correlation_id = a.correlation_id
+  AND (r.from_name = a.to_name OR EXISTS (
+    SELECT 1 FROM agents ag WHERE ag.repo = a.repo AND ag.session_id = a.to_name AND ag.name = r.from_name
+  ))
   AND r.to_name = a.from_name AND r.seq > a.seq`;
 
 const SCHEMA = `
@@ -38,15 +47,20 @@ CREATE TABLE IF NOT EXISTS cursors (
 
 CREATE TABLE IF NOT EXISTS agents (
   repo TEXT NOT NULL,
+  session_key TEXT NOT NULL,
   name TEXT NOT NULL,
   harness TEXT NOT NULL,
   session_id TEXT,
   cwd TEXT NOT NULL,
+  branch TEXT,
+  head TEXT,
   wake INTEGER NOT NULL DEFAULT 0,
   last_seen INTEGER NOT NULL,
   status TEXT NOT NULL DEFAULT '',
-  PRIMARY KEY (repo, name)
+  PRIMARY KEY (repo, session_key)
 );
+CREATE INDEX IF NOT EXISTS agents_repo_name ON agents(repo, name);
+CREATE INDEX IF NOT EXISTS agents_repo_session ON agents(repo, session_id);
 
 CREATE TABLE IF NOT EXISTS roles (
   repo TEXT NOT NULL PRIMARY KEY,
@@ -61,7 +75,47 @@ export class Store {
     this.db = new DatabaseSync(file);
     this.db.exec("PRAGMA journal_mode = WAL;");
     this.db.exec("PRAGMA busy_timeout = 3000;");
+    this.migrateAgentsTable();
     this.db.exec(SCHEMA);
+  }
+
+  private migrateAgentsTable(): void {
+    const cols = this.db.prepare("PRAGMA table_info(agents)").all() as { name: string }[];
+    if (cols.length === 0) return;
+    const hasSessionKey = cols.some((col) => col.name === "session_key");
+    const hasBranch = cols.some((col) => col.name === "branch");
+    const hasHead = cols.some((col) => col.name === "head");
+    if (hasSessionKey && hasBranch && hasHead) return;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec(`
+        CREATE TABLE agents_v2 (
+          repo TEXT NOT NULL,
+          session_key TEXT NOT NULL,
+          name TEXT NOT NULL,
+          harness TEXT NOT NULL,
+          session_id TEXT,
+          cwd TEXT NOT NULL,
+          branch TEXT,
+          head TEXT,
+          wake INTEGER NOT NULL DEFAULT 0,
+          last_seen INTEGER NOT NULL,
+          status TEXT NOT NULL DEFAULT '',
+          PRIMARY KEY (repo, session_key)
+        );
+        INSERT OR REPLACE INTO agents_v2 (repo, session_key, name, harness, session_id, cwd, branch, head, wake, last_seen, status)
+        SELECT repo, COALESCE(session_id, 'name:' || name), name, harness, session_id, cwd, NULL, NULL, wake, last_seen, status
+        FROM agents;
+        DROP TABLE agents;
+        ALTER TABLE agents_v2 RENAME TO agents;
+        CREATE INDEX IF NOT EXISTS agents_repo_name ON agents(repo, name);
+        CREATE INDEX IF NOT EXISTS agents_repo_session ON agents(repo, session_id);
+      `);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   close(): void {
@@ -226,56 +280,77 @@ export class Store {
     toName: string,
     cursor: number,
     minTs = 0,
+    sessionId?: string | null,
   ): BusMessage | null {
     const row = this.db
       .prepare(
         `SELECT * FROM messages a
-         WHERE a.repo = ? AND a.to_name = ? AND a.kind = 'ask'
+         WHERE a.repo = ? AND (a.to_name = ? OR (? IS NOT NULL AND a.to_name = ?)) AND a.kind = 'ask'
            AND a.seq <= ? AND a.ts >= ?
            AND a.correlation_id IS NOT NULL
            AND NOT EXISTS (${ANSWERED_ASK})
          ORDER BY a.seq DESC
          LIMIT 1`,
       )
-      .get(repo, toName, cursor, minTs) as Row | undefined;
+      .get(repo, toName, sessionId ?? null, sessionId ?? null, cursor, minTs) as Row | undefined;
     return row ? mapMessage(row) : null;
   }
 
-  inbox(repo: string, since: number, opts: { topic?: string; to?: string; limit: number }): BusMessage[] {
+  inbox(
+    repo: string,
+    since: number,
+    opts: { topic?: string; to?: string; sessionId?: string | null; limit: number },
+  ): BusMessage[] {
     const limit = Math.max(1, Math.min(opts.limit, 200));
     const topic = opts.topic ?? null;
+    const session = opts.sessionId ?? null;
     const rows = this.db
       .prepare(
         `SELECT * FROM messages
          WHERE repo = ? AND seq > ?
-           AND (to_name IS NULL OR to_name = '*' OR to_name = ?)
+           AND (to_name IS NULL OR to_name = '*' OR to_name = ? OR (? IS NOT NULL AND to_name = ?))
            AND ((? IS NULL AND topic != 'presence') OR topic = ?)
          ORDER BY seq ASC
          LIMIT ?`,
       )
-      .all(repo, since, opts.to ?? "", topic, topic, limit) as Row[];
+      .all(repo, since, opts.to ?? "", session, session, topic, topic, limit) as Row[];
     return rows.map(mapMessage);
   }
 
   /** Read-only wait queries use the same visibility and topic cursor rules as inbox. */
-  unreadForWait(repo: string, to: string, since: number, cursorKey = to, topic?: string): BusMessage[] {
+  unreadForWait(
+    repo: string,
+    to: string,
+    since: number,
+    cursorKey = to,
+    topic?: string,
+    sessionId?: string | null,
+  ): BusMessage[] {
+    const session = sessionId ?? null;
     const rows = this.db.prepare(
       `SELECT * FROM messages WHERE repo = ?
          AND seq > MAX(?, COALESCE((SELECT MAX(cursor) FROM cursors WHERE repo = ? AND client_key = ?), 0))
-         AND (to_name IS NULL OR to_name = '*' OR to_name = ?)
+         AND (to_name IS NULL OR to_name = '*' OR to_name = ? OR (? IS NOT NULL AND to_name = ?))
          AND ((? IS NULL AND topic != 'presence') OR topic = ?)
        ORDER BY seq ASC LIMIT 200`,
-    ).all(repo, since, repo, inboxCursorKey(cursorKey, topic), to, topic ?? null, topic ?? null) as Row[];
+    ).all(repo, since, repo, inboxCursorKey(cursorKey, topic), to, session, session, topic ?? null, topic ?? null) as Row[];
     return rows.map(mapMessage);
   }
 
-  latestUnreadSeq(repo: string, to: string, cursorKey = to, topic?: string): number {
+  latestUnreadSeq(
+    repo: string,
+    to: string,
+    cursorKey = to,
+    topic?: string,
+    sessionId?: string | null,
+  ): number {
+    const session = sessionId ?? null;
     const row = this.db.prepare(
       `SELECT COALESCE(MAX(seq), 0) AS seq FROM messages WHERE repo = ?
          AND seq > COALESCE((SELECT MAX(cursor) FROM cursors WHERE repo = ? AND client_key = ?), 0)
-         AND (to_name IS NULL OR to_name = '*' OR to_name = ?)
+         AND (to_name IS NULL OR to_name = '*' OR to_name = ? OR (? IS NOT NULL AND to_name = ?))
          AND ((? IS NULL AND topic != 'presence') OR topic = ?)`,
-    ).get(repo, repo, inboxCursorKey(cursorKey, topic), to, topic ?? null, topic ?? null) as { seq: number };
+    ).get(repo, repo, inboxCursorKey(cursorKey, topic), to, session, session, topic ?? null, topic ?? null) as { seq: number };
     return row.seq;
   }
 
@@ -285,44 +360,127 @@ export class Store {
     harness: string;
     sessionId: string | null;
     cwd: string;
+    branch?: string | null;
+    head?: string | null;
     wake: boolean;
     status: string;
-  }): void {
+    bySession?: boolean;
+  }): AgentRecord {
     const now = Date.now();
+    const keyBySession = Boolean(agent.sessionId && (agent.bySession || !isPaneOrTty(agent.sessionId)));
+    if (keyBySession && agent.sessionId) {
+      // Remove any unbound placeholder row for this (repo, name) once a real session id is bound.
+      this.db
+        .prepare("DELETE FROM agents WHERE repo = ? AND session_key = ? AND session_id IS NULL")
+        .run(agent.repo, `name:${agent.name}`);
+      this.db
+        .prepare(
+          `INSERT INTO agents (repo, session_key, name, harness, session_id, cwd, branch, head, wake, last_seen, status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(repo, session_key) DO UPDATE SET
+             name = excluded.name,
+             harness = excluded.harness,
+             session_id = excluded.session_id,
+             cwd = excluded.cwd,
+             branch = COALESCE(excluded.branch, agents.branch),
+             head = COALESCE(excluded.head, agents.head),
+             wake = excluded.wake,
+             last_seen = excluded.last_seen,
+             status = excluded.status`,
+        )
+        .run(
+          agent.repo,
+          agent.sessionId,
+          agent.name,
+          agent.harness,
+          agent.sessionId,
+          agent.cwd,
+          agent.branch ?? null,
+          agent.head ?? null,
+          agent.wake ? 1 : 0,
+          now,
+          agent.status,
+        );
+      return this.getAgentBySession(agent.repo, agent.sessionId)!;
+    }
+
+    if (!agent.sessionId) {
+      const existingBound = this.db
+        .prepare("SELECT * FROM agents WHERE repo = ? AND name = ? AND session_id IS NOT NULL ORDER BY last_seen DESC LIMIT 1")
+        .get(agent.repo, agent.name) as AgentRow | undefined;
+      if (existingBound) {
+        this.db
+          .prepare(
+            `UPDATE agents
+             SET harness = ?, cwd = ?, branch = COALESCE(?, branch), head = COALESCE(?, head), wake = ?, last_seen = ?, status = ?
+             WHERE repo = ? AND session_key = ?`,
+          )
+          .run(
+            agent.harness,
+            agent.cwd,
+            agent.branch ?? null,
+            agent.head ?? null,
+            agent.wake ? 1 : 0,
+            now,
+            agent.status,
+            agent.repo,
+            existingBound.session_key,
+          );
+        return this.getAgentBySession(agent.repo, existingBound.session_key)!;
+      }
+    }
+
+    const sessionKey = `name:${agent.name}`;
     this.db
       .prepare(
-        `INSERT INTO agents (repo, name, harness, session_id, cwd, wake, last_seen, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(repo, name) DO UPDATE SET
+        `INSERT INTO agents (repo, session_key, name, harness, session_id, cwd, branch, head, wake, last_seen, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(repo, session_key) DO UPDATE SET
            harness = excluded.harness,
            session_id = COALESCE(excluded.session_id, agents.session_id),
            cwd = excluded.cwd,
+           branch = COALESCE(excluded.branch, agents.branch),
+           head = COALESCE(excluded.head, agents.head),
            wake = excluded.wake,
            last_seen = excluded.last_seen,
            status = excluded.status`,
       )
       .run(
         agent.repo,
+        sessionKey,
         agent.name,
         agent.harness,
         agent.sessionId,
         agent.cwd,
+        agent.branch ?? null,
+        agent.head ?? null,
         agent.wake ? 1 : 0,
         now,
         agent.status,
       );
+    return this.getAgent(agent.repo, agent.sessionId ?? agent.name)!;
   }
 
-  touchAgent(repo: string, name: string, status?: string): void {
+  touchAgent(repo: string, name: string, status?: string, sessionId?: string | null): void {
+    const now = Date.now();
+    if (sessionId) {
+      const res =
+        status === undefined
+          ? this.db.prepare("UPDATE agents SET last_seen = ? WHERE repo = ? AND session_id = ?").run(now, repo, sessionId)
+          : this.db
+              .prepare("UPDATE agents SET last_seen = ?, status = ? WHERE repo = ? AND session_id = ?")
+              .run(now, status, repo, sessionId);
+      if (res.changes > 0) return;
+    }
     if (status === undefined) {
       this.db
         .prepare("UPDATE agents SET last_seen = ? WHERE repo = ? AND name = ?")
-        .run(Date.now(), repo, name);
+        .run(now, repo, name);
       return;
     }
     this.db
       .prepare("UPDATE agents SET last_seen = ?, status = ? WHERE repo = ? AND name = ?")
-      .run(Date.now(), status, repo, name);
+      .run(now, status, repo, name);
   }
 
   listRepos(): string[] {
@@ -356,16 +514,25 @@ export class Store {
       .run(repo, name);
   }
 
-  getAgent(repo: string, name: string): AgentRecord | undefined {
+  getAgentBySession(repo: string, sessionId: string): AgentRecord | undefined {
     const row = this.db
-      .prepare("SELECT * FROM agents WHERE repo = ? AND name = ?")
-      .get(repo, name) as AgentRow | undefined;
+      .prepare("SELECT * FROM agents WHERE repo = ? AND (session_id = ? OR session_key = ?) LIMIT 1")
+      .get(repo, sessionId, sessionId) as AgentRow | undefined;
+    return row ? mapAgent(row, false) : undefined;
+  }
+
+  getAgent(repo: string, nameOrSession: string): AgentRecord | undefined {
+    const bySession = this.getAgentBySession(repo, nameOrSession);
+    if (bySession) return bySession;
+    const row = this.db
+      .prepare("SELECT * FROM agents WHERE repo = ? AND name = ? ORDER BY last_seen DESC LIMIT 1")
+      .get(repo, nameOrSession) as AgentRow | undefined;
     return row ? mapAgent(row, false) : undefined;
   }
 
   listAgents(repo: string, onlineNames: Set<string>): AgentRecord[] {
     const rows = this.db
-      .prepare("SELECT * FROM agents WHERE repo = ? ORDER BY name")
+      .prepare("SELECT * FROM agents WHERE repo = ? ORDER BY name, session_id")
       .all(repo) as AgentRow[];
     return rows.map((row) => mapAgent(row, onlineNames.has(row.name)));
   }
@@ -387,10 +554,13 @@ type Row = {
 
 type AgentRow = {
   repo: string;
+  session_key: string;
   name: string;
   harness: string;
   session_id: string | null;
   cwd: string;
+  branch: string | null;
+  head: string | null;
   wake: number;
   last_seen: number;
   status: string;
@@ -419,6 +589,8 @@ function mapAgent(row: AgentRow, online: boolean): AgentRecord {
     harness: row.harness,
     sessionId: row.session_id,
     cwd: row.cwd,
+    branch: row.branch,
+    head: row.head,
     wake: row.wake === 1,
     lastSeen: row.last_seen,
     online,

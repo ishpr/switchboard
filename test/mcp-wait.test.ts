@@ -117,3 +117,110 @@ test("wait cancellation interrupts a long polling sleep", async () => {
     await assert.rejects(waitForMessages(store, { repo: "board", to: "agy", signal: controller.signal }), { name: "AbortError" });
   } finally { store.close(); }
 });
+
+test("bus_register keys rows by harness session id, refuses when missing, and supports session-targeted bus_ask", async () => {
+  const home = mkdtempSync(path.join(tmpdir(), "mcp-register-"));
+  const token = ensureToken(home);
+  const file = path.join(home, "switchboard.db");
+  const store = new Store(file);
+  const repo = "board";
+  const daemon = await startDaemon({ port: 0, dbFile: file, token, paneProbe: async () => true });
+  const muse1Id = "01a1957b-b088-76e1-b08b-ad1ac5ed8594";
+  const muse2Id = "01a19366-9ddb-7781-aab6-33bc60c5810a";
+
+  const muse1 = new Client({ name: "muse-1", version: "1.0" });
+  const muse2 = new Client({ name: "muse-2", version: "1.0" });
+  const unbound = new Client({ name: "muse-unbound", version: "1.0" });
+
+  await muse1.connect(
+    new StdioClientTransport({
+      command: process.execPath,
+      args: ["--experimental-strip-types", path.resolve("src/cli.ts"), "mcp"],
+      stderr: "pipe",
+      env: {
+        PATH: process.env.PATH!,
+        SWITCHBOARD_HOME: home,
+        SWITCHBOARD_URL: daemon.url,
+        SWITCHBOARD_REPO_KEY: repo,
+        SWITCHBOARD_NAME: "muse",
+        SWITCHBOARD_HARNESS: "muse",
+        MUSE_SESSION_ID: muse1Id,
+      },
+    }),
+  );
+  await muse2.connect(
+    new StdioClientTransport({
+      command: process.execPath,
+      args: ["--experimental-strip-types", path.resolve("src/cli.ts"), "mcp"],
+      stderr: "pipe",
+      env: {
+        PATH: process.env.PATH!,
+        SWITCHBOARD_HOME: home,
+        SWITCHBOARD_URL: daemon.url,
+        SWITCHBOARD_REPO_KEY: repo,
+        SWITCHBOARD_NAME: "muse",
+        SWITCHBOARD_HARNESS: "muse",
+        MUSE_SESSION_ID: muse2Id,
+      },
+    }),
+  );
+  await unbound.connect(
+    new StdioClientTransport({
+      command: process.execPath,
+      args: ["--experimental-strip-types", path.resolve("src/cli.ts"), "mcp"],
+      stderr: "pipe",
+      env: {
+        PATH: process.env.PATH!,
+        SWITCHBOARD_HOME: home,
+        SWITCHBOARD_URL: daemon.url,
+        SWITCHBOARD_REPO_KEY: repo,
+        SWITCHBOARD_NAME: "muse",
+        SWITCHBOARD_HARNESS: "muse",
+      },
+    }),
+  );
+
+  try {
+    // Calling bus_register on muse1 and muse2 keeps both session rows without overwriting
+    const reg1 = await muse1.callTool({ name: "bus_register", arguments: {} });
+    assert.equal(reg1.isError, undefined);
+    assert.match((reg1.content[0] as { text: string }).text, new RegExp(`session=${muse1Id}`));
+
+    const reg1Again = await muse1.callTool({ name: "bus_register", arguments: {} });
+    assert.match((reg1Again.content[0] as { text: string }).text, /registered \(existing\)/);
+
+    const reg2 = await muse2.callTool({ name: "bus_register", arguments: {} });
+    assert.equal(reg2.isError, undefined);
+    assert.match((reg2.content[0] as { text: string }).text, new RegExp(`session=${muse2Id}`));
+
+    const allAgents = store.listAgents(repo, new Set());
+    assert.equal(allAgents.filter((a) => a.name === "muse").length, 2);
+    assert.ok(store.getAgentBySession(repo, muse1Id));
+    assert.ok(store.getAgentBySession(repo, muse2Id));
+
+    // Unbound Muse without MUSE_SESSION_ID refuses bus_register and names MUSE_SESSION_ID
+    const refused = await unbound.callTool({ name: "bus_register", arguments: {} });
+    assert.equal(refused.isError, true);
+    assert.match((refused.content[0] as { text: string }).text, /MUSE_SESSION_ID/);
+
+    // bus_ask to a specific session id reaches ONLY that session, not the other Muse session
+    const askToMuse2 = await muse1.callTool({
+      name: "bus_ask",
+      arguments: { agent: muse2Id, question: "only for muse2" },
+    });
+    assert.equal(askToMuse2.isError, undefined);
+
+    const inbox1 = await muse1.callTool({ name: "bus_inbox", arguments: {} });
+    assert.doesNotMatch((inbox1.content[0] as { text: string }).text, /only for muse2/);
+
+    const inbox2 = await muse2.callTool({ name: "bus_inbox", arguments: {} });
+    assert.match((inbox2.content[0] as { text: string }).text, /only for muse2/);
+  } finally {
+    await muse1.close();
+    await muse2.close();
+    await unbound.close();
+    await daemon.close();
+    store.close();
+    rmSync(home, { recursive: true, force: true });
+  }
+});

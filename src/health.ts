@@ -59,7 +59,7 @@ export async function sessionDiagnostics(
   probe: PaneProbe,
   now = Date.now(),
 ): Promise<SessionDiagnostics> {
-  const sessionId = agent.sessionId ?? agent.wakeSessionId ?? null;
+  const sessionId = agent.wakeSessionId || agent.sessionId || null;
   const target = paneTarget(sessionId);
   let pane: boolean | null | undefined;
   if (target) {

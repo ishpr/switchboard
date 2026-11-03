@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import { resolveShimCwd } from "./init.ts";
-import { repoKey } from "./repo.ts";
+import { gitCheckoutInfo, repoKey } from "./repo.ts";
 import { createPaneProbe, formatDiagnostics, sessionDiagnostics, type PaneProbe } from "./health.ts";
 import { BUILD, buildWarning, runtimeInfo } from "./build.ts";
 import { Store, inboxCursorKey } from "./store.ts";
@@ -51,7 +51,10 @@ type Conn = {
   harness: string;
   repo: string;
   cwd: string;
+  branch: string | null;
+  head: string | null;
   sessionId: string | null;
+  wakeSessionId: string | null;
   /** The client supplied sessionId, so this connection has its own inbox cursor. */
   declaredSession: string | null;
   sessionBound: boolean;
@@ -109,7 +112,10 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       harness: "",
       repo: "",
       cwd: "",
+      branch: null,
+      head: null,
       sessionId: null,
+      wakeSessionId: null,
       declaredSession: null,
       sessionBound: false,
       waitOnly: false,
@@ -230,7 +236,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
             if (peer.authed && peer.repo === conn.repo && peer.name === conn.name
               && (conn.harness === "cli" || groupKey(peer) === groupKey(conn))) peer.status = frame.status;
           }
-          store.touchAgent(conn.repo, conn.name, frame.status);
+          store.touchAgent(conn.repo, conn.name, frame.status, conn.sessionId);
         }
         await sendStatus(conn, frame, respond);
         break;
@@ -241,7 +247,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         register(conn, frame, respond);
         break;
       case "heartbeat":
-        store.touchAgent(conn.repo, conn.name);
+        store.touchAgent(conn.repo, conn.name, undefined, conn.sessionId);
         break;
       default:
         respond({ type: "error", error: "unknown frame" });
@@ -273,7 +279,8 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       : [conn.repo];
     const probe = options.paneProbe ?? createPaneProbe();
     const candidates = repos.flatMap((repo) => agents(repo)).map((agent) => ({
-      agent, stored: store.getAgent(agent.repo, agent.name),
+      agent,
+      stored: store.getAgent(agent.repo, agent.sessionId || agent.name),
     }));
     const rows = await Promise.all(candidates.map(async ({ agent }) => ({
       ...agent, diagnostics: await diagnostics(agent, probe),
@@ -294,9 +301,15 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         let clearedLiveBinding = false;
         if (reason === "dead_pane") {
           for (const peer of conns) {
-            if (peer.authed && peer.repo === row.repo && peer.name === row.name && peer.sessionId === targetId) {
+            if (
+              peer.authed &&
+              peer.repo === row.repo &&
+              peer.name === row.name &&
+              (peer.sessionId === targetId || peer.wakeSessionId === targetId)
+            ) {
               peer.sessionBound = false;
               peer.sessionId = null;
+              peer.wakeSessionId = null;
               clearedLiveBinding = true;
             }
           }
@@ -337,7 +350,10 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     if (!frame.cwd) throw new Error("cwd required");
     const effectiveCwd = frame.cwd === "/" ? resolveShimCwd("/") : frame.cwd;
     const effectiveRepo = frame.cwd === "/" && effectiveCwd !== "/" ? repoKey(effectiveCwd) : frame.repoKey;
-    const existing = store.getAgent(effectiveRepo, frame.name);
+    const declaredSession = frame.sessionId || null;
+    const existing =
+      (declaredSession ? store.getAgentBySession(effectiveRepo, declaredSession) : undefined) ??
+      store.getAgent(effectiveRepo, frame.name);
     conn.authed = true;
     conn.agentId = randomUUID();
     conn.name = frame.name;
@@ -347,9 +363,12 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       : (frame.harness || "unknown");
     conn.repo = effectiveRepo;
     conn.cwd = effectiveCwd;
-    conn.declaredSession = frame.sessionId || null;
-    conn.sessionBound = Boolean(frame.boundSession && frame.sessionId);
+    conn.branch = frame.branch ?? existing?.branch ?? null;
+    conn.head = frame.head ?? existing?.head ?? null;
+    conn.declaredSession = declaredSession;
+    conn.sessionBound = Boolean(frame.boundSession && declaredSession);
     conn.sessionId = conn.declaredSession;
+    conn.wakeSessionId = frame.wakeSessionId || (conn.sessionBound ? conn.sessionId : existing?.sessionId ?? null);
     conn.build = frame.build;
     conn.wake = frame.wake === undefined ? (existing?.wake ?? false) : frame.wake;
     conn.status = [...conns].find((peer) => peer !== conn && peer.authed && groupKey(peer) === groupKey(conn))?.status
@@ -358,28 +377,32 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     conn.topics.add("repo");
     conn.topics.add("presence");
     if (conn.role === "orchestrator") conn.topics.add("reports");
-    if (conn.harness !== "cli" && !conn.waitOnly && (!existing || conn.sessionBound)) {
+    if (conn.cwd !== "/" && conn.harness !== "cli" && !conn.waitOnly && (!existing || conn.sessionBound)) {
       store.upsertAgent({
         repo: conn.repo,
         name: conn.name,
         harness: conn.harness,
         sessionId: conn.sessionBound ? conn.declaredSession : (existing?.sessionId ?? null),
         cwd: conn.cwd,
+        branch: conn.branch,
+        head: conn.head,
         wake: conn.wake,
         status: conn.status,
       });
-    } else if (conn.harness !== "cli" && conn.waitOnly && !existing) {
+    } else if (conn.cwd !== "/" && conn.harness !== "cli" && conn.waitOnly && !existing) {
       store.upsertAgent({
         repo: conn.repo,
         name: conn.name,
         harness: conn.harness,
         sessionId: conn.sessionBound ? conn.declaredSession : null,
         cwd: conn.cwd,
+        branch: conn.branch,
+        head: conn.head,
         wake: conn.wake,
         status: conn.status,
       });
-    } else if (conn.harness !== "cli") {
-      store.touchAgent(conn.repo, conn.name);
+    } else if (conn.cwd !== "/" && conn.harness !== "cli") {
+      store.touchAgent(conn.repo, conn.name, undefined, conn.sessionId);
     }
     respond({
       type: "welcome",
@@ -479,7 +502,18 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       to: null,
     });
     fanout(message, conn);
-    if (state === "offline" && ![...conns].some((peer) => peer.authed && peer.repo === conn.repo && peer.name === conn.name && peer.harness !== "cli")) store.touchAgent(conn.repo, conn.name, "offline");
+    if (
+      state === "offline" &&
+      ![...conns].some(
+        (peer) =>
+          peer.authed &&
+          peer.repo === conn.repo &&
+          peer.harness !== "cli" &&
+          (conn.sessionId ? peer.sessionId === conn.sessionId : peer.name === conn.name),
+      )
+    ) {
+      store.touchAgent(conn.repo, conn.name, "offline", conn.sessionId);
+    }
   }
 
   function clientKey(conn: Conn): string {
@@ -510,7 +544,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       correlationId,
       to: frame.to === "*" ? null : frame.to || null,
     });
-    store.touchAgent(conn.repo, conn.name);
+    store.touchAgent(conn.repo, conn.name, undefined, conn.sessionId);
     fanout(message, conn);
     const wake = await wakeFor(conn.repo, message);
     respond({
@@ -525,9 +559,15 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
   async function ask(conn: Conn, to: string, body: string, topic: string | undefined, respond: Respond): Promise<void> {
     requireName(to);
     const others = [...conns].filter(
-      (peer) => peer.authed && peer.repo === conn.repo && peer.name === to && peer.socket !== conn.socket,
+      (peer) =>
+        peer.authed &&
+        peer.repo === conn.repo &&
+        (peer.name === to || peer.sessionId === to || peer.declaredSession === to) &&
+        peer.socket !== conn.socket,
     );
-    if (to === conn.name && others.length === 0) throw new Error("ask someone else");
+    if ((to === conn.name || to === conn.sessionId || to === conn.declaredSession) && others.length === 0) {
+      throw new Error("ask someone else");
+    }
     await publish(
       conn,
       { topic: topic || "dm", body, to, id: randomUUID() },
@@ -554,9 +594,13 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     if (typeof correlationId !== "string" || !correlationId) throw new Error("correlation id required");
     const askMessage = store.byCorrelation(conn.repo, correlationId);
     if (!askMessage) throw new Error("no ask with that correlation id");
-    if (conn.name !== askMessage.to && conn.name !== askMessage.fromName) throw new Error("only ask participants may reply");
+    const isRecipient =
+      conn.name === askMessage.to ||
+      (conn.sessionId !== null && conn.sessionId === askMessage.to) ||
+      (conn.declaredSession !== null && conn.declaredSession === askMessage.to);
+    if (!isRecipient && conn.name !== askMessage.fromName) throw new Error("only ask participants may reply");
     const target =
-      conn.name === askMessage.fromName && askMessage.to ? askMessage.to : askMessage.fromName;
+      conn.name === askMessage.fromName && !isRecipient && askMessage.to ? askMessage.to : askMessage.fromName;
     await publish(
       conn,
       {
@@ -582,13 +626,14 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     const messages = store.inbox(conn.repo, cursor, {
       topic,
       to: conn.name,
+      sessionId: conn.sessionId,
       limit: pageSize,
     });
     const next = messages.length ? messages[messages.length - 1]!.seq : cursor;
     if (messages.length) store.ack(conn.repo, key, next);
-    store.touchAgent(conn.repo, conn.name);
+    store.touchAgent(conn.repo, conn.name, undefined, conn.sessionId);
     const updatedCursor = store.cursor(conn.repo, key);
-    const pendingAsk = store.unansweredAsk(conn.repo, conn.name, updatedCursor);
+    const pendingAsk = store.unansweredAsk(conn.repo, conn.name, updatedCursor, 0, conn.sessionId);
     respond({
       type: "inbox",
       messages,
@@ -606,22 +651,72 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     requireName(frame.name);
     if (!frame.cwd) throw new Error("cwd required");
     if (!frame.harness) throw new Error("harness required");
-    store.upsertAgent({
+    const existing = frame.sessionId
+      ? store.getAgentBySession(conn.repo, frame.sessionId)
+      : store.getAgent(conn.repo, frame.name);
+    if (frame.sessionId && !frame.sessionId.startsWith("zellij:")) {
+      const sessionKey = `${frame.name}:${frame.sessionId}`;
+      const baseCursor = store.cursor(conn.repo, frame.name);
+      if (store.cursor(conn.repo, sessionKey) === 0 && baseCursor > 0) {
+        store.ack(conn.repo, sessionKey, baseCursor);
+      }
+    }
+    const checkout =
+      frame.branch !== undefined || frame.head !== undefined
+        ? { branch: frame.branch ?? null, head: frame.head ?? null }
+        : gitCheckoutInfo(frame.cwd);
+    const wake = frame.wake === undefined ? (existing?.wake ?? conn.wake) : frame.wake;
+    const status = conn.harness === "cli" ? (existing?.status || "registered") : (conn.status || "online");
+    const saved = store.upsertAgent({
       repo: conn.repo,
       name: frame.name,
       harness: frame.harness,
       sessionId: frame.sessionId || null,
       cwd: frame.cwd,
-      wake: frame.wake,
-      status: "registered",
+      branch: checkout.branch,
+      head: checkout.head,
+      wake,
+      status,
+      bySession: Boolean(frame.sessionId),
     });
-    respond({ type: "registered", name: frame.name });
+    if (conn.harness !== "cli") {
+      if (frame.sessionId) {
+        conn.declaredSession = frame.sessionId;
+        conn.sessionId = frame.sessionId;
+        conn.sessionBound = true;
+      }
+      if (frame.wakeSessionId || frame.sessionId) {
+        conn.wakeSessionId = frame.wakeSessionId || frame.sessionId || conn.wakeSessionId;
+      }
+      conn.branch = checkout.branch ?? conn.branch;
+      conn.head = checkout.head ?? conn.head;
+      conn.wake = wake;
+    } else {
+      for (const peer of conns) {
+        if (!peer.authed || peer.repo !== conn.repo || peer.name !== frame.name || peer.harness === "cli") continue;
+        if (!peer.sessionBound && frame.sessionId) {
+          peer.declaredSession = frame.sessionId;
+          peer.sessionId = frame.sessionId;
+          peer.sessionBound = true;
+        }
+        if (frame.wakeSessionId || frame.sessionId) {
+          peer.wakeSessionId = frame.wakeSessionId || frame.sessionId || peer.wakeSessionId;
+        }
+        peer.branch = checkout.branch ?? peer.branch;
+        peer.head = checkout.head ?? peer.head;
+        peer.wake = wake;
+      }
+    }
+    respond({ type: "registered", name: frame.name, agent: saved, created: !existing });
   }
 
   function fanout(message: BusMessage, origin: Conn): void {
     for (const peer of conns) {
       if (!peer.authed || peer.repo !== message.repo || peer.socket === origin.socket) continue;
-      const delivered = message.to && message.to !== "*" ? message.to === peer.name : peer.topics.has(message.topic);
+      const delivered =
+        message.to && message.to !== "*"
+          ? message.to === peer.name || message.to === peer.sessionId || message.to === peer.declaredSession
+          : peer.topics.has(message.topic);
       if (delivered) send(peer.socket, { type: "message", message });
     }
   }
@@ -675,21 +770,32 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     }
   }
 
-  function describeTarget(repo: string, name: string): {
+  function describeTarget(repo: string, target: string): {
     harness: string;
     sessionId: string | null;
     cwd: string;
     wake: boolean;
     online: boolean;
   } | null {
-    const candidates = [...conns].filter((conn) => conn.authed && conn.repo === repo && conn.name === name && conn.harness !== "cli");
-    const row = store.getAgent(repo, name);
+    const bySession = [...conns].filter(
+      (conn) =>
+        conn.authed &&
+        conn.repo === repo &&
+        conn.harness !== "cli" &&
+        (conn.sessionId === target || conn.declaredSession === target),
+    );
+    const byName = [...conns].filter(
+      (conn) => conn.authed && conn.repo === repo && conn.name === target && conn.harness !== "cli",
+    );
+    const candidates = bySession.length > 0 ? bySession : byName;
+    const row = store.getAgent(repo, target);
     const live = candidates.find((conn) => conn.sessionBound && conn.sessionId === row?.sessionId)
       ?? candidates.find((conn) => conn.sessionBound) ?? candidates[0];
     if (!live && !row) return null;
+    const liveWakeSession = live?.wakeSessionId || (live?.sessionBound ? live.sessionId : null);
     return {
       harness: live?.sessionBound ? live.harness : row?.harness ?? live!.harness,
-      sessionId: (live?.sessionBound ? live.sessionId : null) || row?.sessionId || null,
+      sessionId: liveWakeSession || row?.sessionId || null,
       cwd: live?.sessionBound ? live.cwd : row?.cwd ?? live!.cwd,
       wake: row?.wake ?? live?.wake ?? false,
       online: Boolean(live),
@@ -718,20 +824,42 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       const nonWait = members.filter((member) => !member.waitOnly);
       const counted = nonWait.length > 0 ? nonWait : [members.reduce((a, b) => a.lastSeen >= b.lastSeen ? a : b)];
       const conn = counted.reduce((a, b) => a.lastSeen >= b.lastSeen ? a : b);
-      const registered = store.getAgent(repo, conn.name);
+      const registered =
+        (conn.sessionId ? store.getAgentBySession(repo, conn.sessionId) : undefined) ??
+        store.getAgent(repo, conn.name);
       return {
-        repo, name: conn.name, harness: conn.harness, sessionId: conn.sessionId,
-        wakeSessionId: conn.sessionBound ? conn.sessionId : registered?.sessionId ?? null,
-        cwd: conn.cwd, wake: registered?.wake ?? conn.wake,
+        repo,
+        name: conn.name,
+        harness: conn.harness,
+        sessionId: conn.sessionId,
+        wakeSessionId: conn.wakeSessionId || (conn.sessionBound ? conn.sessionId : registered?.sessionId ?? null),
+        cwd: conn.cwd,
+        branch: conn.branch ?? registered?.branch ?? null,
+        head: conn.head ?? registered?.head ?? null,
+        wake: registered?.wake ?? conn.wake,
         lastSeen: Math.max(...members.map((member) => member.lastSeen)),
-        online: true, status: conn.status || "online", role: conn.role,
-        connectionCount: counted.length, connectionIds: counted.map((member) => member.agentId),
-        builds: counted.flatMap((member) => member.build ? [member.build] : []),
+        online: true,
+        status: conn.status || "online",
+        role: conn.role,
+        connectionCount: counted.length,
+        connectionIds: counted.map((member) => member.agentId),
+        builds: counted.flatMap((member) => (member.build ? [member.build] : [])),
       };
     });
     const liveNames = new Set(rows.map((row) => row.name));
+    const liveSessions = new Set(rows.flatMap((row) => (row.sessionId ? [row.sessionId] : [])));
     for (const row of store.listAgents(repo, new Set())) {
-      if (!liveNames.has(row.name)) rows.push({ ...row, wakeSessionId: row.sessionId, connectionCount: 0, role: row.name === orchestrator ? "orchestrator" : "worker" });
+      const represented = row.sessionId
+        ? liveSessions.has(row.sessionId) || rows.some((live) => live.name === row.name && !live.sessionId)
+        : liveNames.has(row.name);
+      if (!represented) {
+        rows.push({
+          ...row,
+          wakeSessionId: row.sessionId,
+          connectionCount: 0,
+          role: row.name === orchestrator ? "orchestrator" : "worker",
+        });
+      }
     }
     rows.sort((a, b) => a.name.localeCompare(b.name) || (a.sessionId ?? "").localeCompare(b.sessionId ?? ""));
     return rows;
