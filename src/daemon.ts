@@ -677,10 +677,12 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     }
     const askMessage = store.byCorrelation(conn.repo, correlationId);
     if (!askMessage) throw new Error("no ask with that correlation id");
+    const targetSessionOwner = askMessage.to ? store.getAgentBySession(conn.repo, askMessage.to)?.name : undefined;
     const isRecipient =
       conn.name === askMessage.to ||
       (conn.sessionId !== null && conn.sessionId === askMessage.to) ||
-      (conn.declaredSession !== null && conn.declaredSession === askMessage.to);
+      (conn.declaredSession !== null && conn.declaredSession === askMessage.to) ||
+      (!conn.sessionBound && targetSessionOwner === conn.name);
     if (!isRecipient && conn.name !== askMessage.fromName) throw new Error("only ask participants may reply");
     const target =
       conn.name === askMessage.fromName && !isRecipient && askMessage.to ? askMessage.to : askMessage.fromName;
@@ -871,11 +873,16 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
   }
 
   function fanout(message: BusMessage, origin: Conn): void {
+    const targetSessionOwner =
+      message.to && message.to !== "*" ? store.getAgentBySession(message.repo, message.to)?.name : undefined;
     for (const peer of conns) {
       if (!peer.authed || peer.repo !== message.repo || peer.socket === origin.socket) continue;
       const delivered =
         message.to && message.to !== "*"
-          ? message.to === peer.name || message.to === peer.sessionId || message.to === peer.declaredSession
+          ? message.to === peer.name ||
+            message.to === peer.sessionId ||
+            message.to === peer.declaredSession ||
+            (!peer.sessionBound && targetSessionOwner === peer.name)
           : peer.topics.has(message.topic);
       if (delivered) send(peer.socket, { type: "message", message });
     }

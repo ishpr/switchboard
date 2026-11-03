@@ -349,17 +349,26 @@ export class Store {
     minTs = 0,
     sessionId?: string | null,
   ): BusMessage | null {
+    const session = sessionId ?? null;
     const row = this.db
       .prepare(
         `SELECT * FROM messages a
-         WHERE a.repo = ? AND (a.to_name = ? OR (? IS NOT NULL AND a.to_name = ?)) AND a.kind = 'ask'
+         WHERE a.repo = ?
+           AND (
+             a.to_name = ?
+             OR (? IS NOT NULL AND a.to_name = ?)
+             OR (? IS NULL AND EXISTS (
+               SELECT 1 FROM agents ag WHERE ag.repo = a.repo AND ag.session_id = a.to_name AND ag.name = ?
+             ))
+           )
+           AND a.kind = 'ask'
            AND a.seq <= ? AND a.ts >= ?
            AND a.correlation_id IS NOT NULL
            AND NOT EXISTS (${ANSWERED_ASK})
          ORDER BY a.seq DESC
          LIMIT 1`,
       )
-      .get(repo, toName, sessionId ?? null, sessionId ?? null, cursor, minTs) as Row | undefined;
+      .get(repo, toName, session, session, session, toName, cursor, minTs) as Row | undefined;
     return row ? mapMessage(row) : null;
   }
 
@@ -435,11 +444,19 @@ export class Store {
           `SELECT * FROM messages
            WHERE repo = ? AND seq > ?
              AND topic = ?
-             AND (to_name IS NULL OR to_name = '*' OR to_name = ? OR (? IS NOT NULL AND to_name = ?))
+             AND (
+               to_name IS NULL
+               OR to_name = '*'
+               OR to_name = ?
+               OR (? IS NOT NULL AND to_name = ?)
+               OR (? IS NULL AND EXISTS (
+                 SELECT 1 FROM agents ag WHERE ag.repo = messages.repo AND ag.session_id = messages.to_name AND ag.name = ?
+               ))
+             )
            ORDER BY seq ASC
            LIMIT ?`,
         )
-        .all(repo, since, topic, opts.to ?? "", session, session, limit) as Row[];
+        .all(repo, since, topic, opts.to ?? "", session, session, session, opts.to ?? "", limit) as Row[];
       return rows.map(mapMessage);
     }
     const subKey = opts.subscriptionKey ?? (session || `name:${opts.to ?? ""}`);
@@ -449,7 +466,13 @@ export class Store {
         `SELECT * FROM messages m
          WHERE m.repo = ? AND m.seq > ? AND m.topic != 'presence'
            AND (
-             (m.to_name IS NOT NULL AND m.to_name != '*' AND (m.to_name = ? OR (? IS NOT NULL AND m.to_name = ?)))
+             (m.to_name IS NOT NULL AND m.to_name != '*' AND (
+               m.to_name = ?
+               OR (? IS NOT NULL AND m.to_name = ?)
+               OR (? IS NULL AND EXISTS (
+                 SELECT 1 FROM agents ag WHERE ag.repo = m.repo AND ag.session_id = m.to_name AND ag.name = ?
+               ))
+             ))
              OR
              ((m.to_name IS NULL OR m.to_name = '*') AND (
                m.topic = 'repo'
@@ -466,7 +489,7 @@ export class Store {
          ORDER BY m.seq ASC
          LIMIT ?`,
       )
-      .all(repo, since, opts.to ?? "", session, session, isOrch, subKey, limit) as Row[];
+      .all(repo, since, opts.to ?? "", session, session, session, opts.to ?? "", isOrch, subKey, limit) as Row[];
     return rows.map(mapMessage);
   }
 
@@ -483,10 +506,18 @@ export class Store {
     const rows = this.db.prepare(
       `SELECT * FROM messages WHERE repo = ?
          AND seq > MAX(?, COALESCE((SELECT MAX(cursor) FROM cursors WHERE repo = ? AND client_key = ?), 0))
-         AND (to_name IS NULL OR to_name = '*' OR to_name = ? OR (? IS NOT NULL AND to_name = ?))
+         AND (
+           to_name IS NULL
+           OR to_name = '*'
+           OR to_name = ?
+           OR (? IS NOT NULL AND to_name = ?)
+           OR (? IS NULL AND EXISTS (
+             SELECT 1 FROM agents ag WHERE ag.repo = messages.repo AND ag.session_id = messages.to_name AND ag.name = ?
+           ))
+         )
          AND ((? IS NULL AND topic != 'presence') OR topic = ?)
        ORDER BY seq ASC LIMIT 200`,
-    ).all(repo, since, repo, inboxCursorKey(cursorKey, topic), to, session, session, topic ?? null, topic ?? null) as Row[];
+    ).all(repo, since, repo, inboxCursorKey(cursorKey, topic), to, session, session, session, to, topic ?? null, topic ?? null) as Row[];
     return rows.map(mapMessage);
   }
 
@@ -501,9 +532,17 @@ export class Store {
     const row = this.db.prepare(
       `SELECT COALESCE(MAX(seq), 0) AS seq FROM messages WHERE repo = ?
          AND seq > COALESCE((SELECT MAX(cursor) FROM cursors WHERE repo = ? AND client_key = ?), 0)
-         AND (to_name IS NULL OR to_name = '*' OR to_name = ? OR (? IS NOT NULL AND to_name = ?))
+         AND (
+           to_name IS NULL
+           OR to_name = '*'
+           OR to_name = ?
+           OR (? IS NOT NULL AND to_name = ?)
+           OR (? IS NULL AND EXISTS (
+             SELECT 1 FROM agents ag WHERE ag.repo = messages.repo AND ag.session_id = messages.to_name AND ag.name = ?
+           ))
+         )
          AND ((? IS NULL AND topic != 'presence') OR topic = ?)`,
-    ).get(repo, repo, inboxCursorKey(cursorKey, topic), to, session, session, topic ?? null, topic ?? null) as { seq: number };
+    ).get(repo, repo, inboxCursorKey(cursorKey, topic), to, session, session, session, to, topic ?? null, topic ?? null) as { seq: number };
     return row.seq;
   }
 
