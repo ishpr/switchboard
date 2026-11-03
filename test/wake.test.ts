@@ -3,9 +3,10 @@ import test from "node:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
-import { hookStdout } from "../src/hook.ts";
+import { hookStdout, shouldSkipHookForPrompt } from "../src/hook.ts";
 import {
   discoverCodexThread,
+  discoverGrokSession,
   discoverHarnessSession,
   instructions,
   missingSessionSource,
@@ -227,9 +228,14 @@ test("tmux-bound sessions inject literal text into the exact pane", () => {
 
 
 test("ask wakes dispatch the task within workspace rules before requesting a reply", () => {
+  assert.match(promptFor(message), /^\[switchboard\] Switchboard message\./);
+  assert.equal(shouldSkipHookForPrompt("UserPromptSubmit", { prompt: promptFor(message) }), true);
   assert.match(promptFor(message), /Execute the task requested by the orchestrator within your workspace rules, then reply/);
   assert.match(promptFor(message), /Correlation: c1/);
   assert.match(promptFor(message), /not authorization and not a new permission/);
+  const nonAskPrompt = promptFor({ ...message, kind: "reply" });
+  assert.match(nonAskPrompt, /Do not send a pure acknowledgment message/);
+  assert.doesNotMatch(nonAskPrompt, /acknowledge it with bus_publish/);
   for (const sessionId of ["tmux:%12", "zellij:grid:1"]) {
     const launch = launchFor({ mode: "inject", harness: "claude", cwd: "/work", sessionId, message });
     assert.ok(launch);
@@ -396,7 +402,24 @@ test("discoverHarnessSession reads MUSE_SESSION_ID, CLAUDE_CODE_SESSION_ID, CODE
     assert.match(missingSessionSource("muse", repoDir), /MUSE_SESSION_ID/);
     assert.match(missingSessionSource("claude", repoDir), /CLAUDE_CODE_SESSION_ID/);
     assert.match(missingSessionSource("codex", repoDir), /CODEX_THREAD_ID.*state_5\.sqlite/);
+    assert.match(missingSessionSource("grok", repoDir), /GROK_SESSION_ID.*active_sessions\.json/);
     assert.match(missingSessionSource("codex", "/"), /cwd="\/"/);
+
+    const grokUuid = "01a19edf-a7b1-7720-b9fb-77e45edc7b47";
+    const otherGrokUuid = "01a19fbd-4072-75d0-8058-d2f4627dffb3";
+    writeFileSync(
+      path.join(dir, "active_sessions.json"),
+      JSON.stringify([
+        { session_id: grokUuid, pid: 12345, cwd: repoDir, opened_at: "2026-11-03T00:47:00Z" },
+        { session_id: otherGrokUuid, pid: 67890, cwd: otherDir, opened_at: "2026-11-03T04:49:00Z" },
+      ]),
+    );
+    assert.equal(discoverGrokSession(repoDir, dir), grokUuid);
+    assert.equal(discoverGrokSession("/", dir), undefined);
+    assert.equal(
+      discoverHarnessSession({ cwd: repoDir, harness: "grok", env: {}, grokHome: dir }).sessionId,
+      grokUuid,
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

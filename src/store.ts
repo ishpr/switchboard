@@ -102,6 +102,14 @@ CREATE TABLE IF NOT EXISTS subscriptions (
   since_seq INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (repo, session_key, topic)
 );
+
+CREATE TABLE IF NOT EXISTS deferred_wakes (
+  repo TEXT NOT NULL,
+  target TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (repo, target)
+);
 `;
 
 export class Store {
@@ -822,6 +830,49 @@ export class Store {
     } catch (error) {
       this.db.exec("ROLLBACK");
       throw error;
+    }
+  }
+
+  saveDeferredWake(repo: string, target: string, seq: number): void {
+    this.db
+      .prepare(
+        `INSERT INTO deferred_wakes (repo, target, seq, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(repo, target) DO UPDATE SET
+           seq = MAX(deferred_wakes.seq, excluded.seq),
+           updated_at = excluded.updated_at`,
+      )
+      .run(repo, target, seq, Date.now());
+  }
+
+  clearDeferredWake(repo: string, target: string): void {
+    this.db.prepare("DELETE FROM deferred_wakes WHERE repo = ? AND target = ?").run(repo, target);
+  }
+
+  listDeferredWakes(repo?: string): Array<{ repo: string; target: string; seq: number }> {
+    if (repo !== undefined) {
+      return this.db
+        .prepare("SELECT repo, target, seq FROM deferred_wakes WHERE repo = ? ORDER BY seq ASC")
+        .all(repo) as Array<{ repo: string; target: string; seq: number }>;
+    }
+    return this.db
+      .prepare("SELECT repo, target, seq FROM deferred_wakes ORDER BY seq ASC")
+      .all() as Array<{ repo: string; target: string; seq: number }>;
+  }
+
+  /**
+   * Ensures a session_id or wake_session_id (tty/pane/UUID) bound in `repo` is not left
+   * bound in any other repo board, preventing cross-repo wake/injection mix-ups.
+   */
+  evictCrossRepoBinding(repo: string, sessionId?: string | null, wakeSessionId?: string | null): void {
+    for (const id of [sessionId, wakeSessionId]) {
+      if (!id) continue;
+      this.db
+        .prepare("UPDATE agents SET wake_session_id = NULL WHERE repo != ? AND wake_session_id = ?")
+        .run(repo, id);
+      this.db
+        .prepare("DELETE FROM agents WHERE repo != ? AND session_id = ?")
+        .run(repo, id);
     }
   }
 }
