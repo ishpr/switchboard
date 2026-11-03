@@ -985,6 +985,15 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     if (frame.orchestrator !== undefined && frame.orchestrator.trim()) {
       const nextOrch = resolveOrchestratorName(frame.orchestrator.trim());
       requireName(nextOrch);
+      const currentOrch = store.getOrchestrator(conn.repo);
+      if (
+        currentOrch &&
+        currentOrch !== nextOrch &&
+        conn.name !== currentOrch &&
+        conn.harness !== "cli"
+      ) {
+        throw new Error(`orchestrator is already ${currentOrch}; only ${currentOrch} or the CLI can reassign it`);
+      }
       store.setOrchestrator(conn.repo, nextOrch);
       for (const peer of conns) {
         if (peer.authed && peer.repo === conn.repo) {
@@ -1007,9 +1016,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       if (seen.has(spec.name)) continue;
       seen.add(spec.name);
 
-      const live = currentRows.find(
-        (row) => row.online && (row.name === spec.name || (spec.name === spec.harness && row.harness === spec.harness)),
-      );
+      const live = currentRows.find((row) => row.online && row.name === spec.name);
       if (live) {
         const wakeId = live.wakeSessionId ?? live.sessionId ?? null;
         const wakeInfo = decideWake({
@@ -1032,24 +1039,31 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       }
 
       if (mode === "headless") {
-        store.upsertAgent({
+        const existingOffline = store.getAgent(conn.repo, spec.name);
+        const resumableSession =
+          existingOffline?.sessionId &&
+          !TTY_RE.test(existingOffline.sessionId) &&
+          !existingOffline.sessionId.startsWith("zellij:") &&
+          !existingOffline.sessionId.startsWith("tmux:") &&
+          !/^%\d+$/.test(existingOffline.sessionId)
+            ? existingOffline.sessionId
+            : null;
+        store.saveInvitedAgent({
           repo: conn.repo,
           name: spec.name,
           harness: spec.harness,
-          sessionId: null,
+          sessionId: resumableSession,
           wakeSessionId: null,
           cwd: repoRootDir,
           branch: checkout.branch,
           head: checkout.head,
-          wake: true,
           status: "registered",
-          bySession: false,
         });
         invited.push({
           name: spec.name,
           harness: spec.harness,
           action: "registered_headless",
-          sessionId: null,
+          sessionId: resumableSession,
           wakeSessionId: null,
           wakeMode: "headless",
           detail: `registered for headless subscription CLI wake in ${repoRootDir}`,
@@ -1069,7 +1083,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         args: spec.args,
       });
       store.evictCrossRepoBinding(conn.repo, undefined, ttySession);
-      store.upsertAgent({
+      store.saveInvitedAgent({
         repo: conn.repo,
         name: spec.name,
         harness: spec.harness,
@@ -1078,9 +1092,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         cwd: repoRootDir,
         branch: checkout.branch,
         head: checkout.head,
-        wake: true,
         status: "invited",
-        bySession: false,
       });
       invited.push({
         name: spec.name,
