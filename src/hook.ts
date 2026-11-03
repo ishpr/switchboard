@@ -36,9 +36,13 @@ export function hookStdout(
     if (stopHookActive) return "";
     if (messages.length > 0 && (harness === "claude" || harness === "codex" || harness === "grok")) {
       const text = messages.map(formatMessage).join("\n\n");
+      const reason = `Switchboard has unread message(s) from another agent:\n\n${text}`;
+      if (harness === "codex") {
+        return `${JSON.stringify({ decision: "block", reason })}\n`;
+      }
       return `${JSON.stringify({
         decision: "block",
-        reason: `Switchboard has unread message(s) from another agent:\n\n${text}`,
+        reason,
         hookSpecificOutput: {
           hookEventName: "Stop",
           additionalContext: text,
@@ -51,6 +55,9 @@ export function hookStdout(
       (harness === "claude" || harness === "codex" || harness === "grok")
     ) {
       const reason = `[switchboard] You finished your turn without replying to bus_ask from ${pendingAsk.fromName} (correlationId="${pendingAsk.correlationId}"). Inline terminal output is NOT delivered over Switchboard. Call bus_reply with correlationId="${pendingAsk.correlationId}" now to send your response.`;
+      if (harness === "codex") {
+        return `${JSON.stringify({ decision: "block", reason })}\n`;
+      }
       return `${JSON.stringify({
         decision: "block",
         reason,

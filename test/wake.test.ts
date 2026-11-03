@@ -14,7 +14,7 @@ import {
 } from "../src/shim.ts";
 import { DatabaseSync } from "node:sqlite";
 import type { BusMessage } from "../src/types.ts";
-import { decideWake, headlessLaunch, launchFor, promptFor, spawnWake } from "../src/wake.ts";
+import { decideWake, headlessLaunch, isCodexTurnInProgress, launchFor, promptFor, spawnWake } from "../src/wake.ts";
 
 const message: BusMessage = {
   id: "m1",
@@ -164,6 +164,15 @@ test("hook stdout matches the harness that can actually attach context", () => {
   const grok = JSON.parse(hookStdout("grok", "Stop", [message]));
   assert.equal(grok.decision, "block");
   assert.match(grok.hookSpecificOutput.additionalContext, /correlation=c1/);
+
+  const codexStop = JSON.parse(hookStdout("codex", "Stop", [message]));
+  assert.equal(codexStop.decision, "block");
+  assert.match(codexStop.reason, /correlation=c1/);
+  assert.equal(codexStop.hookSpecificOutput, undefined);
+
+  const codexPost = JSON.parse(hookStdout("codex", "PostToolUse", [message]));
+  assert.equal(codexPost.hookSpecificOutput.hookEventName, "PostToolUse");
+  assert.match(codexPost.hookSpecificOutput.additionalContext, /look at the test/);
 
   const cursor = JSON.parse(hookStdout("cursor", "postToolUse", [message]));
   assert.match(cursor.additional_context, /look at the test/);
@@ -388,6 +397,54 @@ test("discoverHarnessSession reads MUSE_SESSION_ID, CLAUDE_CODE_SESSION_ID, CODE
     assert.match(missingSessionSource("claude", repoDir), /CLAUDE_CODE_SESSION_ID/);
     assert.match(missingSessionSource("codex", repoDir), /CODEX_THREAD_ID.*state_5\.sqlite/);
     assert.match(missingSessionSource("codex", "/"), /cwd="\/"/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("isCodexTurnInProgress reads latest rollout_ordinal status from ~/.codex/thread_history_1.sqlite", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "sb-codex-turn-"));
+  const codexDir = path.join(dir, ".codex");
+  mkdirSync(codexDir, { recursive: true });
+  const dbPath = path.join(codexDir, "thread_history_1.sqlite");
+  const db = new DatabaseSync(dbPath);
+  db.exec(`
+    CREATE TABLE thread_turns (
+      thread_id TEXT NOT NULL,
+      turn_id TEXT NOT NULL,
+      rollout_ordinal INTEGER NOT NULL,
+      status TEXT NOT NULL
+    );
+  `);
+  const threadId = "01a175cd-251c-7571-abb3-21ea77b5d73d";
+  db.prepare("INSERT INTO thread_turns (thread_id, turn_id, rollout_ordinal, status) VALUES (?, ?, ?, ?)").run(
+    threadId,
+    "turn-1",
+    10,
+    "completed",
+  );
+  db.prepare("INSERT INTO thread_turns (thread_id, turn_id, rollout_ordinal, status) VALUES (?, ?, ?, ?)").run(
+    threadId,
+    "turn-2",
+    20,
+    "inProgress",
+  );
+  db.close();
+
+  try {
+    assert.equal(isCodexTurnInProgress(threadId, codexDir), true);
+    assert.equal(isCodexTurnInProgress("01a175cd-0000-7000-8000-000000000000", codexDir), false);
+    assert.equal(isCodexTurnInProgress("not-a-uuid", codexDir), false);
+
+    const db2 = new DatabaseSync(dbPath);
+    db2.prepare("INSERT INTO thread_turns (thread_id, turn_id, rollout_ordinal, status) VALUES (?, ?, ?, ?)").run(
+      threadId,
+      "turn-3",
+      30,
+      "completed",
+    );
+    db2.close();
+    assert.equal(isCodexTurnInProgress(threadId, codexDir), false);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

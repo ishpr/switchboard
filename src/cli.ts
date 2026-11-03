@@ -998,10 +998,14 @@ async function hook(): Promise<void> {
     inferClaudeAgentName() ||
     harness;
   const stdinCwd = stdinJson && typeof stdinJson.cwd === "string" ? stdinJson.cwd : "";
+  const stdinSessionId =
+    stdinJson && typeof stdinJson.session_id === "string" && stdinJson.session_id.trim()
+      ? stdinJson.session_id.trim()
+      : undefined;
   const cwd = values.cwd || stdinCwd || process.cwd();
   let client: BusClient;
   try {
-    client = await connectCli(cwd, callerName);
+    client = await connectCli(cwd, callerName, undefined, undefined, stdinSessionId);
   } catch {
     return;
   }
@@ -1025,6 +1029,7 @@ async function connectCli(
   name = "cli",
   roleArg?: string,
   scope?: RepoScope,
+  sessionId?: string,
 ): Promise<BusClient> {
   const { url, token } = await ensureDaemon();
   const role = roleArg === "orchestrator" || process.env.SWITCHBOARD_ROLE === "orchestrator"
@@ -1038,6 +1043,7 @@ async function connectCli(
     repoKey: repoKey(cwd, scope),
     cwd,
     ...(role ? { role } : {}),
+    ...(sessionId ? { sessionId } : {}),
   };
   const client = new BusClient();
   await client.connect(url, hello);
