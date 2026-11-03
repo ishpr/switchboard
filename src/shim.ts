@@ -409,7 +409,8 @@ function registerTools(mcp: McpServer, bus: BusClient, role: Role,
   mcp.registerTool(
     "bus_subscribe",
     {
-      description: "Subscribe this session to a topic. Pushes arrive only on harnesses that can surface them.",
+      description:
+        "Subscribe this session to a topic. The topic is live from now on in pushes and default bus_inbox; read older mail on that topic with bus_inbox and topic=<name>. Subscriptions persist for this session across reconnects.",
       inputSchema: { topic: z.string() },
     },
     async ({ topic }) => {
@@ -421,7 +422,8 @@ function registerTools(mcp: McpServer, bus: BusClient, role: Role,
   mcp.registerTool(
     "bus_unsubscribe",
     {
-      description: "Stop receiving a topic.",
+      description:
+        "Stop receiving a custom topic in pushes and default bus_inbox. repo and presence cannot be removed.",
       inputSchema: { topic: z.string() },
     },
     async ({ topic }) => {

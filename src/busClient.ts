@@ -108,7 +108,11 @@ export class BusClient {
 
   async request(frame: ClientFrame): Promise<ServerFrame> {
     if (frame.type === "subscribe") for (const topic of frame.topics) this.subscribedTopics.add(topic);
-    if (frame.type === "unsubscribe") for (const topic of frame.topics) this.subscribedTopics.delete(topic);
+    if (frame.type === "unsubscribe") {
+      for (const topic of frame.topics) {
+        if (topic !== "repo" && topic !== "presence") this.subscribedTopics.delete(topic);
+      }
+    }
     const socket = await this.ensureConnected();
     if (!this.legacyOnly) return this.rawRequest(socket, frame);
     const operation = this.legacyTail.then(async () => this.rawRequest(await this.ensureConnected(), frame));

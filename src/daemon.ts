@@ -198,15 +198,42 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       case "publish":
         await publish(conn, frame, respond);
         break;
-      case "subscribe":
+      case "subscribe": {
         for (const topic of frame.topics) requireTopic(topic);
-        for (const topic of frame.topics) conn.topics.add(topic);
-        respond({ type: "ok", detail: `subscribed ${[...frame.topics].join(",")}` });
+        const sinceSeq = store.maxSeq(conn.repo);
+        store.subscribe(conn.repo, subscriptionKey(conn), frame.topics, sinceSeq);
+        for (const topic of frame.topics) {
+          conn.topics.add(topic);
+          for (const peer of conns) {
+            if (peer.authed && groupKey(peer) === groupKey(conn)) peer.topics.add(topic);
+          }
+        }
+        const joined = [...frame.topics].join(",");
+        respond({
+          type: "ok",
+          detail: `subscribed ${joined}; live from now on. Read older mail with bus_inbox and topic=${joined}.`,
+        });
         break;
-      case "unsubscribe":
-        for (const topic of frame.topics) conn.topics.delete(topic);
-        respond({ type: "ok", detail: "unsubscribed" });
+      }
+      case "unsubscribe": {
+        for (const topic of frame.topics) requireTopic(topic);
+        const removable = frame.topics.filter((topic) => topic !== "repo" && topic !== "presence");
+        store.unsubscribe(conn.repo, subscriptionKey(conn), removable);
+        for (const topic of removable) {
+          conn.topics.delete(topic);
+          for (const peer of conns) {
+            if (peer.authed && groupKey(peer) === groupKey(conn)) peer.topics.delete(topic);
+          }
+        }
+        const kept = frame.topics.filter((topic) => topic === "repo" || topic === "presence");
+        respond({
+          type: "ok",
+          detail: kept.length
+            ? `unsubscribed${removable.length ? ` ${removable.join(",")}` : ""}; ${kept.join(",")} cannot be removed`
+            : "unsubscribed",
+        });
         break;
+      }
       case "inbox":
         inbox(conn, frame.since, frame.topic, frame.limit, respond);
         break;
@@ -381,9 +408,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     conn.status = [...conns].find((peer) => peer !== conn && peer.authed && groupKey(peer) === groupKey(conn))?.status
       || frame.status || existing?.status || "online";
     conn.role = elect(conn.repo, conn.name, frame.role === "orchestrator");
-    conn.topics.add("repo");
-    conn.topics.add("presence");
-    if (conn.role === "orchestrator") conn.topics.add("reports");
+    restoreSubscriptions(conn);
     if (conn.cwd !== "/" && conn.harness !== "cli" && !conn.waitOnly && (!existing || conn.sessionBound)) {
       store.upsertAgent({
         repo: conn.repo,
@@ -444,7 +469,9 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
           peer.topics.add("reports");
         } else if (peer.role === "orchestrator") {
           peer.role = "worker";
-          peer.topics.delete("reports");
+          if (!store.subscriptions(conn.repo, subscriptionKey(peer)).has("reports")) {
+            peer.topics.delete("reports");
+          }
         }
       }
     }
@@ -520,6 +547,23 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       )
     ) {
       store.touchAgent(conn.repo, conn.name, "offline", conn.sessionId);
+    }
+  }
+
+  function subscriptionKey(conn: Conn): string {
+    if (conn.sessionId) return conn.sessionId;
+    if (conn.declaredSession) return conn.declaredSession;
+    const stored = store.getAgent(conn.repo, conn.name);
+    if (stored?.sessionId) return stored.sessionId;
+    return `name:${conn.name}`;
+  }
+
+  function restoreSubscriptions(conn: Conn): void {
+    conn.topics.add("repo");
+    conn.topics.add("presence");
+    if (conn.role === "orchestrator") conn.topics.add("reports");
+    for (const topic of store.subscriptions(conn.repo, subscriptionKey(conn)).keys()) {
+      conn.topics.add(topic);
     }
   }
 
@@ -729,6 +773,8 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       topic,
       to: conn.name,
       sessionId: conn.sessionId,
+      subscriptionKey: subscriptionKey(conn),
+      isOrchestrator: conn.role === "orchestrator",
       limit: pageSize,
     });
     const next = messages.length ? messages[messages.length - 1]!.seq : cursor;
@@ -756,6 +802,9 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     const existing = frame.sessionId
       ? store.getAgentBySession(conn.repo, frame.sessionId)
       : store.getAgent(conn.repo, frame.name);
+    if (frame.sessionId) {
+      store.migrateSubscriptions(conn.repo, `name:${frame.name}`, frame.sessionId);
+    }
     if (frame.sessionId && !frame.sessionId.startsWith("zellij:")) {
       const sessionKey = `${frame.name}:${frame.sessionId}`;
       const baseCursor = store.cursor(conn.repo, frame.name);
@@ -793,6 +842,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       conn.branch = checkout.branch ?? conn.branch;
       conn.head = checkout.head ?? conn.head;
       conn.wake = wake;
+      restoreSubscriptions(conn);
     } else {
       for (const peer of conns) {
         if (!peer.authed || peer.repo !== conn.repo || peer.name !== frame.name || peer.harness === "cli") continue;
@@ -807,6 +857,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         peer.branch = checkout.branch ?? peer.branch;
         peer.head = checkout.head ?? peer.head;
         peer.wake = wake;
+        restoreSubscriptions(peer);
       }
     }
     respond({ type: "registered", name: frame.name, agent: saved, created: !existing });
