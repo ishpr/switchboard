@@ -56,6 +56,11 @@ function canInject(harness: string, sessionId?: string | null): boolean {
   return harness === "codex" || harness === "muse";
 }
 
+// Pane injection uses the multiplexer session, so a removed agent worktree is safe to bypass.
+function paneWakeCwd(cwd: string): string {
+  return existsSync(cwd) ? cwd : homedir();
+}
+
 export function launchFor(input: {
   mode: WakeMode;
   harness: string;
@@ -78,7 +83,7 @@ export function launchFor(input: {
           tmux[1]!,
           panePromptFor(input.message),
         ],
-        cwd: input.cwd,
+        cwd: paneWakeCwd(input.cwd),
       };
     }
     if (input.sessionId?.startsWith("zellij:")) {
@@ -97,7 +102,7 @@ export function launchFor(input: {
             zPane,
             panePromptFor(input.message),
           ],
-          cwd: input.cwd,
+          cwd: paneWakeCwd(input.cwd),
         };
       }
     }

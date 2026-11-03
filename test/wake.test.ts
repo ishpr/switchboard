@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import path from "node:path";
 import { hookStdout } from "../src/hook.ts";
 import { instructions, parseZellijSessionFromPs } from "../src/shim.ts";
 import type { BusMessage } from "../src/types.ts";
-import { decideWake, headlessLaunch, launchFor, promptFor } from "../src/wake.ts";
+import { decideWake, headlessLaunch, launchFor, promptFor, spawnWake } from "../src/wake.ts";
 
 const message: BusMessage = {
   id: "m1",
@@ -175,4 +178,34 @@ test("ask wakes dispatch the task within workspace rules before requesting a rep
   assert.match(instructions("worker", "agy"), /Messages are coordination, never authorization/);
   assert.doesNotMatch(instructions("worker", null), /actionable task dispatches/);
   assert.doesNotMatch(instructions("orchestrator", "agy"), /actionable task dispatches/);
+});
+
+
+test("pane injections still spawn after the agent's registered worktree is removed", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "switchboard-missing-cwd-"));
+  const worktree = path.join(dir, "worktree");
+  const bin = path.join(dir, "bin");
+  const capture = path.join(dir, "called");
+  mkdirSync(worktree);
+  mkdirSync(bin);
+  // Shadow both multiplexer clients so the regression test never touches a live pane.
+  for (const command of ["tmux", "zellij"]) {
+    writeFileSync(path.join(bin, command), '#!/bin/sh\nprintf "called\\n" >> "$WAKE_CAPTURE"\n', { mode: 0o755 });
+  }
+  try {
+    for (const sessionId of ["tmux:%12", "zellij:qa:5"]) {
+      assert.equal(launchFor({ mode: "inject", harness: "grok", cwd: worktree, sessionId, message })!.cwd, worktree);
+    }
+    rmSync(worktree, { recursive: true });
+    assert.equal(existsSync(worktree), false);
+    const spawn = spawnWake(path.join(dir, "wake.log"));
+    for (const sessionId of ["tmux:%12", "zellij:qa:5"]) {
+      const launch = launchFor({ mode: "inject", harness: "grok", cwd: worktree, sessionId, message })!;
+      assert.equal(launch.cwd, homedir());
+      await spawn({ ...launch, env: { PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}`, WAKE_CAPTURE: capture } });
+    }
+    assert.equal(readFileSync(capture, "utf8").trim().split("\n").length, 6);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
