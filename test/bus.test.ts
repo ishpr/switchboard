@@ -274,7 +274,10 @@ test("two sessions of one harness poll separately and both stay visible", async 
     assert.equal(readBySecond.type, "inbox");
     if (readBySecond.type !== "inbox") return;
     assert.ok(readBySecond.messages.some((entry) => entry.body === "from grok-a"));
-    assert.ok(readBySecond.messages.some((entry) => entry.topic === "presence" && entry.body.includes("grok-a")));
+    assert.equal(readBySecond.messages.some((entry) => entry.topic === "presence"), false);
+    const presence = await second.request({ type: "inbox", topic: "presence" });
+    assert.equal(presence.type, "inbox");
+    if (presence.type === "inbox") assert.ok(presence.messages.some((entry) => entry.body.includes("grok-a")));
 
     const readByFirst = await first.request({ type: "inbox" });
     assert.equal(readByFirst.type, "inbox");
@@ -621,7 +624,7 @@ test("orchestrator can be configured independently per repo and reassigned dynam
   }
 });
 
-test("multi-turn reply on the same correlationId routes to the other party and live who inherits registered sessionId", async () => {
+test("multi-turn replies route to the other party and who separates an unbound connection from its registered wake target", async () => {
   const fx = await fixture();
   const registrar = await join(fx, "cli", "repo-a", { harness: "cli" });
   await registrar.request({
@@ -640,7 +643,8 @@ test("multi-turn reply on the same correlationId routes to the other party and l
     const who = await agy.request({ type: "who" });
     assert.equal(who.type, "who");
     if (who.type === "who") {
-      assert.equal(who.agents.find((a) => a.name === "muse")?.sessionId, "zellij:switchboard:6");
+      assert.equal(who.agents.find((a) => a.name === "muse")?.sessionId, null);
+      assert.equal(who.agents.find((a) => a.name === "muse")?.wakeSessionId, "zellij:switchboard:6");
     }
 
     // 1. muse asks agy

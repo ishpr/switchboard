@@ -69,6 +69,7 @@ export function launchFor(input: {
     const tmux = /^(?:tmux:)?(%\d+)$/.exec(input.sessionId ?? "");
     if (tmux) {
       return {
+        completion: "exit",
         cmd: "sh",
         args: [
           "-c",
@@ -86,6 +87,7 @@ export function launchFor(input: {
       const zPane = parts[2];
       if (zSession && zPane) {
         return {
+          completion: "exit",
           cmd: "sh",
           args: [
             "-c",
@@ -101,6 +103,7 @@ export function launchFor(input: {
     }
     if (input.harness === "codex" && input.sessionId) {
       return {
+        completion: "exit",
         cmd: codexBin(),
         args: [
           "queue",
@@ -117,6 +120,7 @@ export function launchFor(input: {
     }
     if (input.harness === "muse" && input.sessionId) {
       return {
+        completion: "exit",
         cmd: "muse",
         args: ["session-message", "send", "--target", input.sessionId, "--json"],
         cwd: input.cwd,
@@ -221,33 +225,43 @@ function kimiBin(): string {
 
 export type SpawnWake = (launch: WakeLaunch) => Promise<void>;
 
-export function spawnWake(logFile: string): SpawnWake {
-  return (launch) =>
-    new Promise((resolve, reject) => {
-      const child = spawn(launch.cmd, launch.args, {
-        cwd: launch.cwd,
-        detached: true,
-        env: launch.env ? { ...process.env, ...launch.env } : process.env,
-        stdio: launch.stdin === undefined ? "ignore" : ["pipe", "ignore", "ignore"],
-      });
-      const finish = (error?: Error) => {
-        if (error) {
-          appendFileSync(logFile, `${new Date().toISOString()} spawn error ${error.message}\n`);
-          reject(error);
-          return;
-        }
-        child.unref();
-        resolve();
-      };
-      child.once("error", (error) => finish(error));
-      child.once("spawn", () => {
-        if (launch.stdin !== undefined && child.stdin) {
-          child.stdin.write(launch.stdin);
-          child.stdin.end();
-        }
-        finish();
-      });
+export function spawnWake(logFile: string, options: { injectionTimeoutMs?: number } = {}): SpawnWake {
+  return (launch) => new Promise((resolve, reject) => {
+    const waitForExit = launch.completion === "exit";
+    const child = spawn(launch.cmd, launch.args, {
+      cwd: launch.cwd, detached: true,
+      env: launch.env ? { ...process.env, ...launch.env } : process.env,
+      stdio: launch.stdin === undefined ? "ignore" : ["pipe", "ignore", "ignore"],
     });
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) {
+        try { appendFileSync(logFile, `${new Date().toISOString()} wake error ${error.message}\n`); } catch { /* Preserve the original launch error. */ }
+        reject(error);
+      } else { child.unref(); resolve(); }
+    };
+    child.once("error", finish);
+    child.stdin?.once("error", finish);
+    child.once("spawn", () => {
+      if (launch.stdin !== undefined) child.stdin?.end(launch.stdin);
+      if (!waitForExit) finish();
+    });
+    if (waitForExit) {
+      child.once("exit", (code, signal) => finish(code === 0 ? undefined : new Error(`injection exited with ${signal ?? code}`)));
+      timer = setTimeout(() => {
+        // The detached injection wrapper and its children own this process group;
+        // the already-running target pane/server is outside it.
+        if (process.platform !== "win32" && child.pid) {
+          try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); }
+        } else child.kill("SIGKILL");
+        finish(new Error("injection timed out"));
+      }, options.injectionTimeoutMs ?? 4000);
+    }
+  });
 }
 
 export function logWake(logFile: string, launch: WakeLaunch, messageId: string): void {

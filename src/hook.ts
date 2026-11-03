@@ -17,6 +17,12 @@ export function shouldSkipHookForPrompt(
   return prompt.startsWith("[switchboard]");
 }
 
+export function supportsHookOutput(harness: string, event: string): boolean {
+  if (event === "Stop") return ["claude", "codex", "grok"].includes(harness);
+  if (["claude", "codex"].includes(harness)) return ["UserPromptSubmit", "SessionStart", "PostToolUse"].includes(event);
+  return harness === "cursor" && ["postToolUse", "PostToolUse"].includes(event);
+}
+
 /** Hooks cannot wake an idle agent. They attach mail to a running turn or block Stop when a reply is owed. */
 export function hookStdout(
   harness: string,
@@ -25,6 +31,7 @@ export function hookStdout(
   pendingAsk: BusMessage | null = null,
   stopHookActive = false,
 ): string {
+  if (!supportsHookOutput(harness, event)) return "";
   if (event === "Stop") {
     if (stopHookActive) return "";
     if (messages.length > 0 && (harness === "claude" || harness === "codex" || harness === "grok")) {

@@ -1,7 +1,7 @@
 import { setTimeout as sleep } from "node:timers/promises";
 import { performance } from "node:perf_hooks";
 import type { Store } from "./store.ts";
-import { NAME_RE } from "./types.ts";
+import { NAME_RE, TOPIC_RE } from "./types.ts";
 import type { BusMessage } from "./types.ts";
 
 export type WaitOptions = {
@@ -12,6 +12,7 @@ export type WaitOptions = {
   sinceSeq?: number;
   wakeExisting?: boolean;
   cursorKey?: string;
+  topic?: string;
   signal?: AbortSignal;
 };
 
@@ -50,15 +51,16 @@ export async function waitForMessages(store: Store, options: WaitOptions, clock:
   if (options.sinceSeq !== undefined && (!Number.isSafeInteger(options.sinceSeq) || options.sinceSeq < 0)) {
     throw new Error("--since-seq must be a non-negative safe integer");
   }
+  if (options.topic !== undefined && !TOPIC_RE.test(options.topic)) throw new Error("invalid wait topic");
   const now = clock.now ?? (() => performance.now());
   options.signal?.throwIfAborted();
   const pause = clock.sleep ?? ((ms: number) => sleep(ms, undefined, { signal: options.signal }));
   const deadline = now() + timeoutMs;
-  const baseline = options.sinceSeq ?? (options.wakeExisting ? 0 : store.latestUnreadSeq(options.repo, options.to, options.cursorKey));
+  const baseline = options.sinceSeq ?? (options.wakeExisting ? 0 : store.latestUnreadSeq(options.repo, options.to, options.cursorKey, options.topic));
   clock.onReady?.(baseline);
   while (true) {
     options.signal?.throwIfAborted();
-    const messages = store.unreadForWait(options.repo, options.to, baseline, options.cursorKey);
+    const messages = store.unreadForWait(options.repo, options.to, baseline, options.cursorKey, options.topic);
     if (messages.length) {
       return { status: "MESSAGES", since_seq: baseline, messages: messages.map((message) => ({
         seq: message.seq, from: message.fromName, to: message.to ?? "*", topic: message.topic,

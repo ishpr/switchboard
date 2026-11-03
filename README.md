@@ -121,7 +121,7 @@ The orchestrator assigns work with `bus_ask`. The agent answers with `bus_reply`
 
 Any agent running inside a Zellij pane binds `zellij:<session>:<pane>` automatically when its MCP shim connects, so `bus_ask` and `bus_report` can wake an idle pane directly by injecting into Zellij. Codex and Muse can also be injected via their session ids (`codex queue`, `muse session-message send`). A broadcast does not start anyone. The role is coordination. It does not grant permission.
 
-Several sessions of one CLI can share a checkout. Each shim picks its own session id, polls its own inbox, and announces `online` and `offline` on the `presence` topic. `bus_who` lists every live session. Asking the shared name delivers to every open session of that name. Set `SWITCHBOARD_SESSION` when a session should be the one Codex or Muse injects into.
+Several sessions of one CLI can share a checkout. Distinct declared sessions keep their own inboxes and remain separate in `bus_who`. Connections with the same agent/session are coalesced with `connectionCount` and `connectionIds`; their `online`/`offline` presence is aggregated and brief reconnects are debounced. Unbound connections show no session ID; `wakeSessionId` separately identifies a registered wake target. They cannot overwrite that target's harness, directory or wake policy. Asking the shared name delivers to the open sessions of that name. Set `SWITCHBOARD_SESSION` when a session should be the one Codex or Muse injects into.
 
 ## Daemon
 
@@ -156,7 +156,7 @@ The shim registers these MCP tools. Call `bus_inbox` at the start of a turn and 
 
 The same verbs exist on the CLI: `who`, `publish`, `inbox`, `wait`, `ask`, `reply`, `report`, `status`, `orchestrator`, `agent add`, `account`, `hook`, `token`, `init`, `--resume` (`-c`), and `--restart` (`-r`).
 
-Delivery is at least once. Each row has an id. Dedupe on that id. Bodies are capped at 32 KB.
+Messages are retained in the store. Inbox reads advance their cursor; replaying history or reading separate topic views can return the same message again, so dedupe on its ID. Bodies are capped at 32 KB.
 
 Topics are names like `repo` or `review`. The namespace is a hash of the git common dir (`SWITCHBOARD_SCOPE=share`, the default), so the main checkout and linked git worktrees share a board while separate clones do not meet. Set `SWITCHBOARD_SCOPE=split` to hash the git toplevel instead so a worktree gets its own board. `SWITCHBOARD_REPO_KEY` overrides the hash.
 
@@ -356,8 +356,11 @@ accepts 1–200. Empty results are an empty array (or `pending_asks: none` in te
 
 A reply matches the ask's stored **correlation ID**, which is separate from its
 message ID in Switchboard. Pass `correlation_id` to `bus_reply` as `correlationId`.
-Matching `kind=reply` messages remove the ask from the tracker immediately; inbox
-reads and progress publications/reports do not. Tracking persists across daemon
+Only a matching `kind=reply` from the assigned recipient back to the sender removes
+the ask from the tracker. Sender follow-ups, inbox reads and progress publications/
+reports do not close the obligation. Replies are restricted to the original ask's
+participants; multi-turn follow-ups remain supported. The same completion rule is
+used by status, metrics and Stop enforcement, without an implicit 30-minute expiry. Tracking persists across daemon
 restarts and follows the current board's shared/split worktree scope, including
 `SWITCHBOARD_SCOPE` and `SWITCHBOARD_REPO_KEY`. Restart the daemon after upgrading
 to enable tracking.
@@ -393,13 +396,15 @@ Flags:
 - `--session <id>` selects a native session's inbox cursor (`name:session`) instead
   of the recipient's name cursor. Zellij sessions use the name cursor, as `bus_inbox`
   does. Use this when monitoring a specific session-bound Codex/Muse/etc. inbox.
+- `--topic <name>` selects a topic view. Presence is excluded unless selected explicitly.
 - `--json` prints a result object; normal output prints message summaries.
 
 Every poll also checks the recipient's current inbox cursor, so messages consumed
 by another reader are not returned. A wake returns up to 200 matching unread
 messages, oldest first, with `seq`, `from`, `to`, `topic`, `kind`, `correlation_id`,
 and a normalized 160-character `preview`. Broadcast summaries use `to: "*"`.
-Presence announcements are broadcasts and can wake a wait too.
+Presence announcements are excluded by default. Add `--topic presence` to wait for
+lifecycle events explicitly; other `--topic` values select that topic's view.
 
 Both a message wake and timeout exit 0. Text timeout output is `TIMEOUT`. JSON has
 `status` (`MESSAGES` or `TIMEOUT`), `since_seq`, and `messages` (empty on timeout).
@@ -411,7 +416,8 @@ stdout contains only the final result. Invalid arguments or store failures exit 
 
 `bus_wait` exposes the same non-consuming wait loop to MCP clients. Its inputs are
 `to` (default your agent name), `timeout_seconds` (integer 1–120, default 30),
-`interval_ms` (integer 1–60000, default 1500), `since_seq`, and `wake_existing`.
+`interval_ms` (integer 1–60000, default 1500), `since_seq`, `wake_existing`, and optional
+`topic`. Default waits ignore presence; select `topic: "presence"` to monitor it.
 It returns the same `status`, `since_seq`, and `messages` fields as `wait --json`,
 plus readable text. Use `bus_inbox` after a wake to consume the messages.
 
@@ -452,3 +458,55 @@ Each row contains:
 Progress publications and reports do not count as replies. Use these message-level
 counters as workload signals. Restart the daemon after upgrading to enable metrics
 in status responses.
+
+
+## Transport and lifecycle integrity
+
+Protocol v2 adds a unique `reqId` to requests and echoes it on responses, so a slow
+request cannot satisfy another concurrent call. Async validation and handler failures
+return error frames. Timed-out tagged requests are removed and late responses are
+ignored. Older clients remain supported through serialized daemon dispatch; newer
+clients serialize requests to older daemons and reconnect after an untagged timeout.
+Directed messages reach only their recipient, regardless of topic subscriptions.
+Broadcasts use no recipient (or `to: "*"`). Requesting `topic: "reports"` does not
+grant access to other agents' directed reports.
+
+Default inbox reads and waits exclude presence records. `bus_inbox(topic="presence")`
+opts into lifecycle history. Each topic-filtered inbox has an independent cursor;
+reading reports cannot advance the default cursor past an unread DM. Reading the
+same message from the default inbox and a topic view is possible; dedupe by ID.
+A topic-filtered wait uses that view's cursor. Live topic subscriptions still control
+push notifications separately from inbox reads.
+
+Wake delivery reserves a recipient's in-flight slot before starting a child process.
+Failure releases the reservation so a later attempt may retry. Short injection
+commands must exit successfully within four seconds; nonzero exits and timeouts
+are returned as wake failures. Offline headless launches remain detached and are
+acknowledged when the process starts. Unsupported hook harness/event combinations
+return before opening or consuming an inbox.
+
+## Build identity and upgrading
+
+`npm run build` now emits `dist/build-info.json`, recording package version,
+protocol version, commit SHA, dirty state and build time. Compiled processes load
+that file at startup, so later changes to checkout HEAD do not relabel an already
+running build. Source execution is labeled separately. A source archive without git
+metadata reports an unknown commit rather than inventing one.
+
+Daemon welcome, who, status and doctor responses carry version/build identity, PID
+and startup time. Status text/JSON and MCP structured content expose the daemon
+and client/shim builds. Doctor text displays both builds and warns about version,
+protocol or commit mismatches and connected shims that lack metadata. MCP server
+initialization advertises its version and commit as well.
+
+```sh
+switchboard status --json
+switchboard doctor --metadata --json
+```
+
+`doctor --metadata --json` returns `{daemon, client, warnings, agents, pruned}`.
+Existing doctor JSON array output and `{agents, pruned}` pruning output remain
+available without `--metadata`. Update and rebuild first, then restart the daemon
+and reconnect MCP shims/refresh the host tool catalog. Rebuilding files alone cannot
+change a schema already loaded by a long-running shim. Doctor can diagnose an older
+daemon's missing metadata without replacing it or killing agent panes.

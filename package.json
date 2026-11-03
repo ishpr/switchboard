@@ -1,6 +1,6 @@
 {
   "name": "switchboard",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "Local agent-to-agent message bus. One daemon, one stdio MCP shim, headless wake for idle CLIs.",
@@ -8,7 +8,7 @@
     "switchboard": "./dist/cli.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node scripts/write-build-info.mjs",
     "test": "node --experimental-strip-types --test test/*.test.ts",
     "switchboard": "node --experimental-strip-types src/cli.ts"
   },

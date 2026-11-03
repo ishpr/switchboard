@@ -1,3 +1,4 @@
+import type { BuildInfo } from "./types.ts";
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import net from "node:net";
@@ -5,6 +6,7 @@ import { daemonInfoPath, switchboardHome } from "./paths.ts";
 import { ensureToken } from "./token.ts";
 
 export type DaemonInfo = {
+  build?: BuildInfo;
   port: number;
   pid: number;
   url: string;

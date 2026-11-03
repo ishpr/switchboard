@@ -1,6 +1,15 @@
 import { DatabaseSync } from "node:sqlite";
 import type { AgentRecord, BusMessage, Kind, PendingAsk, AgentMetrics } from "./types.ts";
 
+export function inboxCursorKey(clientKey: string, topic?: string): string {
+  return topic ? JSON.stringify([clientKey, "topic", topic]) : clientKey;
+}
+
+// One definition of task completion for status, metrics, and the Stop gate.
+const ANSWERED_ASK = `SELECT 1 FROM messages r WHERE r.repo = a.repo AND r.kind = 'reply'
+  AND r.correlation_id = a.correlation_id AND r.from_name = a.to_name
+  AND r.to_name = a.from_name AND r.seq > a.seq`;
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS messages (
   repo TEXT NOT NULL,
@@ -160,10 +169,7 @@ export class Store {
       `SELECT a.* FROM messages a
        WHERE a.repo = ? AND a.kind = 'ask' AND a.correlation_id IS NOT NULL
          AND (? IS NULL OR a.from_name = ? OR a.to_name = ?)
-         AND NOT EXISTS (
-           SELECT 1 FROM messages r
-           WHERE r.repo = a.repo AND r.kind = 'reply' AND r.correlation_id = a.correlation_id
-         )
+         AND NOT EXISTS (${ANSWERED_ASK})
        ORDER BY a.seq DESC LIMIT ?`,
     ).all(repo, participant ?? null, participant ?? null, participant ?? null, boundedLimit) as Row[];
     return rows.map((row) => ({
@@ -188,10 +194,7 @@ export class Store {
            AND to_name IS NOT NULL AND to_name != '*'
        ), asks AS (
          SELECT to_name AS agent, COUNT(*) AS received,
-           SUM(CASE WHEN a.correlation_id IS NOT NULL AND NOT EXISTS (
-             SELECT 1 FROM messages r WHERE r.repo = a.repo AND r.kind = 'reply'
-               AND r.correlation_id = a.correlation_id
-           ) THEN 1 ELSE 0 END) AS pending
+           SUM(CASE WHEN a.correlation_id IS NOT NULL AND NOT EXISTS (${ANSWERED_ASK}) THEN 1 ELSE 0 END) AS pending
          FROM messages a WHERE repo = ? AND kind = 'ask' AND to_name IS NOT NULL AND to_name != '*'
          GROUP BY to_name
        ), replies AS (
@@ -200,7 +203,7 @@ export class Store {
        ), latency AS (
          SELECT a.to_name AS agent, AVG(MAX(0, (
            SELECT r.ts FROM messages r WHERE r.repo = a.repo AND r.kind = 'reply'
-             AND r.correlation_id = a.correlation_id AND r.from_name = a.to_name AND r.seq > a.seq
+             AND r.correlation_id = a.correlation_id AND r.from_name = a.to_name AND r.to_name = a.from_name AND r.seq > a.seq
            ORDER BY r.seq LIMIT 1
          ) - a.ts) / 1000.0) AS avg_latency
          FROM messages a WHERE a.repo = ? AND a.kind = 'ask' AND a.correlation_id IS NOT NULL
@@ -222,7 +225,7 @@ export class Store {
     repo: string,
     toName: string,
     cursor: number,
-    minTs = Date.now() - 30 * 60_000,
+    minTs = 0,
   ): BusMessage | null {
     const row = this.db
       .prepare(
@@ -230,14 +233,7 @@ export class Store {
          WHERE a.repo = ? AND a.to_name = ? AND a.kind = 'ask'
            AND a.seq <= ? AND a.ts >= ?
            AND a.correlation_id IS NOT NULL
-           AND NOT EXISTS (
-             SELECT 1 FROM messages r
-             WHERE r.repo = a.repo
-               AND (
-                 (r.kind = 'reply' AND r.correlation_id = a.correlation_id)
-                 OR (r.from_name = a.to_name AND r.seq > a.seq AND r.topic != 'presence')
-               )
-           )
+           AND NOT EXISTS (${ANSWERED_ASK})
          ORDER BY a.seq DESC
          LIMIT 1`,
       )
@@ -252,32 +248,34 @@ export class Store {
       .prepare(
         `SELECT * FROM messages
          WHERE repo = ? AND seq > ?
-           AND (to_name IS NULL OR to_name = ? OR (? = 'reports' AND topic = 'reports'))
-           AND (? IS NULL OR topic = ?)
+           AND (to_name IS NULL OR to_name = '*' OR to_name = ?)
+           AND ((? IS NULL AND topic != 'presence') OR topic = ?)
          ORDER BY seq ASC
          LIMIT ?`,
       )
-      .all(repo, since, opts.to ?? "", topic, topic, topic, limit) as Row[];
+      .all(repo, since, opts.to ?? "", topic, topic, limit) as Row[];
     return rows.map(mapMessage);
   }
 
-  /** Read-only wait queries: do not ack messages or touch agent presence. */
-  unreadForWait(repo: string, to: string, since: number, cursorKey = to): BusMessage[] {
+  /** Read-only wait queries use the same visibility and topic cursor rules as inbox. */
+  unreadForWait(repo: string, to: string, since: number, cursorKey = to, topic?: string): BusMessage[] {
     const rows = this.db.prepare(
       `SELECT * FROM messages WHERE repo = ?
-         AND seq > MAX(?, COALESCE((SELECT cursor FROM cursors WHERE repo = ? AND client_key = ?), 0))
+         AND seq > MAX(?, COALESCE((SELECT MAX(cursor) FROM cursors WHERE repo = ? AND client_key = ?), 0))
          AND (to_name IS NULL OR to_name = '*' OR to_name = ?)
+         AND ((? IS NULL AND topic != 'presence') OR topic = ?)
        ORDER BY seq ASC LIMIT 200`,
-    ).all(repo, since, repo, cursorKey, to) as Row[];
+    ).all(repo, since, repo, inboxCursorKey(cursorKey, topic), to, topic ?? null, topic ?? null) as Row[];
     return rows.map(mapMessage);
   }
 
-  latestUnreadSeq(repo: string, to: string, cursorKey = to): number {
+  latestUnreadSeq(repo: string, to: string, cursorKey = to, topic?: string): number {
     const row = this.db.prepare(
       `SELECT COALESCE(MAX(seq), 0) AS seq FROM messages WHERE repo = ?
-         AND seq > COALESCE((SELECT cursor FROM cursors WHERE repo = ? AND client_key = ?), 0)
-         AND (to_name IS NULL OR to_name = '*' OR to_name = ?)`,
-    ).get(repo, repo, cursorKey, to) as { seq: number };
+         AND seq > COALESCE((SELECT MAX(cursor) FROM cursors WHERE repo = ? AND client_key = ?), 0)
+         AND (to_name IS NULL OR to_name = '*' OR to_name = ?)
+         AND ((? IS NULL AND topic != 'presence') OR topic = ?)`,
+    ).get(repo, repo, inboxCursorKey(cursorKey, topic), to, topic ?? null, topic ?? null) as { seq: number };
     return row.seq;
   }
 

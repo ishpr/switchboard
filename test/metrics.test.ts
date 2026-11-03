@@ -63,9 +63,9 @@ test("metrics match correlation IDs, ignore other boards and unassigned replies 
     assert.equal(store.agentMetrics("board").find((m) => m.agent === "eg")!.pending_asks_count, 60);
     insert(store, { kind: "reply", correlationId: "pending-0", fromName: "agy", to: "eg", ts: 2000 });
     const eg = store.agentMetrics("board").find((m) => m.agent === "eg")!;
-    assert.equal(eg.pending_asks_count, 59);
+    assert.equal(eg.pending_asks_count, 60);
     assert.equal(eg.avg_reply_latency_seconds, null);
-    insert(store, { kind: "reply", correlationId: "pending-1", fromName: "eg", ts: 500 });
+    insert(store, { kind: "reply", correlationId: "pending-1", fromName: "eg", to: "agy", ts: 500 });
     assert.equal(store.agentMetrics("board").find((m) => m.agent === "eg")!.avg_reply_latency_seconds, 0);
     insert(store, { kind: "ask", to: "*", correlationId: "broadcast" });
     assert.equal(store.agentMetrics("board").some((m) => m.agent === "*"), false);
