@@ -33,6 +33,12 @@ export class BusClient {
     return this.openSocket(url, this.lastHello);
   }
 
+  updateHello(patch: Partial<ClientHello>): void {
+    if (this.lastHello) {
+      this.lastHello = { ...this.lastHello, ...patch };
+    }
+  }
+
   private async openSocket(url: string, hello: ClientHello): Promise<Extract<ServerFrame, { type: "welcome" }>> {
     const socket = new WebSocket(url);
     this.socket = socket;

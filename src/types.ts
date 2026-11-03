@@ -159,6 +159,7 @@ export type ClientFrame = (
       name: string;
       harness: string;
       cwd: string;
+      rebind?: boolean;
       sessionId?: string;
       wakeSessionId?: string;
       branch?: string | null;

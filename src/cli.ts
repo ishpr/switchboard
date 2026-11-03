@@ -371,6 +371,7 @@ async function waitCmd(): Promise<void> {
     args: process.argv.slice(3),
     options: {
       to: { type: "string" },
+      name: { type: "string" },
       cwd: { type: "string" },
       timeout: { type: "string", default: "240" },
       "interval-ms": { type: "string", default: "1500" },
@@ -381,7 +382,7 @@ async function waitCmd(): Promise<void> {
       json: { type: "boolean", default: false },
     },
   });
-  const to = values.to ?? process.env.SWITCHBOARD_AGENT ?? "agy";
+  const to = values.to ?? values.name ?? process.env.SWITCHBOARD_AGENT ?? process.env.SWITCHBOARD_NAME ?? "agy";
   const cwd = values.cwd || process.cwd();
   const repo = repoKey(cwd);
   const timeoutMs = Number(values.timeout) * 1000;

@@ -15,7 +15,10 @@ import {
   gridPlan,
   gridSessionName,
   harnessPanes,
+  isActiveZellijGridSession,
+  isHarnessProcessInPsOutput,
   panesFor,
+  parseZellijPaneForInvitedAgent,
   readRepoConfig,
   resolveAccountProfiles,
   resolveInvitedAgentSpec,
@@ -281,4 +284,23 @@ test("per-repo gridSessionName isolates concurrent project Zellij grids and reso
   assert.equal(resolveInvitedAgentSpec("muse")?.harness, "muse");
   assert.equal(resolveInvitedAgentSpec("argon4")?.name, "agy");
   assert.equal(resolveInvitedAgentSpec("cursor-agent")?.name, "cursor");
+
+  assert.equal(isHarnessProcessInPsOutput("login\n-zsh\n", "/Users/ishprasad/.grok/bin/grok", "grok"), false);
+  assert.equal(isHarnessProcessInPsOutput("login\n-zsh\nnode /tmp/zsh-helper.js\n", "/Users/ishprasad/.grok/bin/grok", "grok"), false);
+  assert.equal(isHarnessProcessInPsOutput("zsh -lc cd /repo && exec /Users/ishprasad/.grok/bin/grok\n", "/Users/ishprasad/.grok/bin/grok", "grok"), false);
+  assert.equal(isHarnessProcessInPsOutput("login\n-zsh\n/Users/ishprasad/.grok/bin/grok\n", "/Users/ishprasad/.grok/bin/grok", "grok"), true);
+  assert.equal(isHarnessProcessInPsOutput("login\n-zsh\nnode /Users/ishprasad/.local/bin/muse --yolo\n", "/Users/ishprasad/.local/bin/muse", "muse"), true);
+
+  assert.equal(isActiveZellijGridSession(`${sB} [Created 2m ago]\n`, sB), true);
+  assert.equal(isActiveZellijGridSession(`${sB} [Created 2m ago] (EXITED - attach to resurrect)\n`, sB), false);
+  assert.equal(
+    parseZellijPaneForInvitedAgent(
+      `zsh -lc exec muse SWITCHBOARD_NAME=muse ZELLIJ_SESSION_NAME=${sB} ZELLIJ_PANE_ID=4\nnode /Users/ishprasad/.local/bin/muse --yolo SWITCHBOARD_NAME=muse ZELLIJ_SESSION_NAME=${sB} ZELLIJ_PANE_ID=4\n`,
+      sB,
+      "muse",
+      "/Users/ishprasad/.local/bin/muse",
+      "muse",
+    ),
+    `zellij:${sB}:4`,
+  );
 });
