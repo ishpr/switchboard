@@ -284,22 +284,25 @@ export function provisionClaudeAccount(
     if (existsSync(path.join(repoRoot, ".git"))) {
       if (!existsSync(candidateWt)) {
         const branch = `ws/${profile.id}`;
+        let branchExists = false;
         try {
-          const hasBranch =
-            execFileSync("git", ["-C", repoRoot, "show-ref", "--verify", "--quiet", `refs/heads/${branch}`], {
-              stdio: "ignore",
-            }) === undefined;
-          if (hasBranch) {
-            execFileSync("git", ["-C", repoRoot, "worktree", "add", candidateWt, branch], { stdio: "ignore" });
-          }
+          execFileSync("git", ["-C", repoRoot, "show-ref", "--verify", "--quiet", `refs/heads/${branch}`], {
+            stdio: "ignore",
+          });
+          branchExists = true;
         } catch {
-          try {
-            execFileSync("git", ["-C", repoRoot, "worktree", "add", "-b", `ws/${profile.id}`, candidateWt], {
-              stdio: "ignore",
-            });
-          } catch {
-            // If branch is already checked out or worktree add fails, fall back to candidateWt if present
-          }
+          branchExists = false;
+        }
+        try {
+          execFileSync(
+            "git",
+            branchExists
+              ? ["-C", repoRoot, "worktree", "add", candidateWt, branch]
+              : ["-C", repoRoot, "worktree", "add", "-b", branch, candidateWt],
+            { stdio: "ignore" },
+          );
+        } catch {
+          // The branch is already checked out, or worktree add failed.
         }
         if (existsSync(candidateWt)) {
           notes.push(`worktree ${candidateWt} (branch ws/${profile.id})`);
