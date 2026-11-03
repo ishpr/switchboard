@@ -1136,6 +1136,42 @@ test("wake_session_id persists in SQLite across legacy shim reconnects and falls
       assert.equal(row.wakeSessionId, museUuid);
       assert.equal(row.diagnostics?.wakeMode, "headless");
     }
+
+    // An ask addressed to the session UUID can be read and replied to by an unbound CLI connection for that agent name
+    const codex = await join(fx, "codex", "repo-a", { harness: "codex" });
+    const museCli = await join(fx, "muse", "repo-a", { harness: "cli" });
+    try {
+      const asked = await codex.request({
+        type: "ask",
+        to: museUuid,
+        body: "session-addressed ask for muse",
+      });
+      assert.equal(asked.type, "published");
+      if (asked.type === "published" && asked.correlationId) {
+        const cliInbox = await museCli.request({ type: "inbox" });
+        assert.equal(cliInbox.type, "inbox");
+        if (cliInbox.type === "inbox") {
+          assert.ok(cliInbox.messages.some((m) => m.correlationId === asked.correlationId));
+        }
+        const replied = await museCli.request({
+          type: "reply",
+          correlationId: asked.correlationId,
+          body: "replied from unbound CLI as muse",
+        });
+        assert.equal(replied.type, "published");
+        const st = await codex.request({ type: "status", pending: true });
+        assert.equal(st.type, "ok");
+        if (st.type === "ok") {
+          assert.equal(
+            st.pending_asks?.some((p) => p.correlation_id === asked.correlationId),
+            false,
+          );
+        }
+      }
+    } finally {
+      codex.close();
+      museCli.close();
+    }
   } finally {
     cli.close();
     await fx.daemon.close();
