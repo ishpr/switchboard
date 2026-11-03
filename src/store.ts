@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS agents (
   name TEXT NOT NULL,
   harness TEXT NOT NULL,
   session_id TEXT,
+  wake_session_id TEXT,
   cwd TEXT NOT NULL,
   branch TEXT,
   head TEXT,
@@ -132,36 +133,42 @@ export class Store {
     const hasSessionKey = cols.some((col) => col.name === "session_key");
     const hasBranch = cols.some((col) => col.name === "branch");
     const hasHead = cols.some((col) => col.name === "head");
-    if (hasSessionKey && hasBranch && hasHead) return;
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      this.db.exec(`
-        CREATE TABLE agents_v2 (
-          repo TEXT NOT NULL,
-          session_key TEXT NOT NULL,
-          name TEXT NOT NULL,
-          harness TEXT NOT NULL,
-          session_id TEXT,
-          cwd TEXT NOT NULL,
-          branch TEXT,
-          head TEXT,
-          wake INTEGER NOT NULL DEFAULT 0,
-          last_seen INTEGER NOT NULL,
-          status TEXT NOT NULL DEFAULT '',
-          PRIMARY KEY (repo, session_key)
-        );
-        INSERT OR REPLACE INTO agents_v2 (repo, session_key, name, harness, session_id, cwd, branch, head, wake, last_seen, status)
-        SELECT repo, COALESCE(session_id, 'name:' || name), name, harness, session_id, cwd, NULL, NULL, wake, last_seen, status
-        FROM agents;
-        DROP TABLE agents;
-        ALTER TABLE agents_v2 RENAME TO agents;
-        CREATE INDEX IF NOT EXISTS agents_repo_name ON agents(repo, name);
-        CREATE INDEX IF NOT EXISTS agents_repo_session ON agents(repo, session_id);
-      `);
-      this.db.exec("COMMIT");
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
+    if (!hasSessionKey || !hasBranch || !hasHead) {
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        this.db.exec(`
+          CREATE TABLE agents_v2 (
+            repo TEXT NOT NULL,
+            session_key TEXT NOT NULL,
+            name TEXT NOT NULL,
+            harness TEXT NOT NULL,
+            session_id TEXT,
+            wake_session_id TEXT,
+            cwd TEXT NOT NULL,
+            branch TEXT,
+            head TEXT,
+            wake INTEGER NOT NULL DEFAULT 0,
+            last_seen INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (repo, session_key)
+          );
+          INSERT OR REPLACE INTO agents_v2 (repo, session_key, name, harness, session_id, wake_session_id, cwd, branch, head, wake, last_seen, status)
+          SELECT repo, COALESCE(session_id, 'name:' || name), name, harness, session_id, NULL, cwd, NULL, NULL, wake, last_seen, status
+          FROM agents;
+          DROP TABLE agents;
+          ALTER TABLE agents_v2 RENAME TO agents;
+          CREATE INDEX IF NOT EXISTS agents_repo_name ON agents(repo, name);
+          CREATE INDEX IF NOT EXISTS agents_repo_session ON agents(repo, session_id);
+        `);
+        this.db.exec("COMMIT");
+      } catch (error) {
+        this.db.exec("ROLLBACK");
+        throw error;
+      }
+    }
+    const updatedCols = this.db.prepare("PRAGMA table_info(agents)").all() as { name: string }[];
+    if (updatedCols.length > 0 && !updatedCols.some((col) => col.name === "wake_session_id")) {
+      this.db.exec("ALTER TABLE agents ADD COLUMN wake_session_id TEXT;");
     }
   }
 
@@ -505,6 +512,7 @@ export class Store {
     name: string;
     harness: string;
     sessionId: string | null;
+    wakeSessionId?: string | null;
     cwd: string;
     branch?: string | null;
     head?: string | null;
@@ -521,12 +529,13 @@ export class Store {
         .run(agent.repo, `name:${agent.name}`);
       this.db
         .prepare(
-          `INSERT INTO agents (repo, session_key, name, harness, session_id, cwd, branch, head, wake, last_seen, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `INSERT INTO agents (repo, session_key, name, harness, session_id, wake_session_id, cwd, branch, head, wake, last_seen, status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(repo, session_key) DO UPDATE SET
              name = excluded.name,
              harness = excluded.harness,
              session_id = excluded.session_id,
+             wake_session_id = COALESCE(excluded.wake_session_id, agents.wake_session_id),
              cwd = excluded.cwd,
              branch = COALESCE(excluded.branch, agents.branch),
              head = COALESCE(excluded.head, agents.head),
@@ -540,6 +549,7 @@ export class Store {
           agent.name,
           agent.harness,
           agent.sessionId,
+          agent.wakeSessionId ?? null,
           agent.cwd,
           agent.branch ?? null,
           agent.head ?? null,
@@ -558,11 +568,12 @@ export class Store {
         this.db
           .prepare(
             `UPDATE agents
-             SET harness = ?, cwd = ?, branch = COALESCE(?, branch), head = COALESCE(?, head), wake = ?, last_seen = ?, status = ?
+             SET harness = ?, wake_session_id = COALESCE(?, wake_session_id), cwd = ?, branch = COALESCE(?, branch), head = COALESCE(?, head), wake = ?, last_seen = ?, status = ?
              WHERE repo = ? AND session_key = ?`,
           )
           .run(
             agent.harness,
+            agent.wakeSessionId ?? null,
             agent.cwd,
             agent.branch ?? null,
             agent.head ?? null,
@@ -579,11 +590,12 @@ export class Store {
     const sessionKey = `name:${agent.name}`;
     this.db
       .prepare(
-        `INSERT INTO agents (repo, session_key, name, harness, session_id, cwd, branch, head, wake, last_seen, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO agents (repo, session_key, name, harness, session_id, wake_session_id, cwd, branch, head, wake, last_seen, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(repo, session_key) DO UPDATE SET
            harness = excluded.harness,
            session_id = COALESCE(excluded.session_id, agents.session_id),
+           wake_session_id = COALESCE(excluded.wake_session_id, agents.wake_session_id),
            cwd = excluded.cwd,
            branch = COALESCE(excluded.branch, agents.branch),
            head = COALESCE(excluded.head, agents.head),
@@ -597,6 +609,7 @@ export class Store {
         agent.name,
         agent.harness,
         agent.sessionId,
+        agent.wakeSessionId ?? null,
         agent.cwd,
         agent.branch ?? null,
         agent.head ?? null,
@@ -805,6 +818,7 @@ type AgentRow = {
   name: string;
   harness: string;
   session_id: string | null;
+  wake_session_id: string | null;
   cwd: string;
   branch: string | null;
   head: string | null;
@@ -854,6 +868,7 @@ function mapAgent(row: AgentRow, online: boolean): AgentRecord {
     name: row.name,
     harness: row.harness,
     sessionId: row.session_id,
+    wakeSessionId: row.wake_session_id ?? row.session_id,
     cwd: row.cwd,
     branch: row.branch,
     head: row.head,

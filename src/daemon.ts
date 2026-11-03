@@ -403,7 +403,10 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     conn.declaredSession = declaredSession;
     conn.sessionBound = Boolean(frame.boundSession && declaredSession);
     conn.sessionId = conn.declaredSession;
-    conn.wakeSessionId = frame.wakeSessionId || (conn.sessionBound ? conn.sessionId : existing?.sessionId ?? null);
+    conn.wakeSessionId =
+      frame.wakeSessionId ||
+      ((!conn.sessionBound || conn.sessionId === existing?.sessionId) ? existing?.wakeSessionId : null) ||
+      (conn.sessionBound ? conn.sessionId : existing?.sessionId ?? null);
     conn.build = frame.build;
     conn.wake = frame.wake === undefined ? (existing?.wake ?? false) : frame.wake;
     conn.status = [...conns].find((peer) => peer !== conn && peer.authed && groupKey(peer) === groupKey(conn))?.status
@@ -416,6 +419,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         name: conn.name,
         harness: conn.harness,
         sessionId: conn.sessionBound ? conn.declaredSession : (existing?.sessionId ?? null),
+        wakeSessionId: frame.wakeSessionId ?? existing?.wakeSessionId ?? null,
         cwd: conn.cwd,
         branch: conn.branch,
         head: conn.head,
@@ -428,6 +432,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         name: conn.name,
         harness: conn.harness,
         sessionId: conn.sessionBound ? conn.declaredSession : null,
+        wakeSessionId: frame.wakeSessionId ?? null,
         cwd: conn.cwd,
         branch: conn.branch,
         head: conn.head,
@@ -824,6 +829,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       name: frame.name,
       harness: frame.harness,
       sessionId: frame.sessionId || null,
+      wakeSessionId: frame.wakeSessionId ?? existing?.wakeSessionId ?? null,
       cwd: frame.cwd,
       branch: checkout.branch,
       head: checkout.head,
@@ -985,12 +991,14 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     const live = candidates.find((conn) => conn.sessionBound && conn.sessionId === row?.sessionId)
       ?? candidates.find((conn) => conn.sessionBound) ?? candidates[0];
     if (!live && !row) return null;
-    const liveWakeSession = live?.wakeSessionId || (live?.sessionBound ? live.sessionId : null);
+    const liveWakeSession = live
+      ? (live.wakeSessionId || ((!live.sessionBound || live.sessionId === row?.sessionId) ? row?.wakeSessionId : null) || (live.sessionBound ? live.sessionId : null))
+      : null;
     return {
       name: live?.name ?? row!.name,
       declaredSession: live?.declaredSession ?? row?.sessionId ?? null,
       harness: live?.sessionBound ? live.harness : row?.harness ?? live!.harness,
-      sessionId: liveWakeSession || row?.sessionId || null,
+      sessionId: live ? (liveWakeSession || row?.sessionId || null) : (row?.sessionId || row?.wakeSessionId || null),
       cwd: live?.sessionBound ? live.cwd : row?.cwd ?? live!.cwd,
       wake: row?.wake ?? live?.wake ?? false,
       online: Boolean(live),
@@ -1027,7 +1035,10 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         name: conn.name,
         harness: conn.harness,
         sessionId: conn.sessionId,
-        wakeSessionId: conn.wakeSessionId || (conn.sessionBound ? conn.sessionId : registered?.sessionId ?? null),
+        wakeSessionId:
+          conn.wakeSessionId ||
+          ((!conn.sessionBound || conn.sessionId === registered?.sessionId) ? registered?.wakeSessionId : null) ||
+          (conn.sessionBound ? conn.sessionId : registered?.sessionId ?? null),
         cwd: conn.cwd,
         branch: conn.branch ?? registered?.branch ?? null,
         head: conn.head ?? registered?.head ?? null,
@@ -1050,7 +1061,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       if (!represented) {
         rows.push({
           ...row,
-          wakeSessionId: row.sessionId,
+          wakeSessionId: row.sessionId || row.wakeSessionId || null,
           connectionCount: 0,
           role: row.name === orchestrator ? "orchestrator" : "worker",
         });

@@ -1089,3 +1089,55 @@ test("default inbox honors session subscriptions, persists them across reconnect
     await fx.daemon.close();
   }
 });
+
+test("wake_session_id persists in SQLite across legacy shim reconnects and falls back to session_id when offline", async () => {
+  const fx = await fixture();
+  const cli = await join(fx, "cli", "repo-a", { harness: "cli" });
+  try {
+    const museUuid = "01a1957b-b088-76e1-b08b-ad1ac5ed8594";
+    const reg = await cli.request({
+      type: "register",
+      name: "muse",
+      harness: "muse",
+      cwd: "/work",
+      sessionId: museUuid,
+      wakeSessionId: "tty:/dev/ttys007",
+      wake: true,
+    });
+    assert.equal(reg.type, "registered");
+
+    // Simulate a legacy pre-bebd1de shim connecting without sessionId or wakeSessionId
+    const legacyMuse = await join(fx, "muse", "repo-a", {
+      harness: "muse",
+    });
+    try {
+      const onlineWho = await cli.request({ type: "who" });
+      assert.equal(onlineWho.type, "who");
+      if (onlineWho.type === "who") {
+        const row = onlineWho.agents.find((a) => a.name === "muse");
+        assert.ok(row);
+        assert.equal(row.online, true);
+        assert.equal(row.wakeSessionId, "tty:/dev/ttys007");
+        assert.equal(row.diagnostics?.wakeMode, "inject");
+      }
+    } finally {
+      legacyMuse.close();
+    }
+
+    // Wait briefly for socket close to register offline
+    await new Promise((r) => setTimeout(r, 30));
+    const offlineWho = await cli.request({ type: "who" });
+    assert.equal(offlineWho.type, "who");
+    if (offlineWho.type === "who") {
+      const row = offlineWho.agents.find((a) => a.name === "muse");
+      assert.ok(row);
+      assert.equal(row.online, false);
+      assert.equal(row.sessionId, museUuid);
+      assert.equal(row.wakeSessionId, museUuid);
+      assert.equal(row.diagnostics?.wakeMode, "headless");
+    }
+  } finally {
+    cli.close();
+    await fx.daemon.close();
+  }
+});
