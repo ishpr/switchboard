@@ -151,7 +151,7 @@ The shim registers these MCP tools. Call `bus_inbox` at the start of a turn and 
 | `bus_ask` | Directed message with a correlation id. This is the wake path. |
 | `bus_reply` | Answer an ask. Routed back to the asker. |
 | `bus_report` | Send a result or a status change to the orchestrator only. Hidden from the orchestrator's own tool list. |
-| `bus_status` | Short status string shown by `bus_who`. |
+| `bus_status` | Show status and unanswered asks; optionally set the status string shown by `bus_who`. |
 
 The same verbs exist on the CLI: `who`, `publish`, `inbox`, `ask`, `reply`, `report`, `status`, `orchestrator`, `agent add`, `account`, `hook`, `token`, `init`, `--resume` (`-c`), and `--restart` (`-r`).
 
@@ -329,3 +329,34 @@ scan; repeated pruning reports no mutation once it is already offline. Pruning a
 Orchestrator asks are task dispatches: the wake hint asks agents to read the inbox,
 execute the assigned task within workspace/repository rules, and reply with the
 correlation id. This does not grant new permissions or override those rules.
+
+
+## Pending asks
+
+`switchboard status` and `bus_status` show unanswered asks on the current workspace
+board. `--status` / the tool's optional `status` argument still updates the agent's
+status. Omit it for a read-only view. CLI and orchestrator views include the whole
+board; worker MCP sessions see only asks they sent or received, preserving directed
+message visibility.
+
+```sh
+switchboard status
+switchboard status --pending
+switchboard status --pending --json --limit 20
+switchboard status --status "reviewing" --name agy
+```
+
+`--pending` filters out the status/health detail. JSON output includes `pending_asks`
+with each ask's `id`, `seq`, `from`, `to`, `topic`, `age_seconds`, a 160-character
+whitespace-normalized `preview`, and `correlation_id` for replying. The MCP tool
+returns these fields in structured content as well as readable text. Results are
+newest first, defaulting to the 50 most recent unanswered asks; `limit` / `--limit`
+accepts 1–200. Empty results are an empty array (or `pending_asks: none` in text).
+
+A reply matches the ask's stored **correlation ID**, which is separate from its
+message ID in Switchboard. Pass `correlation_id` to `bus_reply` as `correlationId`.
+Matching `kind=reply` messages remove the ask from the tracker immediately; inbox
+reads and progress publications/reports do not. Tracking persists across daemon
+restarts and follows the current board's shared/split worktree scope, including
+`SWITCHBOARD_SCOPE` and `SWITCHBOARD_REPO_KEY`. Restart the daemon after upgrading
+to enable tracking.

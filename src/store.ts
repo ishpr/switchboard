@@ -1,5 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
-import type { AgentRecord, BusMessage, Kind } from "./types.ts";
+import type { AgentRecord, BusMessage, Kind, PendingAsk } from "./types.ts";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS messages (
@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS messages_id ON messages(repo, id);
 CREATE INDEX IF NOT EXISTS messages_topic ON messages(repo, topic, seq);
+CREATE INDEX IF NOT EXISTS messages_correlation ON messages(repo, kind, correlation_id);
 
 CREATE TABLE IF NOT EXISTS cursors (
   repo TEXT NOT NULL,
@@ -150,6 +151,31 @@ export class Store {
       )
       .get(repo, correlationId) as Row | undefined;
     return row ? mapMessage(row) : undefined;
+  }
+
+  /** Workspace-wide tracker: only a matching reply answers an ask, not a report or inbox read. */
+  pendingAsks(repo: string, limit = 50, now = Date.now(), participant?: string): PendingAsk[] {
+    const boundedLimit = Number.isInteger(limit) ? Math.max(1, Math.min(limit, 200)) : 50;
+    const rows = this.db.prepare(
+      `SELECT a.* FROM messages a
+       WHERE a.repo = ? AND a.kind = 'ask' AND a.correlation_id IS NOT NULL
+         AND (? IS NULL OR a.from_name = ? OR a.to_name = ?)
+         AND NOT EXISTS (
+           SELECT 1 FROM messages r
+           WHERE r.repo = a.repo AND r.kind = 'reply' AND r.correlation_id = a.correlation_id
+         )
+       ORDER BY a.seq DESC LIMIT ?`,
+    ).all(repo, participant ?? null, participant ?? null, participant ?? null, boundedLimit) as Row[];
+    return rows.map((row) => ({
+      id: row.id,
+      correlation_id: row.correlation_id!,
+      seq: row.seq,
+      from: row.from_name,
+      to: row.to_name,
+      topic: row.topic,
+      age_seconds: Math.max(0, Math.floor((now - row.ts) / 1000)),
+      preview: row.body.replace(/\s+/g, " ").trim().slice(0, 160),
+    }));
   }
 
   unansweredAsk(
