@@ -55,6 +55,7 @@ type Conn = {
   /** The client supplied sessionId, so this connection has its own inbox cursor. */
   declaredSession: string | null;
   sessionBound: boolean;
+  waitOnly: boolean;
   wake: boolean;
   status: string;
   role: Role;
@@ -111,6 +112,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       sessionId: null,
       declaredSession: null,
       sessionBound: false,
+      waitOnly: false,
       wake: false,
       status: "online",
       role: "worker",
@@ -339,7 +341,10 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     conn.authed = true;
     conn.agentId = randomUUID();
     conn.name = frame.name;
-    conn.harness = frame.harness || "unknown";
+    conn.waitOnly = Boolean(frame.waitOnly);
+    conn.harness = (conn.waitOnly && existing && (!frame.harness || frame.harness === "wait" || frame.harness === "unknown"))
+      ? existing.harness
+      : (frame.harness || "unknown");
     conn.repo = effectiveRepo;
     conn.cwd = effectiveCwd;
     conn.declaredSession = frame.sessionId || null;
@@ -353,12 +358,22 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     conn.topics.add("repo");
     conn.topics.add("presence");
     if (conn.role === "orchestrator") conn.topics.add("reports");
-    if (conn.harness !== "cli" && (!existing || conn.sessionBound)) {
+    if (conn.harness !== "cli" && !conn.waitOnly && (!existing || conn.sessionBound)) {
       store.upsertAgent({
         repo: conn.repo,
         name: conn.name,
         harness: conn.harness,
         sessionId: conn.sessionBound ? conn.declaredSession : (existing?.sessionId ?? null),
+        cwd: conn.cwd,
+        wake: conn.wake,
+        status: conn.status,
+      });
+    } else if (conn.harness !== "cli" && conn.waitOnly && !existing) {
+      store.upsertAgent({
+        repo: conn.repo,
+        name: conn.name,
+        harness: conn.harness,
+        sessionId: conn.sessionBound ? conn.declaredSession : null,
         cwd: conn.cwd,
         wake: conn.wake,
         status: conn.status,
@@ -415,6 +430,20 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
 
   function presence(conn: Conn, state: "online" | "offline"): void {
     if (conn.harness === "cli" || stopping) return;
+    if (
+      conn.waitOnly &&
+      [...conns].some(
+        (peer) =>
+          peer !== conn &&
+          peer.authed &&
+          peer.repo === conn.repo &&
+          peer.name === conn.name &&
+          peer.harness !== "cli" &&
+          !peer.waitOnly,
+      )
+    ) {
+      return;
+    }
     const key = groupKey(conn);
     if (state === "online") {
       const pending = pendingOffline.get(key);
@@ -669,16 +698,26 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
 
   function agents(repo: string): AgentRecord[] {
     const orchestrator = store.getOrchestrator(repo);
+    const nonWaitConns = [...conns].filter(
+      (c) => c.authed && c.repo === repo && c.harness !== "cli" && !c.waitOnly,
+    );
+    const hasNonWaitByName = new Set(nonWaitConns.map((c) => c.name));
+    const hasNonWaitByGroup = new Set(nonWaitConns.map((c) => groupKey(c)));
     const groups = new Map<string, Conn[]>();
     for (const conn of conns) {
       if (!conn.authed || conn.repo !== repo || conn.harness === "cli") continue;
       const key = groupKey(conn);
+      if (conn.waitOnly && (hasNonWaitByGroup.has(key) || (!conn.declaredSession && hasNonWaitByName.has(conn.name)))) {
+        continue;
+      }
       const members = groups.get(key) ?? [];
       members.push(conn);
       groups.set(key, members);
     }
     const rows: AgentRecord[] = [...groups.values()].map((members) => {
-      const conn = members.reduce((a, b) => a.lastSeen >= b.lastSeen ? a : b);
+      const nonWait = members.filter((member) => !member.waitOnly);
+      const counted = nonWait.length > 0 ? nonWait : [members.reduce((a, b) => a.lastSeen >= b.lastSeen ? a : b)];
+      const conn = counted.reduce((a, b) => a.lastSeen >= b.lastSeen ? a : b);
       const registered = store.getAgent(repo, conn.name);
       return {
         repo, name: conn.name, harness: conn.harness, sessionId: conn.sessionId,
@@ -686,8 +725,8 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         cwd: conn.cwd, wake: registered?.wake ?? conn.wake,
         lastSeen: Math.max(...members.map((member) => member.lastSeen)),
         online: true, status: conn.status || "online", role: conn.role,
-        connectionCount: members.length, connectionIds: members.map((member) => member.agentId),
-        builds: members.flatMap((member) => member.build ? [member.build] : []),
+        connectionCount: counted.length, connectionIds: counted.map((member) => member.agentId),
+        builds: counted.flatMap((member) => member.build ? [member.build] : []),
       };
     });
     const liveNames = new Set(rows.map((row) => row.name));

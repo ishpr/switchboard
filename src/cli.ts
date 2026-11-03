@@ -26,7 +26,7 @@ import { daemonInfoPath, dbPath, switchboardHome, wakeLogPath } from "./paths.ts
 import { repoKey, type RepoScope } from "./repo.ts";
 import { runShim } from "./shim.ts";
 import { ensureToken, readToken } from "./token.ts";
-import { DEFAULT_PORT, type ClientHello } from "./types.ts";
+import { DEFAULT_PORT, HEARTBEAT_MS, NAME_RE, type ClientHello } from "./types.ts";
 import { gridPlan, init, resolveOrchestratorName, writeRepoConfig } from "./init.ts";
 import { spawnWake } from "./wake.ts";
 
@@ -364,20 +364,74 @@ async function waitCmd(): Promise<void> {
     },
   });
   const to = values.to ?? process.env.SWITCHBOARD_AGENT ?? "agy";
+  const cwd = values.cwd || process.cwd();
+  const repo = repoKey(cwd);
   const timeoutMs = Number(values.timeout) * 1000;
   const intervalMs = Number(values["interval-ms"]);
   const sinceSeq = values["since-seq"] === undefined ? undefined : Number(values["since-seq"]);
   const cursorKey = values.session && !values.session.startsWith("zellij:") ? `${to}:${values.session}` : to;
-  const store = new Store(dbPath());
+  const home = switchboardHome();
+  const store = new Store(dbPath(home));
+  const waitListeners = new Set<() => void>();
+  let waitClient: BusClient | null = null;
+  let heartbeat: ReturnType<typeof setInterval> | null = null;
   try {
+    if (timeoutMs > 0 && to !== "*" && NAME_RE.test(to)) {
+      const daemonInfo = readDaemonInfo(home);
+      if (process.env.SWITCHBOARD_URL || daemonInfo) {
+        try {
+          const resolveEndpoint = async () =>
+            process.env.SWITCHBOARD_URL
+              ? { url: process.env.SWITCHBOARD_URL, token: readToken(home) }
+              : await ensureDaemon(home);
+          const endpoint = await resolveEndpoint();
+          const storedAgent = store.getAgent(repo, to);
+          const harness = process.env.SWITCHBOARD_HARNESS || storedAgent?.harness || "wait";
+          waitClient = new BusClient();
+          waitClient.endpointResolver = resolveEndpoint;
+          waitClient.onMessage = () => {
+            for (const wake of waitListeners) wake();
+          };
+          await waitClient.connect(endpoint.url, {
+            type: "hello",
+            token: endpoint.token,
+            name: to,
+            harness,
+            repoKey: repo,
+            cwd,
+            sessionId: values.session,
+            boundSession: Boolean(values.session),
+            waitOnly: true,
+          });
+          if (values.topic && values.topic !== "repo" && values.topic !== "presence") {
+            await waitClient.request({ type: "subscribe", topics: [values.topic] });
+          }
+          heartbeat = setInterval(() => {
+            waitClient?.send({ type: "heartbeat" });
+          }, HEARTBEAT_MS);
+          heartbeat.unref?.();
+        } catch {
+          waitClient?.close();
+          waitClient = null;
+        }
+      }
+    }
     const result = await waitForMessages(store, {
-      repo: repoKey(values.cwd || process.cwd()), to, timeoutMs, intervalMs, sinceSeq,
+      repo, to, timeoutMs, intervalMs, sinceSeq,
       wakeExisting: values["wake-existing"], cursorKey, topic: values.topic,
     }, {
       onReady: (baseline) => process.stderr.write(`waiting to=${to} since_seq=${baseline} timeout_seconds=${timeoutMs / 1000}\n`),
+      subscribeWake: waitClient
+        ? (wake) => {
+            waitListeners.add(wake);
+            return () => waitListeners.delete(wake);
+          }
+        : undefined,
     });
     process.stdout.write(`${values.json ? JSON.stringify(result) : formatWaitResult(result)}\n`);
   } finally {
+    if (heartbeat) clearInterval(heartbeat);
+    waitClient?.close();
     store.close();
   }
 }

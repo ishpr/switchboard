@@ -54,6 +54,30 @@ test("a bound Codex session is injected even while that session is open", () => 
   assert.ok(launch.args.includes("--resume"));
 });
 
+test("a plain Muse UUID session is not treated as injectable unless bound to a pane or explicitly enabled", () => {
+  const uuid = "01a1957b-9e69-7b90-aa4b-d1f30c47dc47";
+  assert.equal(
+    decideWake({ directed: true, online: true, harness: "muse", sessionId: uuid, wakeEnabled: false }).mode,
+    "push",
+  );
+  assert.equal(
+    decideWake({ directed: true, online: false, harness: "muse", sessionId: uuid, wakeEnabled: false }).mode,
+    "skip",
+  );
+  assert.equal(
+    decideWake({ directed: true, online: false, harness: "muse", sessionId: uuid, wakeEnabled: true }).mode,
+    "headless",
+  );
+  assert.equal(
+    launchFor({ mode: "inject", harness: "muse", cwd: "/work", sessionId: uuid, message }),
+    null,
+  );
+  assert.equal(
+    decideWake({ directed: true, online: true, harness: "muse", sessionId: "zellij:switchboard:5", wakeEnabled: false }).mode,
+    "inject",
+  );
+});
+
 test("an open session with no inject command is not given a second process", () => {
   const info = decideWake({
     directed: true,

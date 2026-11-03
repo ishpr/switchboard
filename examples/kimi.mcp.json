@@ -5,7 +5,8 @@
       "args": ["/absolute/path/to/switchboard/dist/cli.js", "mcp"],
       "env": {
         "SWITCHBOARD_HARNESS": "kimi",
-        "SWITCHBOARD_NAME": "kimi"
+        "SWITCHBOARD_NAME": "kimi",
+        "SWITCHBOARD_SCOPE": "share"
       }
     }
   }

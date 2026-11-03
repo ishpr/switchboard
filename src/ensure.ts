@@ -2,6 +2,7 @@ import type { BuildInfo } from "./types.ts";
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import net from "node:net";
+import { buildWarning, loadBuild } from "./build.ts";
 import { daemonInfoPath, switchboardHome } from "./paths.ts";
 import { ensureToken } from "./token.ts";
 
@@ -26,7 +27,26 @@ export function readDaemonInfo(home = switchboardHome()): DaemonInfo | null {
 export async function ensureDaemon(home = switchboardHome()): Promise<{ url: string; token: string }> {
   const token = ensureToken(home);
   const current = readDaemonInfo(home);
-  if (current && (await portOpen(current.port))) return { url: current.url, token };
+  if (current && (await portOpen(current.port))) {
+    const localBuild = loadBuild();
+    const staleBuild =
+      process.env.SWITCHBOARD_NO_AUTOSTART !== "1" &&
+      current.pid > 1 &&
+      Boolean(
+        buildWarning(localBuild, current.build) ||
+          (localBuild.built_at && current.build?.built_at && localBuild.built_at !== current.build.built_at),
+      );
+    if (!staleBuild) return { url: current.url, token };
+    try {
+      process.kill(current.pid, "SIGTERM");
+      for (let i = 0; i < 30; i++) {
+        if (!(await portOpen(current.port))) break;
+        await delay(50);
+      }
+    } catch {
+      return { url: current.url, token };
+    }
+  }
   if (process.env.SWITCHBOARD_NO_AUTOSTART === "1") {
     throw new Error("switchboard daemon is not running");
   }

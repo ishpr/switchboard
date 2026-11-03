@@ -5,7 +5,8 @@
       "args": ["/absolute/path/to/switchboard/dist/cli.js", "mcp"],
       "env": {
         "SWITCHBOARD_HARNESS": "claude",
-        "SWITCHBOARD_NAME": "claude"
+        "SWITCHBOARD_NAME": "claude",
+        "SWITCHBOARD_SCOPE": "share"
       }
     }
   }

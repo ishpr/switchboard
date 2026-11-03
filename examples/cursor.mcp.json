@@ -6,7 +6,8 @@
       "env": {
         "SWITCHBOARD_HARNESS": "cursor",
         "SWITCHBOARD_NAME": "cursor",
-        "SWITCHBOARD_ROLE": "orchestrator"
+        "SWITCHBOARD_ROLE": "orchestrator",
+        "SWITCHBOARD_SCOPE": "share"
       }
     }
   }
