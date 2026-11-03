@@ -25,7 +25,14 @@ export type BusMessage = {
   to: string | null;
 };
 
+export type SessionDiagnostics = {
+  health: "online" | "offline" | "stale" | "dead_pane";
+  wakeMode: WakeMode;
+  warnings: string[];
+};
+
 export type AgentRecord = {
+  diagnostics?: SessionDiagnostics;
   repo: string;
   name: string;
   harness: string;

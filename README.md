@@ -260,3 +260,40 @@ npm test
 ```
 
 The tests use a temp database and a fake spawn. They do not launch Claude, Codex, Cursor, Kimi, Grok, or Muse. After you add a snippet, restart that CLI and run `node dist/cli.js who`.
+
+## Session diagnostics
+
+Run `switchboard doctor` in a repository to check its registered agents and live
+sessions. Use `--cwd /path/to/repo` to select another repository or `--json` for
+machine-readable output. The command exits 1 when it finds warnings and 0 when
+there are none (including an empty board). It does not change registrations or
+restart agents. An already-running older daemon can also be diagnosed by the new CLI.
+
+`switchboard who`, `bus_who`, and `bus_status` also show diagnostics when connected
+to the updated daemon. Restart the daemon after upgrading to enable those fields.
+Connection presence stays separate from health: a shim can be online while its
+registered pane has disappeared.
+
+- `online` / `offline`: current connection presence, with a recent last-seen time.
+- `stale`: last seen more than 10 minutes ago.
+- `dead_pane`: the bound terminal pane is missing or has exited, even if the shim
+  still sends heartbeats. This takes precedence over stale status.
+
+Zellij bindings use `zellij:<session>:<pane>`. tmux bindings use `tmux:%12`
+(or `%12`), using the pane's unique tmux id. Both use the existing persisted
+`session_id`; there is no separate pane registry to synchronize. The shim detects
+`TMUX_PANE` automatically when no explicit or Zellij binding takes precedence.
+A binding can also be registered explicitly:
+
+```sh
+switchboard agent add --name codex --harness codex --session 'tmux:%12' --wake
+```
+
+Diagnostics check live tmux panes and Zellij terminal panes, ignoring plugin panes
+and exited panes. A missing binary, unsupported pane-list command, timeout, or
+permission error produces an unverified-pane warning rather than declaring it dead.
+Probes have a 1.5-second timeout and share a snapshot per multiplexer/session within
+a report. `doctor` also warns about stale sessions, injection targeting a missing
+pane, and `wake=off` on an active agent. The wake policy controls offline headless
+launches; bound-session injection still applies when wake is off. Diagnostics report
+problems without silently changing that policy or rebinding sessions.

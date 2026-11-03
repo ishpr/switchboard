@@ -3,6 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { inferClaudeAgentName } from "./accounts.ts";
+import { formatDiagnostics } from "./health.ts";
 import { BusClient } from "./busClient.ts";
 import { ensureDaemon } from "./ensure.ts";
 import { resolveShimCwd } from "./init.ts";
@@ -117,7 +118,8 @@ export async function runShim(): Promise<void> {
   // Omit wake unless the env var is set, so `agent add --wake` survives a later connect.
   const wakeFlag = process.env.SWITCHBOARD_WAKE;
   const zellijSession = discoverZellijSession(process.env);
-  const sessionId = process.env.SWITCHBOARD_SESSION || zellijSession;
+  const sessionId = process.env.SWITCHBOARD_SESSION || zellijSession
+    || (/^%\d+$/.test(process.env.TMUX_PANE ?? "") ? `tmux:${process.env.TMUX_PANE}` : undefined);
   const boundSession = Boolean(sessionId);
   const welcome = await bus.connect(endpoint.url, {
     type: "hello",
@@ -237,7 +239,7 @@ function registerTools(mcp: McpServer, bus: BusClient, role: Role): void {
     "bus_who",
     {
       description:
-        "List every live session in this repo, plus registered agents that are offline. Several sessions may share one name. The orchestrator row is marked orchestrator.",
+        "List every live session in this repo, plus registered agents that are offline. Several sessions may share one name. The orchestrator row is marked orchestrator. Includes session health and pane/wake warnings.",
       inputSchema: {},
     },
     async () => {
@@ -250,7 +252,7 @@ function registerTools(mcp: McpServer, bus: BusClient, role: Role): void {
             const state = agent.online ? "online" : "offline";
             const wake = agent.wake ? "wake=on" : "wake=off";
             const session = agent.sessionId ? ` session=${agent.sessionId}` : "";
-            return `${agent.name} ${agent.harness} ${state} ${wake}${session} ${agent.role} ${agent.status}`;
+            return `${agent.name} ${agent.harness} ${state} ${wake}${session} ${agent.role} ${agent.status} ${formatDiagnostics(agent.diagnostics)}`;
           })
           .join("\n"),
       );
@@ -306,7 +308,7 @@ function registerTools(mcp: McpServer, bus: BusClient, role: Role): void {
   mcp.registerTool(
     "bus_status",
     {
-      description: "Set what this agent is doing. Shown by bus_who.",
+      description: "Set what this agent is doing. Shown by bus_who. Returns session health and pane/wake warnings.",
       inputSchema: { status: z.string() },
     },
     async ({ status }) => {

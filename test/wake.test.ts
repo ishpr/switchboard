@@ -143,3 +143,17 @@ test("parseZellijSessionFromPs extracts ZELLIJ_SESSION_NAME and ZELLIJ_PANE_ID f
   assert.equal(parsed.ppid, 93851);
   assert.equal(parsed.session, "zellij:switchboard:6");
 });
+
+test("tmux-bound sessions inject literal text into the exact pane", () => {
+  for (const sessionId of ["tmux:%12", "%12"]) {
+    assert.equal(decideWake({ directed: true, online: true, harness: "claude", sessionId, wakeEnabled: false }).mode, "inject");
+    const launch = launchFor({ mode: "inject", harness: "claude", cwd: "/work", sessionId, message });
+    assert.ok(launch);
+    assert.equal(launch.cmd, "sh");
+    assert.equal(launch.args[3], "%12");
+    assert.match(launch.args[1]!, /send-keys -t "\$1" -l -- "\$2"/);
+    assert.match(launch.args[1]!, /sleep 0\.25/);
+    assert.equal(launch.args[4]!.includes("\n"), false);
+    assert.match(launch.args[4]!, /call bus_inbox and reply with bus_reply/);
+  }
+});

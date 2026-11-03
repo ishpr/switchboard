@@ -52,7 +52,7 @@ export function decideWake(input: {
 }
 
 function canInject(harness: string, sessionId?: string | null): boolean {
-  if (sessionId?.startsWith("zellij:")) return true;
+  if (sessionId?.startsWith("zellij:") || /^(?:tmux:)?%\d+$/.test(sessionId ?? "")) return true;
   return harness === "codex" || harness === "muse";
 }
 
@@ -66,16 +66,25 @@ export function launchFor(input: {
   if (input.mode !== "inject" && input.mode !== "headless") return null;
   const prompt = promptFor(input.message);
   if (input.mode === "inject") {
+    const tmux = /^(?:tmux:)?(%\d+)$/.exec(input.sessionId ?? "");
+    if (tmux) {
+      return {
+        cmd: "sh",
+        args: [
+          "-c",
+          'tmux send-keys -t "$1" C-u && tmux send-keys -t "$1" -l -- "$2" && sleep 0.25 && tmux send-keys -t "$1" Enter',
+          "switchboard-tmux-wake",
+          tmux[1]!,
+          panePromptFor(input.message),
+        ],
+        cwd: input.cwd,
+      };
+    }
     if (input.sessionId?.startsWith("zellij:")) {
       const parts = input.sessionId.split(":");
       const zSession = parts[1];
       const zPane = parts[2];
       if (zSession && zPane) {
-        const actionHint =
-          input.message.kind === "ask"
-            ? "call bus_inbox and reply with bus_reply."
-            : "call bus_inbox to read it and continue.";
-        const oneLine = `[switchboard] Message from ${input.message.fromName} (id=${input.message.id}): ${actionHint}`;
         return {
           cmd: "sh",
           args: [
@@ -84,7 +93,7 @@ export function launchFor(input: {
             "switchboard-zellij-wake",
             zSession,
             zPane,
-            oneLine,
+            panePromptFor(input.message),
           ],
           cwd: input.cwd,
         };
@@ -173,6 +182,13 @@ export function headlessLaunch(
     default:
       return null;
   }
+}
+
+function panePromptFor(message: BusMessage): string {
+  const actionHint = message.kind === "ask"
+    ? "call bus_inbox and reply with bus_reply."
+    : "call bus_inbox to read it and continue.";
+  return `[switchboard] Message from ${message.fromName} (id=${message.id}): ${actionHint}`;
 }
 
 export function promptFor(message: BusMessage): string {
