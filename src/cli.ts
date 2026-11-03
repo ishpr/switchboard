@@ -3,7 +3,16 @@ import { spawn, execFileSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
+import {
+  buildAccountProfile,
+  discoverClaudeAccounts,
+  inferClaudeAgentName,
+  provisionClaudeAccount,
+  runClaudePane,
+  writeSavedAccounts,
+} from "./accounts.ts";
 import { BusClient } from "./busClient.ts";
 import { startDaemon } from "./daemon.ts";
 import { ensureDaemon, readDaemonInfo } from "./ensure.ts";
@@ -60,14 +69,29 @@ try {
       process.stdout.write(`${readToken()}\n`);
       break;
     case "init":
-      await init(async (cwd, orch) => {
+      await init(async (cwd, orch, provisioned) => {
         const client = await connectCli(cwd);
         try {
           await client.request({ type: "orchestrator", name: orch });
+          for (const item of provisioned) {
+            await client.request({
+              type: "register",
+              name: item.profile.id,
+              harness: "claude",
+              cwd: item.worktreeDir,
+              wake: true,
+            });
+          }
         } finally {
           client.close();
         }
       });
+      break;
+    case "account":
+      await accountCmd();
+      break;
+    case "claude-pane":
+      await claudePaneCmd();
       break;
     case "--resume":
     case "-c":
@@ -111,9 +135,10 @@ function usage(): void {
   status                Update an agent's status string
   orchestrator          Get or set the orchestrator for this repo
   agent add             Register an agent and its wake policy
+  account               List or add isolated Claude accounts (list | add)
   hook                  Print hook JSON for a turn already in progress
   token                 Print the machine token path's contents
-  init                  Install the Zellij grid. Asks which panes to include
+  init                  Install the Zellij grid. Asks which panes & accounts to include
   --resume, -c          Attach the grid, or continue each harness's latest session
   --restart, -r         Recreate the grid session and resume each harness's session
 
@@ -508,14 +533,104 @@ async function agent(): Promise<void> {
   }
 }
 
-function labelToAgentName(label?: string): string | undefined {
-  if (!label) return undefined;
-  const low = label.trim().toLowerCase();
-  if (low.startsWith("pi")) return "pi";
-  if (low.startsWith("eg")) return "eg";
-  if (low.includes("team")) return "team";
-  if (low.includes("servsys")) return "servsys";
-  return undefined;
+async function accountCmd(): Promise<void> {
+  const sub = process.argv[3] || "list";
+  const cliPath = fileURLToPath(import.meta.url);
+  if (sub === "list") {
+    const accounts = discoverClaudeAccounts();
+    if (accounts.length === 0) {
+      process.stdout.write("no isolated Claude accounts discovered\n");
+      return;
+    }
+    for (const acct of accounts) {
+      const email = acct.email ?? "-";
+      const plan = acct.plan ?? "-";
+      process.stdout.write(
+        `${acct.id}\t${acct.pane}\t${email}\t${plan}\t${acct.configDir}\t${acct.workspaceRoot}\n`,
+      );
+    }
+    return;
+  }
+  if (sub !== "add") {
+    throw new Error(
+      "usage: switchboard account [list | add --name <id> [--email <email>] [--plan <max|team>] [--label <label>] [--model <model>] [--cwd <repoDir>]]",
+    );
+  }
+  const { values } = parseArgs({
+    args: process.argv.slice(4),
+    options: {
+      name: { type: "string" },
+      email: { type: "string" },
+      plan: { type: "string" },
+      label: { type: "string" },
+      pane: { type: "string" },
+      model: { type: "string" },
+      cwd: { type: "string" },
+    },
+  });
+  if (!values.name) throw new Error("account add requires --name <id>");
+  const existing = discoverClaudeAccounts();
+  const spec = [values.name, values.email ?? "", values.plan ?? ""].join(":");
+  const base = buildAccountProfile(spec, existing);
+  const profile = {
+    ...base,
+    ...(values.label ? { label: values.label } : {}),
+    ...(values.pane ? { pane: values.pane } : {}),
+    ...(values.model ? { model: values.model } : {}),
+  };
+  const nextList = existing.filter((a) => a.id !== profile.id).concat(profile);
+  writeSavedAccounts(nextList);
+  const targetRepo = values.cwd ? path.resolve(values.cwd) : process.cwd();
+  const { worktreeDir, notes } = provisionClaudeAccount(profile, {
+    targetRepo,
+    cliPath,
+  });
+  const client = await connectCli(targetRepo);
+  try {
+    await client.request({
+      type: "register",
+      name: profile.id,
+      harness: "claude",
+      cwd: worktreeDir,
+      wake: true,
+    });
+  } finally {
+    client.close();
+  }
+  for (const note of notes) process.stdout.write(`${note}\n`);
+  process.stdout.write(`account ${profile.id} provisioned (${worktreeDir})\n`);
+}
+
+async function claudePaneCmd(): Promise<void> {
+  const { values } = parseArgs({
+    args: process.argv.slice(3),
+    options: {
+      account: { type: "string" },
+      "config-dir": { type: "string" },
+      label: { type: "string" },
+      cwd: { type: "string" },
+      email: { type: "string" },
+      plan: { type: "string" },
+      model: { type: "string" },
+      resume: { type: "boolean", default: false },
+    },
+  });
+  const account = values.account;
+  if (!account) throw new Error("claude-pane requires --account <id>");
+  const configDir = values["config-dir"] || path.join(homedir(), `.claude-${account}`);
+  const label = values.label || account.toUpperCase();
+  const cwd = values.cwd || process.cwd();
+  await runClaudePane({
+    account,
+    configDir,
+    label,
+    cwd,
+    cliPath: fileURLToPath(import.meta.url),
+    email: values.email,
+    plan: values.plan,
+    model: values.model,
+    resume: Boolean(values.resume),
+  });
 }
 
 async function readStdinJson(): Promise<Record<string, unknown> | null> {
@@ -570,7 +685,7 @@ async function hook(): Promise<void> {
   const callerName =
     values.name ||
     process.env.SWITCHBOARD_NAME ||
-    labelToAgentName(process.env.CLAUDE_ACCOUNT_LABEL) ||
+    inferClaudeAgentName() ||
     harness;
   const stdinCwd = stdinJson && typeof stdinJson.cwd === "string" ? stdinJson.cwd : "";
   const cwd = values.cwd || stdinCwd || process.cwd();

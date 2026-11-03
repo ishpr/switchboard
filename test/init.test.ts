@@ -1,8 +1,13 @@
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import {
+  buildAccountProfile,
+  discoverClaudeAccounts,
+  provisionClaudeAccount,
+} from "../src/accounts.ts";
 import {
   chosenIds,
   claudeAccountPanes,
@@ -10,6 +15,7 @@ import {
   harnessPanes,
   panesFor,
   readRepoConfig,
+  resolveAccountProfiles,
   resolveOrchestratorName,
   switchboardLayout,
   upsertZshBlock,
@@ -120,19 +126,76 @@ test("per-repo config persists different orchestrators for different repos", () 
   assert.deepEqual(cfgB?.panes, ["orchestrator", "codex"]);
 });
 
-test("claude4 mode expands the Claude choice into all 4 Claude account panes with resume support", () => {
-  const fresh = claudeAccountPanes("/Users/ishprasad/code/servone", false);
-  assert.equal(fresh.length, 4);
+test("multi-account Claude resolution and isolated environment provisioning are completely generic", () => {
+  const fakeHome = mkdtempSync(path.join(tmpdir(), "sb-acct-home-"));
+  const fakeSbHome = mkdtempSync(path.join(tmpdir(), "sb-acct-sbhome-"));
+  const baseClaude = path.join(fakeHome, ".claude");
+  mkdirSync(baseClaude, { recursive: true });
+  writeFileSync(path.join(baseClaude, "settings.json"), '{"hooks":{}}\n');
+  writeFileSync(path.join(baseClaude, "CLAUDE.md"), "# shared\n");
+
+  // 1. Numeric count generates generic acct1..acctN when none exist
+  const byCount = resolveAccountProfiles("3", true, [], fakeHome);
+  assert.equal(byCount.length, 3);
   assert.deepEqual(
-    fresh.map((p) => p.name),
-    ["PI · eprasad7in (Max)", "EG · eprasad7 (Max)", "Servsys · Team", "Servsys · Personal (Max)"],
+    byCount.map((p) => p.id),
+    ["acct1", "acct2", "acct3"],
   );
+
+  // 2. Custom id:email:plan specification
+  const custom = resolveAccountProfiles(
+    "work:alice@corp.com:team,personal:alice@gmail.com:max",
+    true,
+    [],
+    fakeHome,
+  );
+  assert.equal(custom.length, 2);
+  assert.equal(custom[0]?.id, "work");
+  assert.equal(custom[0]?.email, "alice@corp.com");
+  assert.equal(custom[0]?.plan, "team");
+  assert.equal(custom[1]?.id, "personal");
+
+  // 3. Provisioning creates ~/.claude-<id>, symlinks shared config, and injects Switchboard MCP
+  const profile = buildAccountProfile("alpha:alpha@example.com:max", [], fakeHome);
+  provisionClaudeAccount(profile, {
+    cliPath: "/opt/switchboard/dist/cli.js",
+    nodePath: "/usr/local/bin/node",
+    home: fakeHome,
+  });
+
+  assert.ok(existsSync(profile.configDir));
+  assert.ok(lstatSync(path.join(profile.configDir, "settings.json")).isSymbolicLink());
+  assert.ok(lstatSync(path.join(profile.configDir, "CLAUDE.md")).isSymbolicLink());
+
+  const claudeJson = JSON.parse(readFileSync(path.join(profile.configDir, ".claude.json"), "utf8"));
+  assert.deepEqual(claudeJson.mcpServers.switchboard, {
+    type: "stdio",
+    command: "/usr/local/bin/node",
+    args: ["/opt/switchboard/dist/cli.js", "mcp"],
+    env: {
+      SWITCHBOARD_NAME: "alpha",
+      SWITCHBOARD_HARNESS: "claude",
+      SWITCHBOARD_SCOPE: "share",
+    },
+  });
+
+  // 4. Discovery picks up ~/.claude-<id> from disk
+  const discovered = discoverClaudeAccounts(fakeHome, fakeSbHome);
+  assert.deepEqual(
+    discovered.map((d) => d.id),
+    ["alpha"],
+  );
+
+  // 5. Pane generation supports both fresh and --resume via native claude-pane
+  const fresh = claudeAccountPanes("/Users/ishprasad/code/servone", false, custom, "/opt/switchboard/dist/cli.js");
+  assert.equal(fresh.length, 2);
+  assert.ok(fresh[0]?.args?.includes("claude-pane"));
   assert.ok(!fresh[0]?.args?.includes("--resume"));
 
-  const resumed = claudeAccountPanes("/Users/ishprasad/code/servone", true);
-  assert.equal(resumed.length, 4);
+  const resumed = claudeAccountPanes("/Users/ishprasad/code/servone", true, custom, "/opt/switchboard/dist/cli.js");
+  assert.equal(resumed.length, 2);
   for (const pane of resumed) {
-    assert.deepEqual(pane.args?.slice(-2), ["--", "--resume"]);
+    assert.equal(pane.args?.at(-1), "--resume");
   }
 
   const dir = "/Users/ishprasad/.config/zellij/layouts";

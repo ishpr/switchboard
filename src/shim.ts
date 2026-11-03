@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { inferClaudeAgentName } from "./accounts.ts";
 import { BusClient } from "./busClient.ts";
 import { ensureDaemon } from "./ensure.ts";
 import { switchboardHome } from "./paths.ts";
@@ -44,7 +45,7 @@ function instructions(role: Role, orchestrator: string | null): string {
 export async function runShim(): Promise<void> {
   const cwd = process.cwd();
   const harness = process.env.SWITCHBOARD_HARNESS || "unknown";
-  const name = process.env.SWITCHBOARD_NAME || harness;
+  const name = process.env.SWITCHBOARD_NAME || inferClaudeAgentName() || harness;
   const home = switchboardHome();
   const resolveEndpoint = async () =>
     process.env.SWITCHBOARD_URL

@@ -6,6 +6,14 @@ import { stdin, stdout } from "node:process";
 import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
+import {
+  buildAccountProfile,
+  claudeProfilePaneSpec,
+  discoverClaudeAccounts,
+  provisionClaudeAccount,
+  writeSavedAccounts,
+  type ClaudeAccountProfile,
+} from "./accounts.ts";
 import { switchboardHome } from "./paths.ts";
 import { gitRepoRoot, repoKey } from "./repo.ts";
 
@@ -15,6 +23,7 @@ export type RepoConfig = {
   orchestrator: string;
   panes?: string[];
   claude4?: boolean;
+  accounts?: string[];
   updatedAt: number;
 };
 
@@ -35,7 +44,7 @@ export function readRepoConfig(cwd: string, home = switchboardHome()): RepoConfi
 
 export function writeRepoConfig(
   cwd: string,
-  update: { orchestrator?: string; panes?: string[]; claude4?: boolean },
+  update: { orchestrator?: string; panes?: string[]; claude4?: boolean; accounts?: string[] },
   home = switchboardHome(),
 ): RepoConfig {
   const key = repoKey(cwd);
@@ -47,6 +56,7 @@ export function writeRepoConfig(
     orchestrator: update.orchestrator ?? existing?.orchestrator ?? "cursor",
     panes: update.panes ?? existing?.panes,
     claude4: update.claude4 ?? existing?.claude4,
+    accounts: update.accounts ?? existing?.accounts,
     updatedAt: Date.now(),
   };
   const dir = path.join(home, "repos");
@@ -253,82 +263,73 @@ export function chosenIds(answer: string, choices: PaneChoice[]): string[] {
   return ids;
 }
 
-export type ClaudeAccountSpec = {
-  id: "pi" | "eg" | "team" | "servsys";
-  pane: string;
-  configDir: string;
-  email: string;
-  plan: "max" | "team";
-  label: string;
-  wsSubdir: string;
-};
+export function resolveAccountProfiles(
+  spec: string | undefined,
+  useClaudeMulti: boolean,
+  discovered = discoverClaudeAccounts(),
+  home = homedir(),
+): ClaudeAccountProfile[] {
+  const raw = (spec ?? "").trim();
+  if (!raw) {
+    return useClaudeMulti ? discovered : [];
+  }
+  if (raw.toLowerCase() === "discovered" || raw.toLowerCase() === "all" || raw.toLowerCase() === "claude4") {
+    return discovered;
+  }
+  if (/^\d+$/.test(raw)) {
+    const count = Math.max(1, Math.min(12, Number(raw)));
+    if (discovered.length >= count) return discovered.slice(0, count);
+    const profiles = [...discovered];
+    for (let i = profiles.length + 1; i <= count; i++) {
+      profiles.push(buildAccountProfile(`acct${i}`, discovered, home));
+    }
+    return profiles;
+  }
+  return raw
+    .split(/[\s,]+/)
+    .filter(Boolean)
+    .map((token) => buildAccountProfile(token, discovered, home));
+}
 
-export const CLAUDE_ACCOUNTS: ClaudeAccountSpec[] = [
-  {
-    id: "pi",
-    pane: "PI · eprasad7in (Max)",
-    configDir: path.join(homedir(), ".claude-pi"),
-    email: "eprasad7in@gmail.com",
-    plan: "max",
-    label: "PI eprasad7in",
-    wsSubdir: "pi",
-  },
-  {
-    id: "eg",
-    pane: "EG · eprasad7 (Max)",
-    configDir: path.join(homedir(), ".claude-eg"),
-    email: "eprasad7@gmail.com",
-    plan: "max",
-    label: "EG eprasad7",
-    wsSubdir: "eg",
-  },
-  {
-    id: "team",
-    pane: "Servsys · Team",
-    configDir: path.join(homedir(), ".claude-team"),
-    email: "eprasad@servsys.com",
-    plan: "team",
-    label: "Servsys Team",
-    wsSubdir: "team",
-  },
-  {
-    id: "servsys",
-    pane: "Servsys · Personal (Max)",
-    configDir: path.join(homedir(), ".claude-servsys"),
-    email: "eprasad@servsys.com",
-    plan: "max",
-    label: "Servsys Personal",
-    wsSubdir: "servsys",
-  },
-];
-
-export function claudeAccountPanes(targetRepo: string, resume: boolean): PaneSpec[] {
-  const repoName = path.basename(gitRepoRoot(targetRepo));
-  const cmd = homeBin("claude-acct");
-  return CLAUDE_ACCOUNTS.map((acct) => {
-    const wsRepo = path.join(homedir(), "claude-ws", acct.wsSubdir, repoName);
-    const rootDir = existsSync(wsRepo) ? wsRepo : path.join(homedir(), "claude-ws", acct.wsSubdir);
-    const baseArgs = [acct.configDir, acct.email, acct.plan, acct.label, rootDir];
-    return {
-      name: acct.pane,
-      command: cmd,
-      args: resume ? [...baseArgs, "--", "--resume"] : baseArgs,
-    };
-  });
+export function claudeAccountPanes(
+  targetRepo: string,
+  resume: boolean,
+  profiles = discoverClaudeAccounts(),
+  cliPath = path.join(repoRoot(), "dist/cli.js"),
+): PaneSpec[] {
+  return profiles.map((profile) =>
+    claudeProfilePaneSpec(profile, {
+      targetRepo,
+      resume,
+      cliPath,
+    }),
+  );
 }
 
 export function panesFor(
   ids: string[],
   resume: boolean,
   choices = gridChoices(),
-  opts: { claude4?: boolean; targetRepo?: string } = {},
+  opts: {
+    claude4?: boolean;
+    accounts?: ClaudeAccountProfile[];
+    targetRepo?: string;
+    cliPath?: string;
+  } = {},
 ): PaneSpec[] {
   const wanted = new Set(ids);
   const out: PaneSpec[] = [];
+  const profiles =
+    opts.accounts && opts.accounts.length > 0
+      ? opts.accounts
+      : opts.claude4
+        ? discoverClaudeAccounts()
+        : [];
+  const cliPath = opts.cliPath ?? path.join(repoRoot(), "dist/cli.js");
   for (const def of HARNESSES) {
     if (!wanted.has(def.id)) continue;
-    if (def.id === "claude" && opts.claude4 && opts.targetRepo) {
-      out.push(...claudeAccountPanes(opts.targetRepo, resume));
+    if (def.id === "claude" && profiles.length > 0 && opts.targetRepo) {
+      out.push(...claudeAccountPanes(opts.targetRepo, resume, profiles, cliPath));
       continue;
     }
     const foundCmd = choices.find((choice) => choice.id === def.id)?.command;
@@ -436,6 +437,7 @@ export function installSwitchboard(
     orchestrator?: string;
     panes?: string[];
     claude4?: boolean;
+    accounts?: string[];
     home?: string;
     fresh?: PaneSpec[];
     resume?: PaneSpec[];
@@ -468,7 +470,12 @@ export function installSwitchboard(
     notes.push(`repo layout ${repoLayoutPath}`);
     const cfg = writeRepoConfig(
       targetRepo,
-      { orchestrator: opts.orchestrator, panes: opts.panes, claude4: opts.claude4 },
+      {
+        orchestrator: opts.orchestrator,
+        panes: opts.panes,
+        claude4: opts.claude4,
+        accounts: opts.accounts,
+      },
       opts.home ?? switchboardHome(),
     );
     notes.push(`repo config ${repoConfigPath(cfg.repoKey, opts.home ?? switchboardHome())} (orchestrator=${cfg.orchestrator})`);
@@ -534,7 +541,11 @@ async function promptPaneSelection(choices: PaneChoice[]): Promise<string> {
 }
 
 export async function init(
-  onOrchestratorChosen?: (cwd: string, orchestrator: string) => Promise<void>,
+  onConfigured?: (
+    cwd: string,
+    orchestrator: string,
+    provisionedAccounts: Array<{ profile: ClaudeAccountProfile; worktreeDir: string }>,
+  ) => Promise<void>,
 ): Promise<void> {
   const { values } = parseArgs({
     args: process.argv.slice(3),
@@ -542,25 +553,74 @@ export async function init(
     options: {
       orchestrator: { type: "string" },
       panes: { type: "string" },
+      accounts: { type: "string" },
       cwd: { type: "string" },
       claude4: { type: "boolean" },
     },
   });
   const targetCwd = values.cwd ? path.resolve(values.cwd) : process.cwd();
   const existingCfg = readRepoConfig(targetCwd);
+  const discovered = discoverClaudeAccounts();
   const choices = gridChoices();
+  if (discovered.length > 0 && values.panes === undefined) {
+    stdout.write(
+      `Discovered ${discovered.length} isolated Claude account(s): ${discovered.map((a) => `${a.id} (${a.pane})`).join(", ")}\n\n`,
+    );
+  }
   const answer = values.panes !== undefined ? values.panes : await promptPaneSelection(choices);
   let ids = chosenIds(answer, choices);
   if (ids.length === 0) {
     stdout.write("Nothing matched. Using the panes found on this machine.\n");
     ids = chosenIds("", choices);
   }
-  const useClaude4 =
-    values.claude4 ??
-    (answer.toLowerCase().includes("claude4") ? true : existingCfg?.claude4 ?? false);
-  if (useClaude4 && !ids.includes("claude")) {
+
+  let accountsRaw = values.accounts;
+  if (accountsRaw === undefined && !values.claude4 && stdin.isTTY && ids.includes("claude")) {
+    const defaultAccts =
+      existingCfg?.accounts?.join(",") ||
+      (existingCfg?.claude4 && discovered.length > 0 ? discovered.map((a) => a.id).join(",") : "");
+    const hint = discovered.length > 0 ? `discovered: ${discovered.map((a) => a.id).join(",")}` : "e.g. acct1,acct2 or 4";
+    const rl = createInterface({ input: stdin, output: stdout });
+    try {
+      accountsRaw = (
+        await rl.question(`Isolated Claude accounts (blank=single Claude, or enter names/count [${defaultAccts || hint}]): `)
+      ).trim();
+      if (!accountsRaw && defaultAccts) accountsRaw = defaultAccts;
+    } finally {
+      rl.close();
+    }
+  }
+
+  const useClaudeMulti = Boolean(
+    values.claude4 ||
+      (accountsRaw && accountsRaw.trim().length > 0) ||
+      answer.toLowerCase().includes("claude4") ||
+      answer.toLowerCase().includes("claude-multi") ||
+      existingCfg?.claude4,
+  );
+  const accountSpec =
+    accountsRaw ??
+    (existingCfg?.accounts?.length ? existingCfg.accounts.join(",") : undefined);
+  const profiles = resolveAccountProfiles(accountSpec, useClaudeMulti, discovered);
+  if (profiles.length > 0 && !ids.includes("claude")) {
     ids.push("claude");
   }
+
+  const cliPath = path.join(repoRoot(), "dist/cli.js");
+  const provisioned: Array<{ profile: ClaudeAccountProfile; worktreeDir: string }> = [];
+  const accountNotes: string[] = [];
+  if (profiles.length > 0) {
+    writeSavedAccounts(profiles);
+    for (const profile of profiles) {
+      const res = provisionClaudeAccount(profile, {
+        targetRepo: targetCwd,
+        cliPath,
+      });
+      provisioned.push({ profile, worktreeDir: res.worktreeDir });
+      accountNotes.push(...res.notes);
+    }
+  }
+
   for (const choice of choices) {
     if (ids.includes(choice.id) && !choice.found) stdout.write(`skipped ${choice.pane}: not found\n`);
   }
@@ -575,22 +635,33 @@ export async function init(
     }
   }
   const orchestrator = resolveOrchestratorName(orchRaw ?? "", defaultOrch);
-  const freshPanes = panesFor(ids, false, choices, { claude4: useClaude4, targetRepo: targetCwd });
-  const resumePanes = panesFor(ids, true, choices, { claude4: useClaude4, targetRepo: targetCwd });
+  const freshPanes = panesFor(ids, false, choices, {
+    claude4: profiles.length > 0,
+    accounts: profiles,
+    targetRepo: targetCwd,
+    cliPath,
+  });
+  const resumePanes = panesFor(ids, true, choices, {
+    claude4: profiles.length > 0,
+    accounts: profiles,
+    targetRepo: targetCwd,
+    cliPath,
+  });
   const notes = installSwitchboard({
     targetRepo: targetCwd,
     orchestrator,
     panes: ids,
-    claude4: useClaude4,
+    claude4: profiles.length > 0,
+    accounts: profiles.map((p) => p.id),
     fresh: freshPanes,
     resume: resumePanes,
   });
-  if (onOrchestratorChosen) {
-    await onOrchestratorChosen(targetCwd, orchestrator);
+  if (onConfigured) {
+    await onConfigured(targetCwd, orchestrator, provisioned);
   }
-  for (const note of notes) stdout.write(`${note}\n`);
+  for (const note of [...accountNotes, ...notes]) stdout.write(`${note}\n`);
   const names = freshPanes.map((pane) => pane.name);
   stdout.write(`panes ${names.join(", ")}\n`);
   stdout.write(`orchestrator ${orchestrator}\n`);
-  stdout.write("Open a new terminal and run: switchboard (or switchboard --resume)\n");
+  stdout.write("Open a new terminal and run: switchboard (or switchboard --resume / switchboard --restart)\n");
 }
