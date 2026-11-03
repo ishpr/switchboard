@@ -87,7 +87,7 @@ function usage(): void {
   agent add             Register an agent and its wake policy
   hook                  Print hook JSON for a turn already in progress
   token                 Print the machine token path's contents
-  init                  Install the Zellij grid and the ~/.zshrc launcher
+  init                  Install the Zellij grid. Asks which panes to include
   --resume, -c          Attach the grid, or continue each harness's latest session
 
 An idle agent is not inside a hook. ask wakes it by injecting into a bound
