@@ -221,6 +221,26 @@ export class Store {
     return rows.map(mapMessage);
   }
 
+  /** Read-only wait queries: do not ack messages or touch agent presence. */
+  unreadForWait(repo: string, to: string, since: number, cursorKey = to): BusMessage[] {
+    const rows = this.db.prepare(
+      `SELECT * FROM messages WHERE repo = ?
+         AND seq > MAX(?, COALESCE((SELECT cursor FROM cursors WHERE repo = ? AND client_key = ?), 0))
+         AND (to_name IS NULL OR to_name = '*' OR to_name = ?)
+       ORDER BY seq ASC LIMIT 200`,
+    ).all(repo, since, repo, cursorKey, to) as Row[];
+    return rows.map(mapMessage);
+  }
+
+  latestUnreadSeq(repo: string, to: string, cursorKey = to): number {
+    const row = this.db.prepare(
+      `SELECT COALESCE(MAX(seq), 0) AS seq FROM messages WHERE repo = ?
+         AND seq > COALESCE((SELECT cursor FROM cursors WHERE repo = ? AND client_key = ?), 0)
+         AND (to_name IS NULL OR to_name = '*' OR to_name = ?)`,
+    ).get(repo, repo, cursorKey, to) as { seq: number };
+    return row.seq;
+  }
+
   upsertAgent(agent: {
     repo: string;
     name: string;

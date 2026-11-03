@@ -360,3 +360,47 @@ reads and progress publications/reports do not. Tracking persists across daemon
 restarts and follows the current board's shared/split worktree scope, including
 `SWITCHBOARD_SCOPE` and `SWITCHBOARD_REPO_KEY`. Restart the daemon after upgrading
 to enable tracking.
+
+## Wait for new mail
+
+`switchboard wait` lets a background shell task wait for mail without a hand-written
+SQLite polling loop. It reads the local store without advancing inbox cursors or
+connecting as an agent, so it does not announce presence or consume messages that
+`bus_inbox` should read. It works with an existing daemon without requiring a daemon
+restart. The repository board follows `--cwd`, `SWITCHBOARD_SCOPE`, and
+`SWITCHBOARD_REPO_KEY` as usual.
+
+```sh
+switchboard wait --to agy --timeout 240
+switchboard wait --to agy --wake-existing --json
+switchboard wait --to agy --since-seq 123 --interval-ms 500 --json
+```
+
+Flags:
+
+- `--to <agent>` defaults to `SWITCHBOARD_AGENT`, then `agy`. It matches mail directed
+  to that agent and broadcasts. `--to '*'` waits only for broadcasts.
+- `--timeout <seconds>` defaults to 240 and accepts non-negative fractional seconds;
+  zero performs an immediate check.
+- `--interval-ms <ms>` defaults to 1500 and must be a positive integer. The final
+  polling sleep is shortened to the remaining timeout.
+- `--since-seq <n>` sets an explicit non-negative sequence baseline. By default the
+  baseline is the highest unread sequence for the recipient when the command starts,
+  so existing unread mail is ignored until something new arrives.
+- `--wake-existing` uses a zero baseline, allowing existing unread mail to wake the
+  command immediately. An explicit `--since-seq` takes precedence.
+- `--session <id>` selects a native session's inbox cursor (`name:session`) instead
+  of the recipient's name cursor. Zellij sessions use the name cursor, as `bus_inbox`
+  does. Use this when monitoring a specific session-bound Codex/Muse/etc. inbox.
+- `--json` prints a result object; normal output prints message summaries.
+
+Every poll also checks the recipient's current inbox cursor, so messages consumed
+by another reader are not returned. A wake returns up to 200 matching unread
+messages, oldest first, with `seq`, `from`, `to`, `topic`, `kind`, `correlation_id`,
+and a normalized 160-character `preview`. Broadcast summaries use `to: "*"`.
+Presence announcements are broadcasts and can wake a wait too.
+
+Both a message wake and timeout exit 0. Text timeout output is `TIMEOUT`. JSON has
+`status` (`MESSAGES` or `TIMEOUT`), `since_seq`, and `messages` (empty on timeout).
+A single readiness line goes to stderr with the effective recipient and baseline;
+stdout contains only the final result. Invalid arguments or store failures exit 1.
