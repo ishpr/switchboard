@@ -1,0 +1,8 @@
+# Merge into ~/.grok/config.toml.
+# Grok also loads .mcp.json, Claude MCP config, and Cursor mcp.json.
+# One switchboard entry is enough. A second copy starts a second shim.
+
+[mcp_servers.switchboard]
+command = "node"
+args = ["/Users/ishprasad/Switchboard/dist/cli.js", "mcp"]
+env = { SWITCHBOARD_HARNESS = "grok", SWITCHBOARD_NAME = "grok" }

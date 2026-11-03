@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "mcpServers": {
+    "switchboard": {
+      "command": "node",
+      "args": ["/Users/ishprasad/Switchboard/dist/cli.js", "mcp"],
+      "env": {
+        "SWITCHBOARD_HARNESS": "muse",
+        "SWITCHBOARD_NAME": "muse"
+      }
+    }
+  }
+}

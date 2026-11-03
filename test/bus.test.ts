@@ -1,0 +1,499 @@
+import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { BusClient } from "../src/busClient.ts";
+import { startDaemon, type DaemonHandle } from "../src/daemon.ts";
+import { ensureToken } from "../src/token.ts";
+import type { BusMessage, ClientHello, WakeLaunch } from "../src/types.ts";
+import { isLoopback } from "../src/daemon.ts";
+
+type Fixture = {
+  daemon: DaemonHandle;
+  token: string;
+  launches: WakeLaunch[];
+};
+
+async function fixture(): Promise<Fixture> {
+  const home = mkdtempSync(path.join(tmpdir(), "switchboard-"));
+  const token = ensureToken(home);
+  const launches: WakeLaunch[] = [];
+  const daemon = await startDaemon({
+    port: 0,
+    dbFile: path.join(home, "switchboard.db"),
+    token,
+    spawnWake: async (launch) => {
+      launches.push(launch);
+    },
+    presenceTtlMs: 250,
+    sweepMs: 40,
+  });
+  return { daemon, token, launches };
+}
+
+function hello(token: string, name: string, repo: string, extra: Partial<ClientHello> = {}): ClientHello {
+  return {
+    type: "hello",
+    token,
+    name,
+    harness: extra.harness ?? "claude",
+    repoKey: repo,
+    cwd: extra.cwd ?? "/work",
+    sessionId: extra.sessionId,
+    wake: extra.wake,
+    status: extra.status,
+    role: extra.role,
+    boundSession: extra.boundSession,
+  };
+}
+
+async function join(fx: Fixture, name: string, repo = "repo-a", extra: Partial<ClientHello> = {}) {
+  const client = new BusClient();
+  await client.connect(fx.daemon.url, hello(fx.token, name, repo, extra));
+  return client;
+}
+
+function waitForMessage(client: BusClient): Promise<BusMessage> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("timed out waiting for a message")), 2_000);
+    client.onMessage = (frame) => {
+      clearTimeout(timer);
+      resolve(frame.message);
+    };
+  });
+}
+
+test("isLoopback accepts only local peers", () => {
+  assert.equal(isLoopback("127.0.0.1"), true);
+  assert.equal(isLoopback("::1"), true);
+  assert.equal(isLoopback("::ffff:127.0.0.1"), true);
+  assert.equal(isLoopback("10.0.0.8"), false);
+  assert.equal(isLoopback(undefined), false);
+});
+
+test("two clients share a topic, and a later client catches up from the log", async () => {
+  const fx = await fixture();
+  const claude = await join(fx, "claude");
+  const codex = await join(fx, "codex", "repo-a", { harness: "codex" });
+  try {
+    const incoming = waitForMessage(codex);
+    const published = await claude.request({ type: "publish", topic: "repo", body: "tests are green" });
+    assert.equal(published.type, "published");
+    if (published.type !== "published") return;
+    const pushed = await incoming;
+    assert.equal(pushed.body, "tests are green");
+    assert.equal(pushed.id, published.id);
+
+    const late = await join(fx, "grok", "repo-a", { harness: "grok" });
+    const inbox = await late.request({ type: "inbox", since: 0 });
+    assert.equal(inbox.type, "inbox");
+    if (inbox.type !== "inbox") return;
+    assert.ok(inbox.messages.some((entry) => entry.body === "tests are green"));
+    late.close();
+  } finally {
+    claude.close();
+    codex.close();
+    await fx.daemon.close();
+  }
+});
+
+test("a different repo hash does not see the message", async () => {
+  const fx = await fixture();
+  const a = await join(fx, "claude", "repo-a");
+  const b = await join(fx, "codex", "repo-b", { harness: "codex" });
+  try {
+    let leaked = false;
+    b.onMessage = () => {
+      leaked = true;
+    };
+    await a.request({ type: "publish", topic: "repo", body: "only repo-a" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(leaked, false);
+    const inbox = await b.request({ type: "inbox", since: 0 });
+    assert.equal(inbox.type, "inbox");
+    if (inbox.type !== "inbox") return;
+    assert.equal(
+      inbox.messages.some((entry) => entry.body === "only repo-a"),
+      false,
+    );
+  } finally {
+    a.close();
+    b.close();
+    await fx.daemon.close();
+  }
+});
+
+test("a bad token is rejected", async () => {
+  const fx = await fixture();
+  const client = new BusClient();
+  try {
+    await assert.rejects(
+      client.connect(fx.daemon.url, hello("nope", "claude", "repo-a")),
+      /bad token/,
+    );
+  } finally {
+    client.close();
+    await fx.daemon.close();
+  }
+});
+
+test("ask and reply share a correlation id", async () => {
+  const fx = await fixture();
+  const claude = await join(fx, "claude");
+  const codex = await join(fx, "codex", "repo-a", { harness: "codex" });
+  try {
+    const asked = waitForMessage(codex);
+    const ack = await claude.request({ type: "ask", to: "codex", body: "what failed?" });
+    assert.equal(ack.type, "published");
+    if (ack.type !== "published") return;
+    assert.equal(ack.wake.mode, "push");
+    const ask = await asked;
+    assert.equal(ask.kind, "ask");
+    assert.equal(ask.correlationId, ack.correlationId);
+
+    const replied = waitForMessage(claude);
+    const replyAck = await codex.request({
+      type: "reply",
+      correlationId: ask.correlationId ?? "",
+      body: "the inbox test",
+    });
+    assert.equal(replyAck.type, "published");
+    const reply = await replied;
+    assert.equal(reply.kind, "reply");
+    assert.equal(reply.correlationId, ask.correlationId);
+    assert.equal(reply.to, "claude");
+    assert.equal(fx.launches.length, 0);
+  } finally {
+    claude.close();
+    codex.close();
+    await fx.daemon.close();
+  }
+});
+
+test("a directed message is not delivered to a third agent", async () => {
+  const fx = await fixture();
+  const claude = await join(fx, "claude");
+  const grok = await join(fx, "grok", "repo-a", { harness: "grok" });
+  try {
+    await claude.request({ type: "register", name: "kimi", harness: "kimi", cwd: "/work", wake: false });
+    await claude.request({ type: "ask", to: "kimi", body: "private" });
+    const inbox = await grok.request({ type: "inbox", since: 0 });
+    assert.equal(inbox.type, "inbox");
+    if (inbox.type !== "inbox") return;
+    assert.equal(
+      inbox.messages.some((entry) => entry.body === "private"),
+      false,
+    );
+  } finally {
+    claude.close();
+    grok.close();
+    await fx.daemon.close();
+  }
+});
+
+test("offline wake starts the headless CLI, and a bound Codex session is queued", async () => {
+  const fx = await fixture();
+  const claude = await join(fx, "claude");
+  try {
+    await claude.request({
+      type: "register",
+      name: "kimi",
+      harness: "kimi",
+      cwd: "/work/kimi",
+      wake: true,
+    });
+    const kimi = await claude.request({ type: "ask", to: "kimi", body: "please look" });
+    assert.equal(kimi.type, "published");
+    if (kimi.type !== "published") return;
+    assert.equal(kimi.wake.mode, "headless");
+    assert.equal(fx.launches[0]?.cmd, "kimi-cli");
+    assert.ok(fx.launches[0]?.args.includes("--print"));
+
+    const again = await claude.request({ type: "ask", to: "kimi", body: "again" });
+    assert.equal(again.type, "published");
+    if (again.type !== "published") return;
+    assert.equal(again.wake.mode, "skip");
+    assert.equal(fx.launches.length, 1);
+
+    await claude.request({
+      type: "register",
+      name: "codex",
+      harness: "codex",
+      cwd: "/work/codex",
+      sessionId: "thread-9",
+      wake: true,
+    });
+    const codex = await claude.request({ type: "ask", to: "codex", body: "in the desktop thread" });
+    assert.equal(codex.type, "published");
+    if (codex.type !== "published") return;
+    assert.equal(codex.wake.mode, "inject");
+    const launch = fx.launches.at(-1);
+    assert.ok(launch);
+    assert.ok(launch.args.includes("thread-9"));
+    assert.ok(launch.args.includes("queue"));
+  } finally {
+    claude.close();
+    await fx.daemon.close();
+  }
+});
+
+test("an open agent without an inject command is not spawned beside the TUI", async () => {
+  const fx = await fixture();
+  const claude = await join(fx, "claude");
+  const grok = await join(fx, "grok", "repo-a", { harness: "grok", wake: true });
+  try {
+    const ack = await claude.request({ type: "ask", to: "grok", body: "you are idle at the prompt" });
+    assert.equal(ack.type, "published");
+    if (ack.type !== "published") return;
+    assert.equal(ack.wake.mode, "push");
+    assert.equal(fx.launches.length, 0);
+  } finally {
+    claude.close();
+    grok.close();
+    await fx.daemon.close();
+  }
+});
+
+test("two sessions of one harness poll separately and both stay visible", async () => {
+  const fx = await fixture();
+  const first = await join(fx, "grok", "repo-a", { harness: "grok", sessionId: "grok-a" });
+  const second = await join(fx, "grok", "repo-a", { harness: "grok", sessionId: "grok-b" });
+  try {
+    const who = await first.request({ type: "who" });
+    assert.equal(who.type, "who");
+    if (who.type !== "who") return;
+    const live = who.agents.filter((agent) => agent.name === "grok" && agent.online);
+    assert.deepEqual(
+      live.map((agent) => agent.sessionId).sort(),
+      ["grok-a", "grok-b"],
+    );
+
+    await first.request({ type: "publish", topic: "repo", body: "from grok-a" });
+    const readBySecond = await second.request({ type: "inbox" });
+    assert.equal(readBySecond.type, "inbox");
+    if (readBySecond.type !== "inbox") return;
+    assert.ok(readBySecond.messages.some((entry) => entry.body === "from grok-a"));
+    assert.ok(readBySecond.messages.some((entry) => entry.topic === "presence" && entry.body.includes("grok-a")));
+
+    const readByFirst = await first.request({ type: "inbox" });
+    assert.equal(readByFirst.type, "inbox");
+    if (readByFirst.type !== "inbox") return;
+    assert.ok(readByFirst.messages.some((entry) => entry.body === "from grok-a"));
+  } finally {
+    first.close();
+    second.close();
+    await fx.daemon.close();
+  }
+});
+
+test("a live session shows the status it set", async () => {
+  const fx = await fixture();
+  const grok = await join(fx, "grok", "repo-a", { harness: "grok", sessionId: "g1" });
+  try {
+    const updated = await grok.request({ type: "status", status: "grok-ready" });
+    assert.equal(updated.type, "ok");
+    const who = await grok.request({ type: "who" });
+    assert.equal(who.type, "who");
+    if (who.type !== "who") return;
+    const row = who.agents.find((agent) => agent.sessionId === "g1");
+    assert.ok(row);
+    assert.equal(row.status, "grok-ready");
+    assert.equal(row.online, true);
+  } finally {
+    grok.close();
+    await fx.daemon.close();
+  }
+});
+
+test("connecting without a wake flag keeps the registered wake policy", async () => {
+  const fx = await fixture();
+  const cli = await join(fx, "cli", "repo-a", { harness: "cli", wake: false });
+  try {
+    const registered = await cli.request({
+      type: "register",
+      name: "kimi",
+      harness: "kimi",
+      cwd: "/work",
+      wake: true,
+    });
+    assert.equal(registered.type, "registered");
+    const kimi = await join(fx, "kimi", "repo-a", { harness: "kimi" });
+    try {
+      const who = await kimi.request({ type: "who" });
+      assert.equal(who.type, "who");
+      if (who.type !== "who") return;
+      const row = who.agents.find((agent) => agent.name === "kimi");
+      assert.ok(row);
+      assert.equal(row.wake, true);
+      assert.equal(row.online, true);
+    } finally {
+      kimi.close();
+    }
+  } finally {
+    cli.close();
+    await fx.daemon.close();
+  }
+});
+
+test("presence drops after the heartbeat ttl", async () => {
+  const fx = await fixture();
+  const watcher = await join(fx, "claude");
+  const idle = await join(fx, "codex", "repo-a", { harness: "codex" });
+  try {
+    idle.close();
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const who = await watcher.request({ type: "who" });
+    assert.equal(who.type, "who");
+    if (who.type !== "who") return;
+    const codex = who.agents.find((agent) => agent.name === "codex");
+    assert.ok(codex);
+    assert.equal(codex.online, false);
+  } finally {
+    watcher.close();
+    await fx.daemon.close();
+  }
+});
+
+test("the first claimant is the orchestrator and a different name cannot take the role", async () => {
+  const fx = await fixture();
+  const cursor = new BusClient();
+  const claude = new BusClient();
+  try {
+    const welcome = await cursor.connect(
+      fx.daemon.url,
+      hello(fx.token, "cursor", "repo-a", { harness: "cursor", role: "orchestrator", sessionId: "c1" }),
+    );
+    assert.equal(welcome.role, "orchestrator");
+    assert.equal(welcome.orchestrator, "cursor");
+
+    const refused = await claude.connect(
+      fx.daemon.url,
+      hello(fx.token, "claude", "repo-a", { role: "orchestrator", sessionId: "cl1" }),
+    );
+    assert.equal(refused.role, "worker");
+    assert.equal(refused.orchestrator, "cursor");
+
+    const who = await claude.request({ type: "who" });
+    assert.equal(who.type, "who");
+    if (who.type !== "who") return;
+    const cursorRow = who.agents.find((agent) => agent.sessionId === "c1");
+    const claudeRow = who.agents.find((agent) => agent.sessionId === "cl1");
+    assert.equal(cursorRow?.role, "orchestrator");
+    assert.equal(claudeRow?.role, "worker");
+  } finally {
+    cursor.close();
+    claude.close();
+    await fx.daemon.close();
+  }
+});
+
+test("a report reaches only the orchestrator", async () => {
+  const fx = await fixture();
+  const cursor = await join(fx, "cursor", "repo-a", {
+    harness: "cursor",
+    role: "orchestrator",
+    sessionId: "c1",
+  });
+  const grok = await join(fx, "grok", "repo-a", { harness: "grok", sessionId: "g1" });
+  const claude = await join(fx, "claude", "repo-a", { sessionId: "cl1" });
+  try {
+    await assert.rejects(
+      cursor.request({ type: "report", body: "the orchestrator does not report to itself" }),
+      /bus_inbox/,
+    );
+    const incoming = waitForMessage(cursor);
+    const reported = await grok.request({ type: "report", body: "grok finished the task" });
+    assert.equal(reported.type, "published");
+    const pushed = await incoming;
+    assert.equal(pushed.topic, "reports");
+    assert.equal(pushed.to, "cursor");
+    assert.equal(pushed.body, "grok finished the task");
+
+    const claudeInbox = await claude.request({ type: "inbox", since: 0 });
+    assert.equal(claudeInbox.type, "inbox");
+    if (claudeInbox.type !== "inbox") return;
+    assert.equal(
+      claudeInbox.messages.some((entry) => entry.body === "grok finished the task"),
+      false,
+    );
+
+    const cursorInbox = await cursor.request({ type: "inbox", since: 0 });
+    assert.equal(cursorInbox.type, "inbox");
+    if (cursorInbox.type !== "inbox") return;
+    assert.ok(cursorInbox.messages.some((entry) => entry.body === "grok finished the task"));
+  } finally {
+    cursor.close();
+    grok.close();
+    claude.close();
+    await fx.daemon.close();
+  }
+});
+
+test("a report waits for the orchestrator and is refused before one exists", async () => {
+  const fx = await fixture();
+  const grok = await join(fx, "grok", "repo-a", { harness: "grok" });
+  try {
+    await assert.rejects(grok.request({ type: "report", body: "too early" }), /no orchestrator/);
+  } finally {
+    grok.close();
+  }
+
+  const cursor = await join(fx, "cursor", "repo-a", { harness: "cursor", role: "orchestrator" });
+  cursor.close();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  const late = await join(fx, "grok", "repo-a", { harness: "grok", sessionId: "g2" });
+  try {
+    const reported = await late.request({ type: "report", body: "while cursor was away" });
+    assert.equal(reported.type, "published");
+    const back = await join(fx, "cursor", "repo-a", {
+      harness: "cursor",
+      role: "orchestrator",
+      sessionId: "c2",
+    });
+    try {
+      const inbox = await back.request({ type: "inbox", since: 0 });
+      assert.equal(inbox.type, "inbox");
+      if (inbox.type !== "inbox") return;
+      assert.ok(inbox.messages.some((entry) => entry.body === "while cursor was away"));
+    } finally {
+      back.close();
+    }
+  } finally {
+    late.close();
+    await fx.daemon.close();
+  }
+});
+
+test("a later ask survives the first full inbox page", async () => {
+  const fx = await fixture();
+  const sender = await join(fx, "cursor", "repo-a", { harness: "cursor", role: "orchestrator" });
+  const claude = await join(fx, "claude", "repo-a", { sessionId: "claude-page" });
+  try {
+    for (let i = 0; i < 60; i++) {
+      const published = await sender.request({ type: "publish", topic: "repo", body: `pad ${i}` });
+      assert.equal(published.type, "published");
+    }
+    const asked = await sender.request({ type: "ask", to: "claude", body: "orchtest reply now" });
+    assert.equal(asked.type, "published");
+
+    const first = await claude.request({ type: "inbox" });
+    assert.equal(first.type, "inbox");
+    if (first.type !== "inbox") return;
+    assert.equal(first.more, true);
+    assert.equal(first.messages.length, 50);
+    assert.equal(
+      first.messages.some((entry) => entry.body === "orchtest reply now"),
+      false,
+    );
+
+    const second = await claude.request({ type: "inbox" });
+    assert.equal(second.type, "inbox");
+    if (second.type !== "inbox") return;
+    assert.ok(second.messages.some((entry) => entry.body === "orchtest reply now" && entry.kind === "ask"));
+  } finally {
+    sender.close();
+    claude.close();
+    await fx.daemon.close();
+  }
+});

@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "switchboard": {
+      "command": "node",
+      "args": ["/Users/ishprasad/Switchboard/dist/cli.js", "mcp"],
+      "env": {
+        "SWITCHBOARD_HARNESS": "kimi",
+        "SWITCHBOARD_NAME": "kimi"
+      }
+    }
+  }
+}
