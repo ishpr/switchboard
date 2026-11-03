@@ -4,9 +4,10 @@ A local message bus for coding CLIs. One daemon listens on `127.0.0.1`. Each CLI
 
 An idle agent is sitting at a prompt, or the process has exited. A hook runs only while a turn is already going, so a hook cannot start that agent. A directed `bus_ask` (or `switchboard ask`) is what starts work:
 
+- Any session running inside a bound Zellij pane (`zellij:<session>:<pane>`): the wake prompt is injected directly into the pane (`zellij action write-chars` + `Enter`).
 - Codex or Muse, with a session id bound: the message is injected into that session (`codex queue`, `muse session-message send`).
-- Any known harness that is offline, with wake turned on: Switchboard starts one headless CLI turn in the repo.
-- A harness that is open and has no inject command: the message is pushed to the shim and stored. The open TUI is left alone. Spawning a second process would start a different conversation.
+- Any known harness that is offline, with wake turned on: Switchboard starts one headless CLI turn in the repo (including isolated Claude accounts via `CLAUDE_CONFIG_DIR=~/.claude-<name>`).
+- A harness that is open outside Zellij and has no inject command: the message is pushed to the shim and stored. The open TUI is left alone. Spawning a second process would start a different conversation.
 - A broadcast (`bus_publish` with no recipient) is stored for subscribers. It does not start a session.
 
 Messages are coordination. They are not authorization and they do not grant permission.
@@ -23,7 +24,7 @@ npm run build
 node dist/cli.js who
 ```
 
-`who` starts the daemon if it is not already listening. Data stays in `~/.switchboard/` (`SWITCHBOARD_HOME` overrides that). Each checkout has its own board, from a hash of that checkout's git toplevel. A different clone does not see it. Linked worktrees can share one board with `SWITCHBOARD_SCOPE=share`.
+`who` starts the daemon if it is not already listening. Data stays in `~/.switchboard/` (`SWITCHBOARD_HOME` overrides that). Each repository has its own board, from a hash of its git common dir, so the main checkout and all of its linked git worktrees share one board by default (`SWITCHBOARD_SCOPE=share`). A different clone does not see it. Set `SWITCHBOARD_SCOPE=split` if you want a linked worktree to have its own separate board.
 
 Point one CLI at the built shim. Use the absolute path of `dist/cli.js`. Set `SWITCHBOARD_HARNESS` to the program and `SWITCHBOARD_NAME` to the name other agents will ask. Restart that CLI after saving the config.
 
@@ -53,7 +54,7 @@ claude mcp add --scope user switchboard \
 
 Snippets for Codex, Cursor, Kimi, Grok, and Muse are in [examples/](examples/). Replace the path in the snippet with your clone. One `switchboard` server is enough. A second copy starts a second shim.
 
-To choose the orchestrator, add `SWITCHBOARD_ROLE=orchestrator` to exactly one of those servers. The first name to claim the role keeps it. The Cursor example is the one that sets it. Any other harness can hold the role instead. Leave the variable off the rest.
+To choose the orchestrator for a repository, run `switchboard orchestrator <name>` (or pass `--orchestrator <name>` to `switchboard init`), or add `SWITCHBOARD_ROLE=orchestrator` to one server's environment. Different repositories can have different orchestrators (saved in `~/.switchboard/repos/<repoKey>.json`).
 
 Restart the CLI, then run `node dist/cli.js who` from the clone. That CLI should show up as online. Paste the prompt below into the session once.
 
@@ -73,30 +74,52 @@ If you are the orchestrator, assign work with bus_ask. Read replies and reports 
 
 ## Grid
 
-If you want the CLIs in one terminal, install [Zellij](https://zellij.dev/) and run `switchboard init`. It asks two things: which harnesses to open, and, when Claude is one of them, which accounts and how many. A blank harness answer keeps the CLIs found on your machine. A blank Claude answer is one shared Claude pane.
+If you want the CLIs in one terminal, install [Zellij](https://zellij.dev/) and run `switchboard init`. It asks:
+1. Which harnesses to open (blank keeps the CLIs found on your machine).
+2. When Claude is one of them, which isolated Claude accounts to open (blank opens one shared Claude pane).
+3. Which agent is the orchestrator for this repository (defaults to the repo's saved orchestrator or `cursor`).
 
-A number such as `4` opens that many isolated Claude panes. Names such as `pi,eg`, or the numbers from the list init prints, open those accounts. `all` opens every account it discovered. Each account gets its own `~/.claude-<id>` config, `SWITCHBOARD_NAME`, git worktree on `ws/<id>`, and Zellij pane. Init writes `~/.config/zellij/layouts/switchboard.kdl` and a marked block in `~/.zshrc`. Running it again replaces that block and asks again.
+A number such as `4` opens that many isolated Claude panes. Names such as `pi,eg`, `id:email:plan` specs, or the 1-based numbers from the discovered list `init` prints (such as `1 3`) open those accounts. `all` opens every account it discovered. Each isolated account automatically gets:
+- its own `~/.claude-<id>` config directory with shared settings, skills, agents, and hooks symlinked from `~/.claude`
+- the `switchboard` MCP server registered in `~/.claude-<id>/.claude.json` with `SWITCHBOARD_NAME=<id>` and `SWITCHBOARD_SCOPE=share`
+- an isolated git worktree at `~/claude-ws/<id>/<repo>` on branch `ws/<id>`
+- its own Zellij pane running `switchboard claude-pane`
 
-An agent can make the same choices without the prompts:
+`init` writes `~/.config/zellij/layouts/switchboard.kdl`, `~/.config/zellij/layouts/switchboard-resume.kdl`, per-repo layouts (`switchboard-<repoKey>.kdl` and `switchboard-<repoKey>-resume.kdl`), `~/.switchboard/repos/<repoKey>.json`, and a marked block in `~/.zshrc`. Running it again updates the layouts and repo config.
+
+An agent or script can make the same choices without interactive prompts:
 
 ```sh
 switchboard init --panes claude,grok,bus --accounts 2 --orchestrator cursor
-switchboard init --panes claude,codex --accounts pi,eg
+switchboard init --cwd /path/to/repo --panes orchestrator,claude,codex,antigravity,bus --accounts pi,eg,team,servsys --orchestrator agy
 switchboard account list
-switchboard account add --name pi --email you@example.com --plan max
+switchboard account add --name work --email you@example.com --plan team --cwd /path/to/repo
 ```
 
-Open a new terminal and run `switchboard` to attach the grid, or to start it. `switchboard --resume` and `switchboard -c` attach if the session is already running. Otherwise they start the grid and each CLI continues its latest session in that repo. `switchboard who` and the other subcommands still call the bus.
+Open a new terminal and run:
+- `switchboard` — attach the grid if running, or start fresh sessions.
+- `switchboard --resume` (or `switchboard -c`) — attach if running, or start the grid and continue each CLI's latest session in that repo.
+- `switchboard --restart` (or `switchboard -r`) — recreate the Zellij session from the resume layout so layout or account changes take effect while resuming each CLI's latest conversation.
 
-Each pane starts in that CLI's auto-approve mode: Orchestrator (Cursor) `--yolo --approve-mcps --trust`, Grok `--always-approve`, Claude `--dangerously-skip-permissions`, Codex `--dangerously-bypass-approvals-and-sandbox`, Kimi `--yolo`, Muse `--yolo`, and Antigravity `--dangerously-skip-permissions --mode auto`. You only get the panes you picked. The choices are Orchestrator, Grok, Claude, Codex, Kimi, Muse, Antigravity (`agy`), and a shell named Bus.
+`switchboard who` and the other subcommands still call the bus.
+
+Each pane starts in that CLI's auto-approve mode: Orchestrator (Cursor) `--yolo --approve-mcps --trust`, Grok `--always-approve`, Claude `--dangerously-skip-permissions`, Codex `--dangerously-bypass-approvals-and-sandbox`, Kimi `--yolo`, Muse `--yolo`, and Antigravity `--dangerously-skip-permissions --mode auto`. You only get the panes you picked. The choices are Orchestrator, Grok, Claude (single or multi-account), Codex, Kimi, Muse, Antigravity (`agy`), and a shell named Bus.
 
 ## Orchestrator
 
-One name per checkout holds the orchestrator role. Set `SWITCHBOARD_ROLE=orchestrator` on that CLI's MCP server. If you include Cursor in the grid, its pane is named Orchestrator and the Cursor example sets the role. The first name to claim it keeps it. Another harness cannot take it.
+One name per repository holds the orchestrator role. You can configure or change it per repo at any time:
+
+```sh
+switchboard orchestrator                 # print current orchestrator for $PWD
+switchboard orchestrator agy             # set Antigravity (agy) as orchestrator for $PWD
+switchboard orchestrator cursor --cwd /path/to/other-repo
+```
+
+Aliases such as `argon4` and `antigravity` resolve to `agy`; `cursor-agent` and `orchestrator` resolve to `cursor`. You can also set `SWITCHBOARD_ROLE=orchestrator` on a CLI's MCP server to claim the role when no orchestrator is set yet. Reassigning the orchestrator updates live connected sessions immediately and persists to `~/.switchboard/repos/<repoKey>.json`.
 
 The orchestrator assigns work with `bus_ask`. The agent answers with `bus_reply`, and that reply comes back to the asker. For a status change, or finished work that was not an ask, the agent calls `bus_report`. A report is stored on the `reports` topic and delivered only to the orchestrator. `bus_who` marks that row `orchestrator`.
 
-Cursor has no inject command, so a report waits in its inbox until that pane takes a turn and calls `bus_inbox`. Codex and Muse can be injected into an open session. A broadcast does not start anyone. The role is coordination. It does not grant permission.
+Any agent running inside a Zellij pane binds `zellij:<session>:<pane>` automatically when its MCP shim connects, so `bus_ask` and `bus_report` can wake an idle pane directly by injecting into Zellij. Codex and Muse can also be injected via their session ids (`codex queue`, `muse session-message send`). A broadcast does not start anyone. The role is coordination. It does not grant permission.
 
 Several sessions of one CLI can share a checkout. Each shim picks its own session id, polls its own inbox, and announces `online` and `offline` on the `presence` topic. `bus_who` lists every live session. Asking the shared name delivers to every open session of that name. Set `SWITCHBOARD_SESSION` when a session should be the one Codex or Muse injects into.
 
@@ -110,6 +133,8 @@ You do not have to start the daemon yourself. The shim starts it. Run `node dist
 | `switchboard.db` | SQLite append log, cursors, and the agent registry. |
 | `daemon.json` | Port, pid, URL, start time. |
 | `wake.log` | Wake commands. The prompt body is not written. |
+| `accounts.json` | Saved isolated Claude account profiles. |
+| `repos/<repoKey>.json` | Per-repo orchestrator, selected panes, and isolated accounts. |
 
 The daemon accepts `127.0.0.1` and `::1` only.
 
@@ -128,11 +153,11 @@ The shim registers these MCP tools. Call `bus_inbox` at the start of a turn and 
 | `bus_report` | Send a result or a status change to the orchestrator only. Hidden from the orchestrator's own tool list. |
 | `bus_status` | Short status string shown by `bus_who`. |
 
-The same verbs exist on the CLI: `who`, `publish`, `inbox`, `ask`, `reply`, `agent add`, `hook`, `token`.
+The same verbs exist on the CLI: `who`, `publish`, `inbox`, `ask`, `reply`, `report`, `status`, `orchestrator`, `agent add`, `account`, `hook`, `token`, `init`, `--resume` (`-c`), and `--restart` (`-r`).
 
 Delivery is at least once. Each row has an id. Dedupe on that id. Bodies are capped at 32 KB.
 
-Topics are names like `repo` or `review`. The namespace is a hash of the git toplevel, so two checkouts do not meet. `SWITCHBOARD_SCOPE=share` hashes the git common dir instead, and linked worktrees share a board. The default is `split`. `SWITCHBOARD_REPO_KEY` overrides the hash.
+Topics are names like `repo` or `review`. The namespace is a hash of the git common dir (`SWITCHBOARD_SCOPE=share`, the default), so the main checkout and linked git worktrees share a board while separate clones do not meet. Set `SWITCHBOARD_SCOPE=split` to hash the git toplevel instead so a worktree gets its own board. `SWITCHBOARD_REPO_KEY` overrides the hash.
 
 ## Wake
 
@@ -167,7 +192,9 @@ The prompt tells the headless process to answer with `bus_reply` and stop. It do
 
 | Program | What you get |
 | --- | --- |
-| Claude Code | Tools always. A session started with `--dangerously-load-development-channels server:switchboard` also gets `notifications/claude/channel`, queued for the next turn. A `UserPromptSubmit` hook can attach unread mail to a prompt that is already being submitted. |
+| Any CLI in Zellij | When started inside a Zellij pane, the shim binds `zellij:<session>:<pane>` automatically. Directed wakes inject into the pane via `zellij action write-chars`. |
+| Claude Code | Tools always. Isolated accounts (`~/.claude-<id>`) connect under their own `SWITCHBOARD_NAME` and wake headless with `CLAUDE_CONFIG_DIR=~/.claude-<id>`. A session started with `--dangerously-load-development-channels server:switchboard` also gets `notifications/claude/channel`. `UserPromptSubmit` / `PostToolUse` hooks attach unread mail during a turn (skipping subagents). |
+| Antigravity (`agy`) | Tools always. `switchboard init` registers the `switchboard` MCP server on `agy`. Desktop GUI connections started with `cwd="/"` automatically resolve to the active configured repository. |
 | Codex CLI | Tools always. A bound thread receives `codex queue --thread <id> --resume`. Offline wake is `codex exec`. The binary is often inside ChatGPT.app rather than on `PATH`. |
 | Codex desktop | Same `~/.codex` as the CLI. `codex queue` reaches a desktop thread when that thread id is bound. The desktop app is not a separate bus. |
 | cursor-agent | Tools always. Offline wake is `cursor-agent -p`. A `postToolUse` hook can attach `additional_context` during a turn. |

@@ -600,11 +600,6 @@ export async function init(
   const existingCfg = readRepoConfig(targetCwd);
   const discovered = discoverClaudeAccounts();
   const choices = gridChoices();
-  if (discovered.length > 0 && values.panes === undefined) {
-    stdout.write(
-      `Discovered ${discovered.length} isolated Claude account(s): ${discovered.map((a) => `${a.id} (${a.pane})`).join(", ")}\n\n`,
-    );
-  }
   const answer = values.panes !== undefined ? values.panes : await promptPaneSelection(choices);
   let ids = chosenIds(answer, choices);
   if (ids.length === 0) {
