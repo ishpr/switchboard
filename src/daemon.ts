@@ -292,7 +292,8 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     const result = await sessionDiagnostics(agent, probe);
     for (const build of agent.builds ?? []) {
       const warning = buildWarning(BUILD, build);
-      if (warning && !result.warnings.includes(warning)) result.warnings.push(`MCP ${warning}`);
+      const formatted = warning ? `MCP ${warning}` : null;
+      if (formatted && !result.warnings.includes(formatted)) result.warnings.push(formatted);
     }
     const unknownBuilds = (agent.connectionCount ?? 0) - (agent.builds?.length ?? 0);
     if (agent.online && unknownBuilds > 0) result.warnings.push(`${unknownBuilds} client connection(s) missing build metadata; reconnect MCP after upgrading`);
