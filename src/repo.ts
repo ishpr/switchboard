@@ -6,14 +6,10 @@ import path from "node:path";
 export type RepoScope = "split" | "share";
 
 export function repoScope(): RepoScope {
-  return process.env.SWITCHBOARD_SCOPE === "share" ? "share" : "split";
+  return process.env.SWITCHBOARD_SCOPE === "split" ? "split" : "share";
 }
 
-/** Namespace key for a checkout. Different checkouts never share a key. */
-export function repoKey(cwd: string, scope: RepoScope = repoScope()): string {
-  const override = process.env.SWITCHBOARD_REPO_KEY;
-  if (override && override.trim()) return override.trim();
-
+export function gitRepoRoot(cwd: string, scope: RepoScope = repoScope()): string {
   let root = cwd;
   try {
     if (scope === "share") {
@@ -22,7 +18,8 @@ export function repoKey(cwd: string, scope: RepoScope = repoScope()): string {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "ignore"],
       }).trim();
-      root = path.isAbsolute(common) ? common : path.resolve(cwd, common);
+      const resolved = path.isAbsolute(common) ? common : path.resolve(cwd, common);
+      root = path.basename(resolved) === ".git" ? path.dirname(resolved) : resolved;
     } else {
       root = execFileSync("git", ["rev-parse", "--show-toplevel"], {
         cwd,
@@ -38,5 +35,14 @@ export function repoKey(cwd: string, scope: RepoScope = repoScope()): string {
   } catch {
     // Keep the path we have when the directory is gone.
   }
+  return root;
+}
+
+/** Namespace key for a checkout. Linked git worktrees share a key unless scope="split". */
+export function repoKey(cwd: string, scope: RepoScope = repoScope()): string {
+  const override = process.env.SWITCHBOARD_REPO_KEY;
+  if (override && override.trim()) return override.trim();
+
+  const root = gitRepoRoot(cwd, scope);
   return createHash("sha256").update(root).digest("hex").slice(0, 16);
 }

@@ -13,7 +13,7 @@ import { repoKey } from "./repo.ts";
 import { runShim } from "./shim.ts";
 import { ensureToken, readToken } from "./token.ts";
 import { DEFAULT_PORT, type ClientHello } from "./types.ts";
-import { gridPlan, init } from "./init.ts";
+import { gridPlan, init, resolveOrchestratorName, writeRepoConfig } from "./init.ts";
 import { spawnWake } from "./wake.ts";
 
 const command = process.argv[2];
@@ -41,6 +41,15 @@ try {
     case "reply":
       await reply();
       break;
+    case "report":
+      await report();
+      break;
+    case "status":
+      await setStatus();
+      break;
+    case "orchestrator":
+      await orchestratorCmd();
+      break;
     case "agent":
       await agent();
       break;
@@ -51,7 +60,14 @@ try {
       process.stdout.write(`${readToken()}\n`);
       break;
     case "init":
-      await init();
+      await init(async (cwd, orch) => {
+        const client = await connectCli(cwd);
+        try {
+          await client.request({ type: "orchestrator", name: orch });
+        } finally {
+          client.close();
+        }
+      });
       break;
     case "--resume":
     case "-c":
@@ -84,6 +100,9 @@ function usage(): void {
   inbox                 Print messages since your cursor
   ask                   Ask one agent (may wake a headless CLI)
   reply                 Reply to an ask
+  report                Report a result or status to the repo's orchestrator
+  status                Update an agent's status string
+  orchestrator          Get or set the orchestrator for this repo
   agent add             Register an agent and its wake policy
   hook                  Print hook JSON for a turn already in progress
   token                 Print the machine token path's contents
@@ -188,10 +207,21 @@ async function serve(): Promise<void> {
 }
 
 async function who(): Promise<void> {
-  const client = await connectCli();
+  const { values } = parseArgs({
+    args: process.argv.slice(3),
+    options: {
+      cwd: { type: "string" },
+      json: { type: "boolean", default: false },
+    },
+  });
+  const client = await connectCli(values.cwd || process.cwd());
   try {
     const frame = await client.request({ type: "who" });
     if (frame.type !== "who") throw new Error("unexpected response");
+    if (values.json) {
+      process.stdout.write(`${JSON.stringify(frame.agents)}\n`);
+      return;
+    }
     if (frame.agents.length === 0) {
       process.stdout.write("nobody registered in this repo\n");
       return;
@@ -216,10 +246,17 @@ async function publish(): Promise<void> {
       topic: { type: "string", default: "repo" },
       message: { type: "string" },
       to: { type: "string" },
+      name: { type: "string" },
+      cwd: { type: "string" },
+      role: { type: "string" },
     },
   });
   if (!values.message) throw new Error("publish requires --message");
-  const client = await connectCli();
+  const client = await connectCli(
+    values.cwd || process.cwd(),
+    values.name || process.env.SWITCHBOARD_NAME || "cli",
+    values.role,
+  );
   try {
     const frame = await client.request({
       type: "publish",
@@ -237,21 +274,41 @@ async function publish(): Promise<void> {
 async function inbox(): Promise<void> {
   const { values } = parseArgs({
     args: process.argv.slice(3),
-    options: { since: { type: "string" }, topic: { type: "string" } },
+    options: {
+      since: { type: "string" },
+      topic: { type: "string" },
+      name: { type: "string" },
+      cwd: { type: "string" },
+      role: { type: "string" },
+      json: { type: "boolean", default: false },
+    },
   });
-  const client = await connectCli();
+  const client = await connectCli(
+    values.cwd || process.cwd(),
+    values.name || process.env.SWITCHBOARD_NAME || "cli",
+    values.role,
+  );
   try {
-    const frame = await client.request({
-      type: "inbox",
-      since: values.since ? Number(values.since) : undefined,
-      topic: values.topic,
-    });
-    if (frame.type !== "inbox") throw new Error("unexpected response");
-    if (frame.messages.length === 0) {
+    const messages = [];
+    for (let page = 0; page < 8; page++) {
+      const frame = await client.request({
+        type: "inbox",
+        since: page === 0 && values.since ? Number(values.since) : undefined,
+        topic: values.topic,
+      });
+      if (frame.type !== "inbox") throw new Error("unexpected response");
+      messages.push(...frame.messages);
+      if (!frame.more) break;
+    }
+    if (values.json) {
+      process.stdout.write(`${JSON.stringify(messages)}\n`);
+      return;
+    }
+    if (messages.length === 0) {
       process.stdout.write("inbox empty\n");
       return;
     }
-    for (const message of frame.messages) {
+    for (const message of messages) {
       process.stdout.write(
         `#${message.seq} ${message.fromName} ${message.topic} ${message.id}\n${message.body}\n\n`,
       );
@@ -268,10 +325,17 @@ async function ask(): Promise<void> {
       to: { type: "string" },
       message: { type: "string" },
       topic: { type: "string" },
+      name: { type: "string" },
+      cwd: { type: "string" },
+      role: { type: "string" },
     },
   });
   if (!values.to || !values.message) throw new Error("ask requires --to and --message");
-  const client = await connectCli();
+  const client = await connectCli(
+    values.cwd || process.cwd(),
+    values.name || process.env.SWITCHBOARD_NAME || "cli",
+    values.role,
+  );
   try {
     const frame = await client.request({
       type: "ask",
@@ -294,12 +358,17 @@ async function reply(): Promise<void> {
     options: {
       correlation: { type: "string" },
       message: { type: "string" },
+      name: { type: "string" },
+      cwd: { type: "string" },
     },
   });
   if (!values.correlation || !values.message) {
     throw new Error("reply requires --correlation and --message");
   }
-  const client = await connectCli();
+  const client = await connectCli(
+    values.cwd || process.cwd(),
+    values.name || process.env.SWITCHBOARD_NAME || "cli",
+  );
   try {
     const frame = await client.request({
       type: "reply",
@@ -308,6 +377,88 @@ async function reply(): Promise<void> {
     });
     if (frame.type !== "published") throw new Error("unexpected response");
     process.stdout.write(`id=${frame.id}\n${frame.wake.mode}: ${frame.wake.detail}\n`);
+  } finally {
+    client.close();
+  }
+}
+
+async function report(): Promise<void> {
+  const { values } = parseArgs({
+    args: process.argv.slice(3),
+    options: {
+      message: { type: "string" },
+      name: { type: "string" },
+      cwd: { type: "string" },
+    },
+  });
+  if (!values.message) throw new Error("report requires --message");
+  const client = await connectCli(
+    values.cwd || process.cwd(),
+    values.name || process.env.SWITCHBOARD_NAME || "cli",
+  );
+  try {
+    const frame = await client.request({
+      type: "report",
+      body: values.message,
+    });
+    if (frame.type !== "published") throw new Error("unexpected response");
+    process.stdout.write(`id=${frame.id} seq=${frame.seq}\n${frame.wake.mode}: ${frame.wake.detail}\n`);
+  } finally {
+    client.close();
+  }
+}
+
+async function setStatus(): Promise<void> {
+  const { values } = parseArgs({
+    args: process.argv.slice(3),
+    options: {
+      status: { type: "string" },
+      name: { type: "string" },
+      cwd: { type: "string" },
+      role: { type: "string" },
+    },
+  });
+  if (!values.status) throw new Error("status requires --status");
+  const client = await connectCli(
+    values.cwd || process.cwd(),
+    values.name || process.env.SWITCHBOARD_NAME || "cli",
+    values.role,
+  );
+  try {
+    const frame = await client.request({
+      type: "status",
+      status: values.status,
+    });
+    if (frame.type !== "ok") throw new Error("unexpected response");
+    process.stdout.write(`${frame.detail}\n`);
+  } finally {
+    client.close();
+  }
+}
+
+async function orchestratorCmd(): Promise<void> {
+  const { values, positionals } = parseArgs({
+    args: process.argv.slice(3),
+    allowPositionals: true,
+    options: {
+      name: { type: "string" },
+      cwd: { type: "string" },
+    },
+  });
+  const cwd = values.cwd || process.cwd();
+  const rawName = values.name || positionals[0];
+  const nextName = rawName ? resolveOrchestratorName(rawName) : undefined;
+  const client = await connectCli(cwd);
+  try {
+    const frame = await client.request({
+      type: "orchestrator",
+      ...(nextName ? { name: nextName } : {}),
+    });
+    if (frame.type !== "orchestrator") throw new Error("unexpected response");
+    if (nextName) {
+      writeRepoConfig(cwd, { orchestrator: nextName });
+    }
+    process.stdout.write(`${frame.orchestrator ?? "none"}\n`);
   } finally {
     client.close();
   }
@@ -353,6 +504,7 @@ async function hook(): Promise<void> {
       harness: { type: "string" },
       event: { type: "string" },
       name: { type: "string" },
+      cwd: { type: "string" },
     },
   });
   const harness = values.harness || process.env.SWITCHBOARD_HARNESS || "";
@@ -361,23 +513,35 @@ async function hook(): Promise<void> {
   const home = switchboardHome();
   const info = readDaemonInfo(home);
   if (!info) return;
+  const callerName = values.name || process.env.SWITCHBOARD_NAME || harness;
+  const cwd = values.cwd || process.cwd();
   let client: BusClient;
   try {
-    client = await connectCli(process.cwd(), values.name || harness);
+    client = await connectCli(cwd, callerName);
   } catch {
     return;
   }
   try {
     const frame = await client.request({ type: "inbox" });
     if (frame.type !== "inbox") return;
-    process.stdout.write(hookStdout(harness, event, frame.messages));
+    const filtered = frame.messages.filter(
+      (m) => m.topic !== "presence" && m.fromName !== callerName,
+    );
+    process.stdout.write(hookStdout(harness, event, filtered));
   } finally {
     client.close();
   }
 }
 
-async function connectCli(cwd = process.cwd(), name = "cli"): Promise<BusClient> {
+async function connectCli(
+  cwd = process.cwd(),
+  name = "cli",
+  roleArg?: string,
+): Promise<BusClient> {
   const { url, token } = await ensureDaemon();
+  const role = roleArg === "orchestrator" || process.env.SWITCHBOARD_ROLE === "orchestrator"
+    ? ("orchestrator" as const)
+    : undefined;
   const hello: ClientHello = {
     type: "hello",
     token,
@@ -385,7 +549,7 @@ async function connectCli(cwd = process.cwd(), name = "cli"): Promise<BusClient>
     harness: "cli",
     repoKey: repoKey(cwd),
     cwd,
-    wake: false,
+    ...(role ? { role } : {}),
   };
   const client = new BusClient();
   await client.connect(url, hello);

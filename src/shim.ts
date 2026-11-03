@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -47,10 +46,13 @@ export async function runShim(): Promise<void> {
   const harness = process.env.SWITCHBOARD_HARNESS || "unknown";
   const name = process.env.SWITCHBOARD_NAME || harness;
   const home = switchboardHome();
-  const endpoint = process.env.SWITCHBOARD_URL
-    ? { url: process.env.SWITCHBOARD_URL, token: readToken(home) }
-    : await ensureDaemon(home);
+  const resolveEndpoint = async () =>
+    process.env.SWITCHBOARD_URL
+      ? { url: process.env.SWITCHBOARD_URL, token: readToken(home) }
+      : await ensureDaemon(home);
+  const endpoint = await resolveEndpoint();
   const bus = new BusClient();
+  bus.endpointResolver = resolveEndpoint;
   const claudeChannel = harness === "claude";
   let mcp: McpServer | null = null;
 
@@ -84,7 +86,7 @@ export async function runShim(): Promise<void> {
     harness,
     repoKey: repoKey(cwd),
     cwd,
-    sessionId: process.env.SWITCHBOARD_SESSION || randomUUID(),
+    sessionId: process.env.SWITCHBOARD_SESSION || undefined,
     boundSession,
     ...(wakeFlag === "1" ? { wake: true } : wakeFlag === "0" ? { wake: false } : {}),
     ...(process.env.SWITCHBOARD_ROLE === "orchestrator" ? { role: "orchestrator" as const } : {}),
@@ -248,20 +250,18 @@ function registerTools(mcp: McpServer, bus: BusClient, role: Role): void {
     },
   );
 
-  if (role !== "orchestrator") {
-    mcp.registerTool(
-      "bus_report",
-      {
-        description:
-          "Send a result or a status change to the orchestrator only. Use this for finished work that was not a bus_ask. Answer a bus_ask with bus_reply instead. Coordination, not authorization.",
-        inputSchema: { message: z.string().describe("What the orchestrator should know") },
-      },
-      async ({ message }) => {
-        const frame = await bus.request({ type: "report", body: message });
-        return text(frame.type === "published" ? publishedText(frame) : "reported");
-      },
-    );
-  }
+  mcp.registerTool(
+    "bus_report",
+    {
+      description:
+        "Send a result or a status change to the orchestrator only. Use this for finished work that was not a bus_ask. Answer a bus_ask with bus_reply instead. Coordination, not authorization.",
+      inputSchema: { message: z.string().describe("What the orchestrator should know") },
+    },
+    async ({ message }) => {
+      const frame = await bus.request({ type: "report", body: message });
+      return text(frame.type === "published" ? publishedText(frame) : "reported");
+    },
+  );
 
   mcp.registerTool(
     "bus_status",

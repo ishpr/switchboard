@@ -68,6 +68,7 @@ export type ClientFrame =
   | { type: "reply"; correlationId: string; body: string }
   | { type: "report"; body: string }
   | { type: "status"; status: string }
+  | { type: "orchestrator"; name?: string }
   | { type: "register"; name: string; harness: string; cwd: string; sessionId?: string; wake: boolean }
   | { type: "heartbeat" };
 
@@ -90,6 +91,7 @@ export type ServerFrame =
   | { type: "message"; message: BusMessage }
   | { type: "inbox"; messages: BusMessage[]; cursor: number; more: boolean }
   | { type: "who"; agents: AgentRecord[] }
+  | { type: "orchestrator"; orchestrator: string | null }
   | { type: "registered"; name: string }
   | { type: "error"; error: string };
 

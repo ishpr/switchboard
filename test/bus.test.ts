@@ -497,3 +497,126 @@ test("a later ask survives the first full inbox page", async () => {
     await fx.daemon.close();
   }
 });
+
+test("a client automatically reconnects and restores subscriptions after a daemon restart", async () => {
+  const home = mkdtempSync(path.join(tmpdir(), "switchboard-reconn-"));
+  const token = ensureToken(home);
+  const dbFile = path.join(home, "switchboard.db");
+  let daemon = await startDaemon({ port: 0, dbFile, token });
+
+  const client = new BusClient();
+  client.endpointResolver = async () => ({ url: daemon.url, token });
+  try {
+    await client.connect(daemon.url, hello(token, "pi", "repo-a"));
+    await client.request({ type: "subscribe", topics: ["train"] });
+
+    // Restart the daemon on a new port
+    await daemon.close();
+    daemon = await startDaemon({ port: 0, dbFile, token });
+
+    // Next request transparently reconnects and re-subscribes
+    const who = await client.request({ type: "who" });
+    assert.equal(who.type, "who");
+
+    const peer = new BusClient();
+    await peer.connect(daemon.url, hello(token, "eg", "repo-a"));
+    try {
+      const incoming = new Promise<BusMessage>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("timed out")), 2_000);
+        client.onMessage = (frame) => {
+          if (frame.message.topic === "train") {
+            clearTimeout(timer);
+            resolve(frame.message);
+          }
+        };
+      });
+      await peer.request({ type: "publish", topic: "train", body: "reconnected on train" });
+      const msg = await incoming;
+      assert.equal(msg.body, "reconnected on train");
+    } finally {
+      peer.close();
+    }
+  } finally {
+    client.close();
+    await daemon.close();
+  }
+});
+
+test("ephemeral cli connections do not overwrite registered agent metadata", async () => {
+  const fx = await fixture();
+  const registrar = await join(fx, "cli", "repo-a", { harness: "cli" });
+  try {
+    await registrar.request({
+      type: "register",
+      name: "codex",
+      harness: "codex",
+      cwd: "/work/codex",
+      sessionId: "thread-42",
+      wake: true,
+    });
+    // An ephemeral hook/cli connection using the agent's name must not clobber harness, sessionId, or wake
+    const hookConn = await join(fx, "codex", "repo-a", { harness: "cli" });
+    await hookConn.request({ type: "inbox" });
+    hookConn.close();
+
+    const who = await registrar.request({ type: "who" });
+    assert.equal(who.type, "who");
+    if (who.type !== "who") return;
+    const codex = who.agents.find((a) => a.name === "codex");
+    assert.ok(codex);
+    assert.equal(codex.harness, "codex");
+    assert.equal(codex.sessionId, "thread-42");
+    assert.equal(codex.wake, true);
+  } finally {
+    registrar.close();
+    await fx.daemon.close();
+  }
+});
+
+test("orchestrator can be configured independently per repo and reassigned dynamically", async () => {
+  const fx = await fixture();
+  const cursorA = await join(fx, "cursor", "repo-a", { harness: "cursor", role: "orchestrator" });
+  const cursorB = await join(fx, "cursor", "repo-b", { harness: "cursor", role: "orchestrator" });
+  const agyA = await join(fx, "agy", "repo-a", { harness: "antigravity" });
+  const agyB = await join(fx, "agy", "repo-b", { harness: "antigravity" });
+  const piA = await join(fx, "pi", "repo-a", { harness: "claude" });
+  try {
+    // Reassign repo-a orchestrator to agy
+    const setRes = await cursorA.request({ type: "orchestrator", name: "agy" });
+    assert.deepEqual(setRes, { type: "orchestrator", orchestrator: "agy" });
+
+    // repo-b keeps cursor as orchestrator
+    const getB = await cursorB.request({ type: "orchestrator" });
+    assert.deepEqual(getB, { type: "orchestrator", orchestrator: "cursor" });
+
+    // Live agyA session is now the orchestrator in repo-a and receives reports
+    const incomingAgy = waitForMessage(agyA);
+    const repA = await piA.request({ type: "report", body: "pi finished slice in repo-a" });
+    assert.equal(repA.type, "published");
+    const msgA = await incomingAgy;
+    assert.equal(msgA.topic, "reports");
+    assert.equal(msgA.to, "agy");
+    assert.equal(msgA.body, "pi finished slice in repo-a");
+
+    // Reconnecting agy in repo-a without role=orchestrator in hello still gets role=orchestrator
+    agyA.close();
+    const agyA2 = await join(fx, "agy", "repo-a", { harness: "antigravity" });
+    try {
+      const whoA = await agyA2.request({ type: "who" });
+      assert.equal(whoA.type, "who");
+      if (whoA.type === "who") {
+        assert.equal(whoA.agents.find((a) => a.name === "agy")?.role, "orchestrator");
+        assert.equal(whoA.agents.find((a) => a.name === "cursor")?.role, "worker");
+      }
+    } finally {
+      agyA2.close();
+    }
+  } finally {
+    cursorA.close();
+    cursorB.close();
+    agyA.close();
+    agyB.close();
+    piA.close();
+    await fx.daemon.close();
+  }
+});
