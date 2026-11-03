@@ -197,6 +197,9 @@ export function instructions(role: Role, orchestrator: string | null): string {
     "Call bus_inbox at the start of a turn and before you stop. That poll is per session.",
     "Several sessions of the same harness can be in this repo at once. Each announces on the presence topic when it connects and when it leaves. bus_who lists every live session and who the orchestrator is.",
     "bus_ask to a shared name (such as muse or codex) reaches every live session of that harness; bus_ask to a session id reaches only that session.",
+    "bus_reply accepts state=done|progress|blocked (default done); only state=done closes the ask, while progress and blocked keep it open.",
+    "bus_ask accepts supersedes=<correlationId> when replacing an earlier ask.",
+    "Use bus_state (get/set/list/delete with rev and if_rev compare-and-swap) for shared per-repo facts and lease keys without triggering automatic wakes.",
     "Dedupe messages by id.",
   ];
   if (role === "orchestrator") {
@@ -486,15 +489,16 @@ function registerTools(mcp: McpServer, bus: BusClient, role: Role,
     "bus_ask",
     {
       description:
-        "Ask one agent by shared name (reaches all live sessions of that harness) or by session id (reaches only that session). Wake and inject use the bound session id. The answer comes back through bus_reply.",
+        "Ask one agent by shared name (reaches all live sessions of that harness) or by session id (reaches only that session). Wake and inject use the bound session id. Pass supersedes to replace and close an earlier open ask. The answer comes back through bus_reply.",
       inputSchema: {
         agent: z.string().describe("Agent name (e.g. muse, codex) or exact session id"),
         question: z.string(),
         topic: z.string().optional(),
+        supersedes: z.string().optional().describe("Correlation id of an earlier ask that this ask replaces and closes"),
       },
     },
-    async ({ agent, question, topic }) => {
-      const frame = await bus.request({ type: "ask", to: agent, body: question, topic });
+    async ({ agent, question, topic, supersedes }) => {
+      const frame = await bus.request({ type: "ask", to: agent, body: question, topic, supersedes });
       return text(frame.type === "published" ? publishedText(frame) : "asked");
     },
   );
@@ -503,14 +507,15 @@ function registerTools(mcp: McpServer, bus: BusClient, role: Role,
     "bus_reply",
     {
       description:
-        "Reply to a bus_ask. Pass the correlation id from the ask. This is how a result gets back to the asker, including the orchestrator.",
+        "Reply to a bus_ask. Pass the correlation id from the ask. state defaults to done (closes the ask); pass state=progress or state=blocked to send an update while keeping the ask open.",
       inputSchema: {
         correlationId: z.string(),
         message: z.string(),
+        state: z.enum(["done", "progress", "blocked"]).optional().describe("done (default, closes ask), progress (keeps ask open), or blocked (keeps ask open)"),
       },
     },
-    async ({ correlationId, message }) => {
-      const frame = await bus.request({ type: "reply", correlationId, body: message });
+    async ({ correlationId, message, state }) => {
+      const frame = await bus.request({ type: "reply", correlationId, body: message, state });
       return text(frame.type === "published" ? publishedText(frame) : "replied");
     },
   );
@@ -581,6 +586,73 @@ function registerTools(mcp: McpServer, bus: BusClient, role: Role,
       return {
         ...text(`${pending ? "" : `${frame.detail}\n${formatBuild("daemon", frame.daemon)}\n${formatBuild("MCP", currentBuild)}${buildWarning(currentBuild, frame.daemon) ? `\nWARNING: ${buildWarning(currentBuild, frame.daemon)}` : ""}\n`}${formatPendingAsks(frame.pending_asks)}${pending ? "" : `\n${formatAgentMetrics(frame.agent_metrics ?? [])}`}`),
         structuredContent: { ...(pending ? {} : { detail: frame.detail, daemon: frame.daemon ?? null, shim: currentBuild, agent_metrics: frame.agent_metrics ?? [] }), pending_asks: frame.pending_asks },
+      };
+    },
+  );
+
+  mcp.registerTool(
+    "bus_state",
+    {
+      description:
+        "Read or write shared per-repo key-value state with compare-and-swap (rev / if_rev). Does not trigger automatic wakes.",
+      inputSchema: {
+        action: z.enum(["get", "set", "list", "delete"]),
+        key: z.string().regex(TOPIC_RE).optional().describe("State key (required for get, set, delete)"),
+        value: z.string().optional().describe("State value (required for set)"),
+        prefix: z.string().optional().describe("Optional key prefix filter for list"),
+        if_rev: z.number().int().min(0).optional().describe("Compare-and-swap expected revision (0 for create-only, N to update/delete only if current rev == N)"),
+      },
+    },
+    async ({ action, key, value, prefix, if_rev }) => {
+      const frame = await bus.request({
+        type: "state",
+        action,
+        key,
+        value,
+        prefix,
+        ifRev: if_rev,
+      });
+      if (frame.type !== "state") return { ...text("state unavailable"), isError: true };
+      if (frame.conflict) {
+        return {
+          ...text(frame.detail || "state revision conflict"),
+          structuredContent: {
+            action: frame.action,
+            conflict: true,
+            entry: frame.entry ?? null,
+          },
+          isError: true,
+        };
+      }
+      if (frame.action === "list") {
+        const entries = frame.entries ?? [];
+        const body =
+          entries.length === 0
+            ? "state empty"
+            : entries
+                .map((e) => `${e.key} rev=${e.rev} updated_by=${e.updatedBy} ts=${e.ts}\n${e.value}`)
+                .join("\n\n");
+        return {
+          ...text(body),
+          structuredContent: { action: "list", entries },
+        };
+      }
+      if (frame.action === "delete") {
+        return {
+          ...text(frame.deleted ? `deleted ${key}` : `not found ${key}`),
+          structuredContent: { action: "delete", key, deleted: Boolean(frame.deleted) },
+        };
+      }
+      if (!frame.entry) {
+        return {
+          ...text(`not found ${key}`),
+          structuredContent: { action: frame.action, entry: null },
+        };
+      }
+      const e = frame.entry;
+      return {
+        ...text(`${e.key} rev=${e.rev} updated_by=${e.updatedBy} ts=${e.ts}\n${e.value}`),
+        structuredContent: { action: frame.action, entry: e },
       };
     },
   );

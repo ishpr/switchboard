@@ -1,5 +1,13 @@
 import { DatabaseSync } from "node:sqlite";
-import type { AgentRecord, BusMessage, Kind, PendingAsk, AgentMetrics } from "./types.ts";
+import type {
+  AgentRecord,
+  BusMessage,
+  Kind,
+  PendingAsk,
+  AgentMetrics,
+  ReplyState,
+  StateEntry,
+} from "./types.ts";
 import { TTY_RE } from "./wake.ts";
 
 function isPaneOrTty(sessionId?: string | null): boolean {
@@ -12,12 +20,19 @@ export function inboxCursorKey(clientKey: string, topic?: string): string {
 }
 
 // One definition of task completion for status, metrics, and the Stop gate.
-const ANSWERED_ASK = `SELECT 1 FROM messages r WHERE r.repo = a.repo AND r.kind = 'reply'
-  AND r.correlation_id = a.correlation_id
-  AND (r.from_name = a.to_name OR EXISTS (
-    SELECT 1 FROM agents ag WHERE ag.repo = a.repo AND ag.session_id = a.to_name AND ag.name = r.from_name
-  ))
-  AND r.to_name = a.from_name AND r.seq > a.seq`;
+// Only a 'done' reply (default) or a superseding ask closes an ask; 'progress' and 'blocked' keep it open.
+const ANSWERED_ASK = `
+  SELECT 1 FROM messages r WHERE r.repo = a.repo AND r.kind = 'reply'
+    AND r.correlation_id = a.correlation_id
+    AND COALESCE(r.reply_state, 'done') = 'done'
+    AND (r.from_name = a.to_name OR EXISTS (
+      SELECT 1 FROM agents ag WHERE ag.repo = a.repo AND ag.session_id = a.to_name AND ag.name = r.from_name
+    ))
+    AND r.to_name = a.from_name AND r.seq > a.seq
+  UNION ALL
+  SELECT 1 FROM messages s WHERE s.repo = a.repo AND s.kind = 'ask'
+    AND s.supersedes = a.correlation_id AND s.seq > a.seq
+`;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS messages (
@@ -32,6 +47,8 @@ CREATE TABLE IF NOT EXISTS messages (
   kind TEXT NOT NULL,
   correlation_id TEXT,
   to_name TEXT,
+  reply_state TEXT,
+  supersedes TEXT,
   PRIMARY KEY (repo, seq)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS messages_id ON messages(repo, id);
@@ -66,6 +83,16 @@ CREATE TABLE IF NOT EXISTS roles (
   repo TEXT NOT NULL PRIMARY KEY,
   orchestrator TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS state (
+  repo TEXT NOT NULL,
+  key TEXT NOT NULL,
+  value TEXT NOT NULL,
+  rev INTEGER NOT NULL,
+  updated_by TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (repo, key)
+);
 `;
 
 export class Store {
@@ -75,8 +102,20 @@ export class Store {
     this.db = new DatabaseSync(file);
     this.db.exec("PRAGMA journal_mode = WAL;");
     this.db.exec("PRAGMA busy_timeout = 3000;");
+    this.migrateMessagesTable();
     this.migrateAgentsTable();
     this.db.exec(SCHEMA);
+  }
+
+  private migrateMessagesTable(): void {
+    const cols = this.db.prepare("PRAGMA table_info(messages)").all() as { name: string }[];
+    if (cols.length === 0) return;
+    if (!cols.some((col) => col.name === "reply_state")) {
+      this.db.exec("ALTER TABLE messages ADD COLUMN reply_state TEXT;");
+    }
+    if (!cols.some((col) => col.name === "supersedes")) {
+      this.db.exec("ALTER TABLE messages ADD COLUMN supersedes TEXT;");
+    }
   }
 
   private migrateAgentsTable(): void {
@@ -151,6 +190,8 @@ export class Store {
     kind: Kind;
     correlationId: string | null;
     to: string | null;
+    replyState?: ReplyState | null;
+    supersedes?: string | null;
   }): BusMessage {
     const existing = this.db
       .prepare("SELECT seq FROM messages WHERE repo = ? AND id = ?")
@@ -169,8 +210,8 @@ export class Store {
       this.db
         .prepare(
           `INSERT INTO messages
-           (repo, seq, id, topic, from_id, from_name, body, ts, kind, correlation_id, to_name)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           (repo, seq, id, topic, from_id, from_name, body, ts, kind, correlation_id, to_name, reply_state, supersedes)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           input.repo,
@@ -184,6 +225,8 @@ export class Store {
           input.kind,
           input.correlationId,
           input.to,
+          input.replyState ?? null,
+          input.supersedes ?? null,
         );
       this.db.exec("COMMIT");
       return this.bySeq(input.repo, row.seq)!;
@@ -216,16 +259,24 @@ export class Store {
     return row ? mapMessage(row) : undefined;
   }
 
-  /** Workspace-wide tracker: only a matching reply answers an ask, not a report or inbox read. */
+  /** Workspace-wide tracker: only a matching done reply or superseding ask closes an ask. */
   pendingAsks(repo: string, limit = 50, now = Date.now(), participant?: string): PendingAsk[] {
     const boundedLimit = Number.isInteger(limit) ? Math.max(1, Math.min(limit, 200)) : 50;
     const rows = this.db.prepare(
-      `SELECT a.* FROM messages a
+      `SELECT a.*, (
+         SELECT r.reply_state FROM messages r
+         WHERE r.repo = a.repo AND r.kind = 'reply'
+           AND r.correlation_id = a.correlation_id AND r.seq > a.seq
+         ORDER BY r.seq DESC LIMIT 1
+       ) AS last_reply_state
+       FROM messages a
        WHERE a.repo = ? AND a.kind = 'ask' AND a.correlation_id IS NOT NULL
          AND (? IS NULL OR a.from_name = ? OR a.to_name = ?)
          AND NOT EXISTS (${ANSWERED_ASK})
        ORDER BY a.seq DESC LIMIT ?`,
-    ).all(repo, participant ?? null, participant ?? null, participant ?? null, boundedLimit) as Row[];
+    ).all(repo, participant ?? null, participant ?? null, participant ?? null, boundedLimit) as (Row & {
+      last_reply_state?: ReplyState | null;
+    })[];
     return rows.map((row) => ({
       id: row.id,
       correlation_id: row.correlation_id!,
@@ -235,6 +286,7 @@ export class Store {
       topic: row.topic,
       age_seconds: Math.max(0, Math.floor((now - row.ts) / 1000)),
       preview: row.body.replace(/\s+/g, " ").trim().slice(0, 160),
+      ...(row.last_reply_state ? { last_reply_state: row.last_reply_state } : {}),
     }));
   }
 
@@ -536,7 +588,106 @@ export class Store {
       .all(repo) as AgentRow[];
     return rows.map((row) => mapAgent(row, onlineNames.has(row.name)));
   }
+
+  getState(repo: string, key: string): StateEntry | null {
+    const row = this.db
+      .prepare("SELECT * FROM state WHERE repo = ? AND key = ?")
+      .get(repo, key) as StateRow | undefined;
+    return row ? mapState(row) : null;
+  }
+
+  listState(repo: string, prefix?: string): StateEntry[] {
+    const rows = prefix
+      ? (this.db
+          .prepare("SELECT * FROM state WHERE repo = ? AND substr(key, 1, ?) = ? ORDER BY key ASC")
+          .all(repo, prefix.length, prefix) as StateRow[])
+      : (this.db
+          .prepare("SELECT * FROM state WHERE repo = ? ORDER BY key ASC")
+          .all(repo) as StateRow[]);
+    return rows.map(mapState);
+  }
+
+  setState(input: {
+    repo: string;
+    key: string;
+    value: string;
+    updatedBy: string;
+    ifRev?: number;
+  }): { ok: true; entry: StateEntry } | { ok: false; current: StateEntry | null } {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const currentRow = this.db
+        .prepare("SELECT * FROM state WHERE repo = ? AND key = ?")
+        .get(input.repo, input.key) as StateRow | undefined;
+      const current = currentRow ? mapState(currentRow) : null;
+      if (input.ifRev !== undefined) {
+        if (input.ifRev === 0) {
+          if (current !== null) {
+            this.db.exec("COMMIT");
+            return { ok: false, current };
+          }
+        } else if (!current || current.rev !== input.ifRev) {
+          this.db.exec("COMMIT");
+          return { ok: false, current };
+        }
+      }
+      const nextRev = (current?.rev ?? 0) + 1;
+      const now = Date.now();
+      this.db
+        .prepare(
+          `INSERT INTO state (repo, key, value, rev, updated_by, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(repo, key) DO UPDATE SET
+             value = excluded.value,
+             rev = excluded.rev,
+             updated_by = excluded.updated_by,
+             updated_at = excluded.updated_at`,
+        )
+        .run(input.repo, input.key, input.value, nextRev, input.updatedBy, now);
+      const updated = this.getState(input.repo, input.key)!;
+      this.db.exec("COMMIT");
+      return { ok: true, entry: updated };
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  deleteState(input: {
+    repo: string;
+    key: string;
+    ifRev?: number;
+  }): { ok: true; deleted: boolean; rev: number } | { ok: false; current: StateEntry | null } {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const currentRow = this.db
+        .prepare("SELECT * FROM state WHERE repo = ? AND key = ?")
+        .get(input.repo, input.key) as StateRow | undefined;
+      const current = currentRow ? mapState(currentRow) : null;
+      if (input.ifRev !== undefined && (current?.rev ?? 0) !== input.ifRev) {
+        this.db.exec("COMMIT");
+        return { ok: false, current };
+      }
+      if (current) {
+        this.db.prepare("DELETE FROM state WHERE repo = ? AND key = ?").run(input.repo, input.key);
+      }
+      this.db.exec("COMMIT");
+      return { ok: true, deleted: Boolean(current), rev: current?.rev ?? 0 };
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
 }
+
+type StateRow = {
+  repo: string;
+  key: string;
+  value: string;
+  rev: number;
+  updated_by: string;
+  updated_at: number;
+};
 
 type Row = {
   repo: string;
@@ -550,6 +701,8 @@ type Row = {
   kind: string;
   correlation_id: string | null;
   to_name: string | null;
+  reply_state: string | null;
+  supersedes: string | null;
 };
 
 type AgentRow = {
@@ -567,6 +720,10 @@ type AgentRow = {
 };
 
 function mapMessage(row: Row): BusMessage {
+  const replyState =
+    row.reply_state === "done" || row.reply_state === "progress" || row.reply_state === "blocked"
+      ? row.reply_state
+      : null;
   return {
     id: row.id,
     seq: row.seq,
@@ -579,6 +736,21 @@ function mapMessage(row: Row): BusMessage {
     kind: row.kind === "ask" || row.kind === "reply" ? row.kind : "pub",
     correlationId: row.correlation_id,
     to: row.to_name,
+    ...(replyState ? { replyState } : {}),
+    ...(row.supersedes ? { supersedes: row.supersedes } : {}),
+  };
+}
+
+function mapState(row: StateRow): StateEntry {
+  return {
+    repo: row.repo,
+    key: row.key,
+    value: row.value,
+    rev: row.rev,
+    updatedBy: row.updated_by,
+    ts: row.updated_at,
+    updated_by: row.updated_by,
+    updated_at: row.updated_at,
   };
 }
 

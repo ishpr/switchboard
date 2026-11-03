@@ -215,6 +215,21 @@ test("bus_register keys rows by harness session id, refuses when missing, and su
 
     const inbox2 = await muse2.callTool({ name: "bus_inbox", arguments: {} });
     assert.match((inbox2.content[0] as { text: string }).text, /only for muse2/);
+
+    // bus_state CAS works over MCP without waking
+    const stSet = await muse1.callTool({
+      name: "bus_state",
+      arguments: { action: "set", key: "gate", value: "green", if_rev: 0 },
+    });
+    assert.equal(stSet.isError, undefined);
+    assert.match((stSet.content[0] as { text: string }).text, /gate rev=1/);
+
+    const stConflict = await muse2.callTool({
+      name: "bus_state",
+      arguments: { action: "set", key: "gate", value: "red", if_rev: 0 },
+    });
+    assert.equal(stConflict.isError, true);
+    assert.match((stConflict.content[0] as { text: string }).text, /revision conflict/);
   } finally {
     await muse1.close();
     await muse2.close();
