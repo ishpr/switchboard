@@ -73,7 +73,18 @@ If you are the orchestrator, assign work with bus_ask. Read replies and reports 
 
 ## Grid
 
-If you want every CLI in one terminal, install [Zellij](https://zellij.dev/) and run `switchboard init`. It asks which panes to open, skips any CLI it cannot find, and writes `~/.config/zellij/layouts/switchboard.kdl` plus a marked block in `~/.zshrc`. A blank answer keeps the panes found on your machine. Running it again replaces that block and asks again.
+If you want the CLIs in one terminal, install [Zellij](https://zellij.dev/) and run `switchboard init`. It asks two things: which harnesses to open, and, when Claude is one of them, which accounts and how many. A blank harness answer keeps the CLIs found on your machine. A blank Claude answer is one shared Claude pane.
+
+A number such as `4` opens that many isolated Claude panes. Names such as `pi,eg`, or the numbers from the list init prints, open those accounts. `all` opens every account it discovered. Each account gets its own `~/.claude-<id>` config, `SWITCHBOARD_NAME`, git worktree on `ws/<id>`, and Zellij pane. Init writes `~/.config/zellij/layouts/switchboard.kdl` and a marked block in `~/.zshrc`. Running it again replaces that block and asks again.
+
+An agent can make the same choices without the prompts:
+
+```sh
+switchboard init --panes claude,grok,bus --accounts 2 --orchestrator cursor
+switchboard init --panes claude,codex --accounts pi,eg
+switchboard account list
+switchboard account add --name pi --email you@example.com --plan max
+```
 
 Open a new terminal and run `switchboard` to attach the grid, or to start it. `switchboard --resume` and `switchboard -c` attach if the session is already running. Otherwise they start the grid and each CLI continues its latest session in that repo. `switchboard who` and the other subcommands still call the bus.
 
