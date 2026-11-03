@@ -233,7 +233,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     conn.cwd = effectiveCwd;
     conn.declaredSession = frame.sessionId || null;
     conn.sessionBound = Boolean(frame.boundSession && frame.sessionId);
-    conn.sessionId = conn.declaredSession || conn.agentId;
+    conn.sessionId = conn.declaredSession || existing?.sessionId || conn.agentId;
     conn.wake = frame.wake === undefined ? (existing?.wake ?? false) : frame.wake;
     conn.status = frame.status || "online";
     conn.role = elect(conn.repo, conn.name, frame.role === "orchestrator");
@@ -381,12 +381,14 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     if (!correlationId) throw new Error("correlation id required");
     const askMessage = store.byCorrelation(conn.repo, correlationId);
     if (!askMessage) throw new Error("no ask with that correlation id");
+    const target =
+      conn.name === askMessage.fromName && askMessage.to ? askMessage.to : askMessage.fromName;
     await publish(
       conn,
       {
         topic: askMessage.topic,
         body,
-        to: askMessage.fromName,
+        to: target,
         id: randomUUID(),
       },
       "reply",
