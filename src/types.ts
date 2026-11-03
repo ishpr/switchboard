@@ -89,7 +89,7 @@ export type ServerFrame =
   | { type: "published"; id: string; seq: number; wake: WakeInfo; correlationId?: string | null }
   | { type: "ok"; detail: string }
   | { type: "message"; message: BusMessage }
-  | { type: "inbox"; messages: BusMessage[]; cursor: number; more: boolean }
+  | { type: "inbox"; messages: BusMessage[]; cursor: number; more: boolean; pendingAsk?: BusMessage | null }
   | { type: "who"; agents: AgentRecord[] }
   | { type: "orchestrator"; orchestrator: string | null }
   | { type: "registered"; name: string }

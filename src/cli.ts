@@ -16,7 +16,7 @@ import {
 import { BusClient } from "./busClient.ts";
 import { startDaemon } from "./daemon.ts";
 import { ensureDaemon, readDaemonInfo } from "./ensure.ts";
-import { hookStdout } from "./hook.ts";
+import { hookStdout, shouldSkipHookForPrompt } from "./hook.ts";
 import { daemonInfoPath, dbPath, switchboardHome, wakeLogPath } from "./paths.ts";
 import { repoKey } from "./repo.ts";
 import { runShim } from "./shim.ts";
@@ -752,6 +752,7 @@ async function hook(): Promise<void> {
   const stdinEvent = stdinJson && typeof stdinJson.hook_event_name === "string" ? stdinJson.hook_event_name : "";
   const event = values.event || stdinEvent || "";
   if (!harness || !event) throw new Error("hook requires --harness and --event");
+  if (shouldSkipHookForPrompt(event, stdinJson)) return;
   const home = switchboardHome();
   const info = readDaemonInfo(home);
   if (!info) return;
@@ -774,7 +775,10 @@ async function hook(): Promise<void> {
     const filtered = frame.messages.filter(
       (m) => m.topic !== "presence" && m.fromName !== callerName,
     );
-    process.stdout.write(hookStdout(harness, event, filtered));
+    const stopHookActive = Boolean(stdinJson && stdinJson.stop_hook_active === true);
+    process.stdout.write(
+      hookStdout(harness, event, filtered, frame.pendingAsk ?? null, stopHookActive),
+    );
   } finally {
     client.close();
   }
