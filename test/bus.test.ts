@@ -735,3 +735,216 @@ test("inbox tracks unanswered ask for Stop hook and clears it once bus_reply is 
     await fx.daemon.close();
   }
 });
+
+test("reply state progress and blocked keep ask open until state=done, and supersedes closes prior ask", async () => {
+  const fx = await fixture();
+  const agy = await join(fx, "agy", "repo-a", { harness: "antigravity", role: "orchestrator" });
+  const eg = await join(fx, "eg", "repo-a", { harness: "claude" });
+  try {
+    const ask1 = await agy.request({ type: "ask", to: "eg", body: "task 1" });
+    assert.equal(ask1.type, "published");
+    if (ask1.type !== "published") return;
+    const cid1 = ask1.correlationId!;
+
+    await eg.request({ type: "inbox" });
+
+    // progress reply keeps ask1 open and records last_reply_state=progress
+    const progIncoming = waitForMessage(agy);
+    await eg.request({ type: "reply", correlationId: cid1, body: "50% done", state: "progress" });
+    const progMsg = await progIncoming;
+    assert.equal(progMsg.replyState, "progress");
+    assert.match(formatMessage(progMsg), /state=progress/);
+
+    const status1 = await agy.request({ type: "status", pending: true });
+    assert.equal(status1.type, "ok");
+    if (status1.type === "ok") {
+      assert.equal(status1.pending_asks?.length, 1);
+      assert.equal(status1.pending_asks?.[0]?.correlation_id, cid1);
+      assert.equal(status1.pending_asks?.[0]?.last_reply_state, "progress");
+    }
+
+    // blocked reply also keeps ask1 open and updates last_reply_state=blocked
+    await eg.request({ type: "reply", correlationId: cid1, body: "waiting on schema", state: "blocked" });
+    const inboxAfterBlocked = await eg.request({ type: "inbox" });
+    assert.equal(inboxAfterBlocked.type, "inbox");
+    if (inboxAfterBlocked.type === "inbox") {
+      assert.equal(inboxAfterBlocked.pendingAsk?.correlationId, cid1);
+    }
+
+    // Superseding ask closes ask1 and leaves only ask2 open
+    const ask2 = await agy.request({
+      type: "ask",
+      to: "eg",
+      body: "task 1 revised",
+      supersedes: cid1,
+    });
+    assert.equal(ask2.type, "published");
+    if (ask2.type !== "published") return;
+    const cid2 = ask2.correlationId!;
+
+    const status2 = await agy.request({ type: "status", pending: true });
+    assert.equal(status2.type, "ok");
+    if (status2.type === "ok") {
+      assert.equal(status2.pending_asks?.length, 1);
+      assert.equal(status2.pending_asks?.[0]?.correlation_id, cid2);
+    }
+
+    // Replying with state=done closes ask2
+    await eg.request({ type: "inbox" });
+    await eg.request({ type: "reply", correlationId: cid2, body: "completed revised task", state: "done" });
+    const status3 = await agy.request({ type: "status", pending: true });
+    assert.equal(status3.type, "ok");
+    if (status3.type === "ok") {
+      assert.equal(status3.pending_asks?.length, 0);
+    }
+  } finally {
+    agy.close();
+    eg.close();
+    await fx.daemon.close();
+  }
+});
+
+test("trailing wake fires after cooldown if message remains unread, and skips if already acked", async () => {
+  const home = mkdtempSync(path.join(tmpdir(), "switchboard-trailing-"));
+  const token = ensureToken(home);
+  const launches: WakeLaunch[] = [];
+  const daemon = await startDaemon({
+    port: 0,
+    dbFile: path.join(home, "switchboard.db"),
+    token,
+    wakeCooldownMs: 60,
+    spawnWake: async (launch) => {
+      launches.push(launch);
+    },
+  });
+  const claude = new BusClient();
+  await claude.connect(daemon.url, hello(token, "claude", "repo-a"));
+  try {
+    await claude.request({
+      type: "register",
+      name: "kimi",
+      harness: "kimi",
+      cwd: "/work/kimi",
+      wake: true,
+    });
+
+    // 1st ask triggers immediate wake (launches.length === 1)
+    const first = await claude.request({ type: "ask", to: "kimi", body: "first task" });
+    assert.equal(first.type, "published");
+    assert.equal(launches.length, 1);
+
+    // 2nd ask within cooldown returns skip immediately, then fires trailing wake after cooldown because unread
+    const second = await claude.request({ type: "ask", to: "kimi", body: "second task (unread)" });
+    assert.equal(second.type, "published");
+    if (second.type === "published") assert.equal(second.wake.mode, "skip");
+    assert.equal(launches.length, 1);
+
+    await new Promise((resolve) => setTimeout(resolve, 110));
+    assert.equal(launches.length, 2);
+
+    // 3rd ask within cooldown that gets read before cooldown expires does NOT fire a redundant trailing wake
+    const third = await claude.request({ type: "ask", to: "kimi", body: "third task (read)" });
+    assert.equal(third.type, "published");
+    const kimiCli = new BusClient();
+    await kimiCli.connect(daemon.url, hello(token, "kimi", "repo-a", { harness: "cli" }));
+    await kimiCli.request({ type: "inbox" });
+    kimiCli.close();
+
+    await new Promise((resolve) => setTimeout(resolve, 110));
+    assert.equal(launches.length, 2);
+  } finally {
+    claude.close();
+    await daemon.close();
+  }
+});
+
+test("state get/set/list/delete supports rev compare-and-swap and never triggers wakes", async () => {
+  const fx = await fixture();
+  const agy = await join(fx, "agy", "repo-a", { harness: "antigravity", role: "orchestrator" });
+  const codex = await join(fx, "codex", "repo-a", { harness: "codex" });
+  try {
+    await agy.request({
+      type: "register",
+      name: "kimi",
+      harness: "kimi",
+      cwd: "/work/kimi",
+      wake: true,
+    });
+
+    // Create-only with ifRev=0 succeeds (rev=1)
+    const set1 = await agy.request({
+      type: "state",
+      action: "set",
+      key: "merge-queue",
+      value: "pr-243",
+      ifRev: 0,
+    });
+    assert.equal(set1.type, "state");
+    if (set1.type === "state") {
+      assert.equal(set1.conflict, undefined);
+      assert.equal(set1.entry?.rev, 1);
+      assert.equal(set1.entry?.value, "pr-243");
+      assert.equal(set1.entry?.updatedBy, "agy");
+    }
+
+    // Second create-only with ifRev=0 conflicts and returns current rev=1
+    const conflictCreate = await codex.request({
+      type: "state",
+      action: "set",
+      key: "merge-queue",
+      value: "pr-244",
+      ifRev: 0,
+    });
+    assert.equal(conflictCreate.type, "state");
+    if (conflictCreate.type === "state") {
+      assert.equal(conflictCreate.conflict, true);
+      assert.equal(conflictCreate.entry?.rev, 1);
+      assert.equal(conflictCreate.entry?.value, "pr-243");
+    }
+
+    // CAS update with ifRev=1 succeeds (rev=2)
+    const set2 = await codex.request({
+      type: "state",
+      action: "set",
+      key: "merge-queue",
+      value: "pr-243+f17",
+      ifRev: 1,
+    });
+    assert.equal(set2.type, "state");
+    if (set2.type === "state") {
+      assert.equal(set2.conflict, undefined);
+      assert.equal(set2.entry?.rev, 2);
+      assert.equal(set2.entry?.updatedBy, "codex");
+    }
+
+    // List with prefix
+    await agy.request({ type: "state", action: "set", key: "merge-target", value: "main" });
+    const listed = await agy.request({ type: "state", action: "list", prefix: "merge-" });
+    assert.equal(listed.type, "state");
+    if (listed.type === "state") {
+      assert.deepEqual(
+        listed.entries?.map((e) => e.key),
+        ["merge-queue", "merge-target"],
+      );
+    }
+
+    // Delete with stale ifRev=1 conflicts, delete with ifRev=2 succeeds
+    const badDel = await agy.request({ type: "state", action: "delete", key: "merge-queue", ifRev: 1 });
+    assert.equal(badDel.type, "state");
+    if (badDel.type === "state") assert.equal(badDel.conflict, true);
+
+    const goodDel = await agy.request({ type: "state", action: "delete", key: "merge-queue", ifRev: 2 });
+    assert.equal(goodDel.type, "state");
+    if (goodDel.type === "state") {
+      assert.equal(goodDel.conflict, undefined);
+      assert.equal(goodDel.deleted, true);
+    }
+
+    // Zero automatic wakes triggered by any state operation
+    assert.equal(fx.launches.length, 0);
+  } finally {
+    agy.close();
+    codex.close();
+    await fx.daemon.close();
+  }
+});

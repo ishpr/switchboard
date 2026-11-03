@@ -10,7 +10,19 @@ export const PRESENCE_TTL_MS = 30_000;
 export const WAKE_COOLDOWN_MS = 3_000;
 
 export type Kind = "pub" | "ask" | "reply";
+export type ReplyState = "done" | "progress" | "blocked";
 export type Role = "orchestrator" | "worker";
+
+export type StateEntry = {
+  repo: string;
+  key: string;
+  value: string;
+  rev: number;
+  updatedBy: string;
+  ts: number;
+  updated_by: string;
+  updated_at: number;
+};
 
 export type BusMessage = {
   id: string;
@@ -24,6 +36,8 @@ export type BusMessage = {
   kind: Kind;
   correlationId: string | null;
   to: string | null;
+  replyState?: ReplyState | null;
+  supersedes?: string | null;
 };
 
 export type SessionDiagnostics = {
@@ -71,6 +85,7 @@ export type PendingAsk = {
   topic: string;
   age_seconds: number;
   preview: string;
+  last_reply_state?: ReplyState | null;
 };
 
 export type AgentMetrics = {
@@ -123,8 +138,8 @@ export type ClientFrame = (
   | { type: "ack"; cursor: number }
   | { type: "who" }
   | { type: "doctor"; all?: boolean; prune?: boolean }
-  | { type: "ask"; to: string; body: string; topic?: string }
-  | { type: "reply"; correlationId: string; body: string }
+  | { type: "ask"; to: string; body: string; topic?: string; supersedes?: string }
+  | { type: "reply"; correlationId: string; body: string; state?: ReplyState }
   | { type: "report"; body: string }
   | { type: "status"; status?: string; pending?: boolean; limit?: number }
   | { type: "orchestrator"; name?: string }
@@ -138,6 +153,14 @@ export type ClientFrame = (
       branch?: string | null;
       head?: string | null;
       wake?: boolean;
+    }
+  | {
+      type: "state";
+      action: "get" | "set" | "list" | "delete";
+      key?: string;
+      value?: string;
+      prefix?: string;
+      ifRev?: number;
     }
   | { type: "heartbeat" }
 ) & { reqId?: string };
@@ -165,6 +188,17 @@ export type ServerFrame = (
   | { type: "doctor"; agents: AgentRecord[]; pruned: PrunedAgent[]; daemon?: RuntimeInfo }
   | { type: "orchestrator"; orchestrator: string | null }
   | { type: "registered"; name: string; agent?: AgentRecord; created?: boolean }
+  | {
+      type: "state";
+      action: "get" | "set" | "list" | "delete";
+      ok?: boolean;
+      detail?: string;
+      entry?: StateEntry | null;
+      entries?: StateEntry[];
+      conflict?: boolean;
+      deleted?: boolean;
+      rev?: number;
+    }
   | { type: "error"; error: string }
 ) & { reqId?: string };
 

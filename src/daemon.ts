@@ -16,6 +16,7 @@ import {
   type BuildInfo,
   type AgentRecord,
   type ClientFrame,
+  type ReplyState,
   type Role,
   type ServerFrame,
   type WakeInfo,
@@ -34,6 +35,7 @@ export type DaemonOptions = {
   sweepMs?: number;
   paneProbe?: PaneProbe;
   presenceDebounceMs?: number;
+  wakeCooldownMs?: number;
 };
 
 export type DaemonHandle = {
@@ -83,6 +85,8 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
   const conns = new Set<Conn>();
   const lastWake = new Map<string, number>();
   const waking = new Set<string>();
+  const wakeCooldownMs = options.wakeCooldownMs ?? WAKE_COOLDOWN_MS;
+  const trailingWakes = new Map<string, ReturnType<typeof setTimeout>>();
   const daemonInfo = runtimeInfo();
   const onlineGroups = new Set<string>();
   const pendingOffline = new Map<string, ReturnType<typeof setTimeout>>();
@@ -217,13 +221,16 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         await sendWho(conn, respond);
         break;
       case "ask":
-        await ask(conn, frame.to, frame.body, frame.topic, respond);
+        await ask(conn, frame.to, frame.body, frame.topic, frame.supersedes, respond);
         break;
       case "reply":
-        await reply(conn, frame.correlationId, frame.body, respond);
+        await reply(conn, frame.correlationId, frame.body, frame.state, respond);
         break;
       case "report":
         await report(conn, frame.body, respond);
+        break;
+      case "state":
+        handleState(conn, frame, respond);
         break;
       case "status":
         if (frame.limit !== undefined && (!Number.isInteger(frame.limit) || frame.limit < 1 || frame.limit > 200)) {
@@ -528,6 +535,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     respond: Respond,
     kind: BusMessage["kind"] = "pub",
     correlationId: string | null = null,
+    extra?: { replyState?: ReplyState | null; supersedes?: string | null },
   ): Promise<void> {
     requireTopic(frame.topic);
     requireBody(frame.body);
@@ -543,6 +551,8 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       kind,
       correlationId,
       to: frame.to === "*" ? null : frame.to || null,
+      replyState: extra?.replyState ?? null,
+      supersedes: extra?.supersedes ?? null,
     });
     store.touchAgent(conn.repo, conn.name, undefined, conn.sessionId);
     fanout(message, conn);
@@ -556,7 +566,14 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     });
   }
 
-  async function ask(conn: Conn, to: string, body: string, topic: string | undefined, respond: Respond): Promise<void> {
+  async function ask(
+    conn: Conn,
+    to: string,
+    body: string,
+    topic: string | undefined,
+    supersedes: string | undefined,
+    respond: Respond,
+  ): Promise<void> {
     requireName(to);
     const others = [...conns].filter(
       (peer) =>
@@ -568,12 +585,18 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     if ((to === conn.name || to === conn.sessionId || to === conn.declaredSession) && others.length === 0) {
       throw new Error("ask someone else");
     }
+    if (supersedes !== undefined) {
+      if (typeof supersedes !== "string" || !supersedes) throw new Error("invalid supersedes correlation id");
+      const priorAsk = store.byCorrelation(conn.repo, supersedes);
+      if (!priorAsk) throw new Error("no ask with that supersedes correlation id");
+    }
     await publish(
       conn,
       { topic: topic || "dm", body, to, id: randomUUID() },
       respond,
       "ask",
       randomUUID(),
+      { supersedes: supersedes ?? null },
     );
   }
 
@@ -590,8 +613,18 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     }
   }
 
-  async function reply(conn: Conn, correlationId: string, body: string, respond: Respond): Promise<void> {
+  async function reply(
+    conn: Conn,
+    correlationId: string,
+    body: string,
+    state: ReplyState | undefined,
+    respond: Respond,
+  ): Promise<void> {
     if (typeof correlationId !== "string" || !correlationId) throw new Error("correlation id required");
+    const replyState: ReplyState = state ?? "done";
+    if (replyState !== "done" && replyState !== "progress" && replyState !== "blocked") {
+      throw new Error("reply state must be done, progress, or blocked");
+    }
     const askMessage = store.byCorrelation(conn.repo, correlationId);
     if (!askMessage) throw new Error("no ask with that correlation id");
     const isRecipient =
@@ -612,7 +645,76 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       respond,
       "reply",
       correlationId,
+      { replyState },
     );
+  }
+
+  function handleState(
+    conn: Conn,
+    frame: Extract<ClientFrame, { type: "state" }>,
+    respond: Respond,
+  ): void {
+    const action = frame.action;
+    if (action !== "get" && action !== "set" && action !== "list" && action !== "delete") {
+      throw new Error("state action must be get, set, list, or delete");
+    }
+    if (frame.ifRev !== undefined && (!Number.isSafeInteger(frame.ifRev) || frame.ifRev < 0)) {
+      throw new Error("ifRev must be a non-negative integer");
+    }
+    if (action === "list") {
+      if (frame.prefix !== undefined && typeof frame.prefix !== "string") {
+        throw new Error("prefix must be a string");
+      }
+      const entries = store.listState(conn.repo, frame.prefix);
+      respond({ type: "state", action: "list", entries });
+      return;
+    }
+    if (!frame.key) throw new Error("state key required");
+    requireTopic(frame.key);
+    if (action === "get") {
+      const entry = store.getState(conn.repo, frame.key) ?? null;
+      respond({ type: "state", action: "get", entry });
+      return;
+    }
+    if (action === "set") {
+      if (typeof frame.value !== "string") throw new Error("state value must be a string");
+      if (frame.value.length > BODY_MAX) throw new Error(`state value is longer than ${BODY_MAX} bytes`);
+      const res = store.setState({
+        repo: conn.repo,
+        key: frame.key,
+        value: frame.value,
+        updatedBy: conn.name,
+        ifRev: frame.ifRev,
+      });
+      if (!res.ok) {
+        respond({
+          type: "state",
+          action: "set",
+          ok: false,
+          entry: res.current,
+          conflict: true,
+          detail: `revision conflict on ${frame.key}: expected rev=${frame.ifRev}, current rev=${res.current?.rev ?? 0}`,
+        });
+        return;
+      }
+      store.touchAgent(conn.repo, conn.name, undefined, conn.sessionId);
+      respond({ type: "state", action: "set", ok: true, entry: res.entry });
+      return;
+    }
+    const res = store.deleteState({ repo: conn.repo, key: frame.key, ifRev: frame.ifRev });
+    if (!res.ok) {
+      respond({
+        type: "state",
+        action: "delete",
+        ok: false,
+        entry: res.current,
+        conflict: true,
+        detail: `revision conflict on ${frame.key}: expected rev=${frame.ifRev}, current rev=${res.current?.rev ?? 0}`,
+      });
+      return;
+    }
+    store.touchAgent(conn.repo, conn.name, undefined, conn.sessionId);
+    respond({ type: "state", action: "delete", ok: true, entry: null, deleted: res.deleted, rev: res.rev });
   }
 
   function inbox(conn: Conn, since: number | undefined, topic: string | undefined, limit: number | undefined, respond: Respond): void {
@@ -721,6 +823,42 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     }
   }
 
+  function isMessageUnreadForTarget(repo: string, message: BusMessage): boolean {
+    if (!message.to) return false;
+    const target = describeTarget(repo, message.to);
+    if (!target) return false;
+    const cursorKeys = new Set<string>([target.name, message.to]);
+    if (target.declaredSession && !target.declaredSession.startsWith("zellij:")) {
+      cursorKeys.add(`${target.name}:${target.declaredSession}`);
+    }
+    for (const peer of conns) {
+      if (!peer.authed || peer.repo !== repo || peer.harness === "cli") continue;
+      if (peer.name === target.name || peer.sessionId === message.to || peer.declaredSession === message.to) {
+        cursorKeys.add(clientKey(peer));
+      }
+    }
+    for (const cKey of cursorKeys) {
+      if (store.cursor(repo, cKey) >= message.seq) return false;
+      if (store.cursor(repo, inboxCursorKey(cKey, message.topic)) >= message.seq) return false;
+    }
+    return true;
+  }
+
+  function scheduleTrailingWake(key: string, repo: string, message: BusMessage): void {
+    const existing = trailingWakes.get(key);
+    if (existing) clearTimeout(existing);
+    const elapsed = Date.now() - (lastWake.get(key) ?? 0);
+    const delay = Math.max(25, wakeCooldownMs - Math.max(0, elapsed));
+    const timer = setTimeout(() => {
+      trailingWakes.delete(key);
+      if (stopping) return;
+      if (!isMessageUnreadForTarget(repo, message)) return;
+      void wakeFor(repo, message);
+    }, delay);
+    timer.unref?.();
+    trailingWakes.set(key, timer);
+  }
+
   async function wakeFor(repo: string, message: BusMessage): Promise<WakeInfo> {
     if (!message.to) return decideWake({
       directed: false,
@@ -743,7 +881,8 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     if (info.mode !== "inject" && info.mode !== "headless") return info;
     const key = JSON.stringify([repo, message.to]);
     const last = lastWake.get(key) ?? 0;
-    if (waking.has(key) || Date.now() - last < WAKE_COOLDOWN_MS) {
+    if (waking.has(key) || Date.now() - last < wakeCooldownMs) {
+      scheduleTrailingWake(key, repo, message);
       return { mode: "skip", detail: "wake is in flight or on cooldown; the message is in the log" };
     }
     const launch = launchFor({
@@ -771,6 +910,8 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
   }
 
   function describeTarget(repo: string, target: string): {
+    name: string;
+    declaredSession: string | null;
     harness: string;
     sessionId: string | null;
     cwd: string;
@@ -794,6 +935,8 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     if (!live && !row) return null;
     const liveWakeSession = live?.wakeSessionId || (live?.sessionBound ? live.sessionId : null);
     return {
+      name: live?.name ?? row!.name,
+      declaredSession: live?.declaredSession ?? row?.sessionId ?? null,
       harness: live?.sessionBound ? live.harness : row?.harness ?? live!.harness,
       sessionId: liveWakeSession || row?.sessionId || null,
       cwd: live?.sessionBound ? live.cwd : row?.cwd ?? live!.cwd,
@@ -874,6 +1017,8 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         clearInterval(sweep);
         for (const timer of pendingOffline.values()) clearTimeout(timer);
         pendingOffline.clear();
+        for (const timer of trailingWakes.values()) clearTimeout(timer);
+        trailingWakes.clear();
         for (const conn of conns) conn.socket.close();
         wss.close(() => {
           http.close(() => {

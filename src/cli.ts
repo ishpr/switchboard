@@ -26,7 +26,7 @@ import { daemonInfoPath, dbPath, switchboardHome, wakeLogPath } from "./paths.ts
 import { repoKey, type RepoScope } from "./repo.ts";
 import { runShim } from "./shim.ts";
 import { ensureToken, readToken } from "./token.ts";
-import { DEFAULT_PORT, HEARTBEAT_MS, NAME_RE, type ClientHello } from "./types.ts";
+import { DEFAULT_PORT, HEARTBEAT_MS, NAME_RE, type ClientHello, type ReplyState } from "./types.ts";
 import { gridPlan, init, resolveOrchestratorName, writeRepoConfig } from "./init.ts";
 import { spawnWake } from "./wake.ts";
 
@@ -66,6 +66,9 @@ try {
       break;
     case "status":
       await setStatus();
+      break;
+    case "state":
+      await stateCmd();
       break;
     case "orchestrator":
       await orchestratorCmd();
@@ -149,6 +152,7 @@ function usage(): void {
   reply                 Reply to an ask
   report                Report a result or status to the repo's orchestrator
   status                Show status and pending asks [--pending] [--json] [--limit 1..200] [--status text]
+  state                 Read or write shared per-repo key-value state (get | set | list | delete)
   orchestrator          Get or set the orchestrator for this repo
   agent add             Register an agent and its wake policy
   account               List or add isolated Claude accounts (list | add)
@@ -523,6 +527,7 @@ async function ask(): Promise<void> {
       to: { type: "string" },
       message: { type: "string" },
       topic: { type: "string" },
+      supersedes: { type: "string" },
       name: { type: "string" },
       cwd: { type: "string" },
       role: { type: "string" },
@@ -540,6 +545,7 @@ async function ask(): Promise<void> {
       to: values.to,
       body: values.message,
       topic: values.topic,
+      supersedes: values.supersedes,
     });
     if (frame.type !== "published") throw new Error("unexpected response");
     process.stdout.write(
@@ -556,12 +562,17 @@ async function reply(): Promise<void> {
     options: {
       correlation: { type: "string" },
       message: { type: "string" },
+      state: { type: "string" },
       name: { type: "string" },
       cwd: { type: "string" },
     },
   });
   if (!values.correlation || !values.message) {
     throw new Error("reply requires --correlation and --message");
+  }
+  const state = values.state as ReplyState | undefined;
+  if (state !== undefined && state !== "done" && state !== "progress" && state !== "blocked") {
+    throw new Error("--state must be done, progress, or blocked");
   }
   const client = await connectCli(
     values.cwd || process.cwd(),
@@ -572,9 +583,81 @@ async function reply(): Promise<void> {
       type: "reply",
       correlationId: values.correlation,
       body: values.message,
+      state,
     });
     if (frame.type !== "published") throw new Error("unexpected response");
     process.stdout.write(`id=${frame.id}\n${frame.wake.mode}: ${frame.wake.detail}\n`);
+  } finally {
+    client.close();
+  }
+}
+
+async function stateCmd(): Promise<void> {
+  const action = process.argv[3];
+  if (action !== "get" && action !== "set" && action !== "list" && action !== "delete") {
+    throw new Error("usage: switchboard state <get|set|list|delete> [--key <k>] [--value <v>] [--prefix <p>] [--if-rev <n>] [--json]");
+  }
+  const { values } = parseArgs({
+    args: process.argv.slice(4),
+    options: {
+      key: { type: "string" },
+      value: { type: "string" },
+      prefix: { type: "string" },
+      "if-rev": { type: "string" },
+      name: { type: "string" },
+      cwd: { type: "string" },
+      json: { type: "boolean", default: false },
+    },
+  });
+  const ifRev = values["if-rev"] === undefined ? undefined : Number(values["if-rev"]);
+  if (ifRev !== undefined && (!Number.isSafeInteger(ifRev) || ifRev < 0)) {
+    throw new Error("--if-rev must be a non-negative integer");
+  }
+  const client = await connectCli(
+    values.cwd || process.cwd(),
+    values.name || process.env.SWITCHBOARD_NAME || "cli",
+  );
+  try {
+    const frame = await client.request({
+      type: "state",
+      action,
+      key: values.key,
+      value: values.value,
+      prefix: values.prefix,
+      ifRev,
+    });
+    if (frame.type !== "state") throw new Error("unexpected response");
+    if (frame.conflict) {
+      if (values.json) process.stdout.write(`${JSON.stringify(frame)}\n`);
+      else process.stderr.write(`${frame.detail || "state revision conflict"}\n`);
+      process.exitCode = 1;
+      return;
+    }
+    if (values.json) {
+      process.stdout.write(`${JSON.stringify(action === "list" ? frame.entries ?? [] : frame.entry ?? null)}\n`);
+      return;
+    }
+    if (action === "list") {
+      const entries = frame.entries ?? [];
+      if (entries.length === 0) {
+        process.stdout.write("state empty\n");
+        return;
+      }
+      for (const e of entries) {
+        process.stdout.write(`${e.key}\trev=${e.rev}\tupdated_by=${e.updatedBy}\tts=${e.ts}\n${e.value}\n\n`);
+      }
+      return;
+    }
+    if (action === "delete") {
+      process.stdout.write(`${frame.deleted ? `deleted ${values.key}` : `not found ${values.key}`}\n`);
+      return;
+    }
+    if (!frame.entry) {
+      process.stdout.write(`not found ${values.key}\n`);
+      return;
+    }
+    const e = frame.entry;
+    process.stdout.write(`${e.key}\trev=${e.rev}\tupdated_by=${e.updatedBy}\tts=${e.ts}\n${e.value}\n`);
   } finally {
     client.close();
   }
