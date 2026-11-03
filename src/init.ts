@@ -16,11 +16,13 @@ import {
 } from "./accounts.ts";
 import { switchboardHome } from "./paths.ts";
 import { gitRepoRoot, repoKey } from "./repo.ts";
+import type { RatioBinding } from "./types.ts";
 
 export type RepoConfig = {
   repoKey: string;
   repoRoot: string;
   orchestrator: string;
+  ratioProject?: string;
   panes?: string[];
   claude4?: boolean;
   accounts?: string[];
@@ -31,8 +33,8 @@ export function repoConfigPath(key: string, home = switchboardHome()): string {
   return path.join(home, "repos", `${key}.json`);
 }
 
-export function readRepoConfig(cwd: string, home = switchboardHome()): RepoConfig | null {
-  const key = repoKey(cwd);
+export function readRepoConfigByKey(key: string, home = switchboardHome()): RepoConfig | null {
+  if (!key) return null;
   const file = repoConfigPath(key, home);
   if (!existsSync(file)) return null;
   try {
@@ -42,9 +44,13 @@ export function readRepoConfig(cwd: string, home = switchboardHome()): RepoConfi
   }
 }
 
+export function readRepoConfig(cwd: string, home = switchboardHome()): RepoConfig | null {
+  return readRepoConfigByKey(repoKey(cwd), home);
+}
+
 export function writeRepoConfig(
   cwd: string,
-  update: { orchestrator?: string; panes?: string[]; claude4?: boolean; accounts?: string[] },
+  update: { orchestrator?: string; ratioProject?: string; panes?: string[]; claude4?: boolean; accounts?: string[] },
   home = switchboardHome(),
 ): RepoConfig {
   const key = repoKey(cwd);
@@ -54,6 +60,7 @@ export function writeRepoConfig(
     repoKey: key,
     repoRoot: root,
     orchestrator: update.orchestrator ?? existing?.orchestrator ?? "cursor",
+    ratioProject: update.ratioProject ?? existing?.ratioProject,
     panes: update.panes ?? existing?.panes,
     claude4: update.claude4 ?? existing?.claude4,
     accounts: update.accounts ?? existing?.accounts,
@@ -63,6 +70,162 @@ export function writeRepoConfig(
   mkdirSync(dir, { recursive: true });
   writeFileSync(repoConfigPath(key, home), `${JSON.stringify(next, null, 2)}\n`);
   return next;
+}
+
+function extractRatioHeaders(
+  headers: Record<string, unknown> | undefined | null,
+  source: string,
+  defaultProfile?: string | null,
+): RatioBinding | null {
+  if (!headers || typeof headers !== "object") return null;
+  let project: string | null = null;
+  let profile: string | null = defaultProfile ?? null;
+  for (const [k, v] of Object.entries(headers)) {
+    if (typeof v !== "string" || !v.trim()) continue;
+    const lower = k.toLowerCase();
+    if (lower === "x-ratio-project") project = v.trim();
+    else if (lower === "x-ratio-profile" || lower === "x-ratio-subject") profile = v.trim();
+  }
+  if (!project) return null;
+  return { project, profile, source };
+}
+
+function extractRatioFromMcpJson(
+  filePath: string,
+  source: string,
+  defaultProfile?: string | null,
+  projectCwd?: string,
+): RatioBinding | null {
+  if (!existsSync(filePath)) return null;
+  try {
+    const raw = JSON.parse(readFileSync(filePath, "utf8")) as Record<string, any>;
+    if (projectCwd && raw?.projects && typeof raw.projects === "object") {
+      const projEntry = raw.projects[projectCwd]?.mcpServers?.ratio;
+      const fromProj = extractRatioHeaders(projEntry?.headers, `${source}[${path.basename(projectCwd)}]`, defaultProfile);
+      if (fromProj) return fromProj;
+    }
+    const topRatio = raw?.mcpServers?.ratio;
+    return extractRatioHeaders(topRatio?.headers, source, defaultProfile);
+  } catch {
+    return null;
+  }
+}
+
+function extractRatioFromToml(
+  filePath: string,
+  source: string,
+  defaultProfile?: string | null,
+): RatioBinding | null {
+  if (!existsSync(filePath)) return null;
+  try {
+    const txt = readFileSync(filePath, "utf8");
+    const ratioSections = [...txt.matchAll(/\[mcp_servers\.ratio(?:\.[^\]]+)?\]([\s\S]*?)(?=\n\[|$)/g)];
+    if (ratioSections.length === 0) return null;
+    const combined = ratioSections.map((m) => m[1] ?? "").join("\n");
+    const projMatch = /["']?[Xx]-[Rr]atio-[Pp]roject["']?\s*=\s*["']([^"']+)["']/.exec(combined);
+    const profMatch = /["']?[Xx]-[Rr]atio-(?:[Pp]rofile|[Ss]ubject)["']?\s*=\s*["']([^"']+)["']/.exec(combined);
+    if (!projMatch?.[1]?.trim()) {
+      return {
+        project: "unpinned",
+        profile: profMatch?.[1]?.trim() || defaultProfile || null,
+        source: `${source}(no-header)`,
+      };
+    }
+    return {
+      project: projMatch[1].trim(),
+      profile: profMatch?.[1]?.trim() || defaultProfile || null,
+      source,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function discoverRatioBinding(opts: {
+  cwd: string;
+  harness: string;
+  name: string;
+  env?: NodeJS.ProcessEnv;
+  home?: string;
+}): RatioBinding | null {
+  if (!opts.cwd || opts.cwd === "/" || !existsSync(opts.cwd)) return null;
+  const env = opts.env ?? process.env;
+  const envProj = env.SWITCHBOARD_RATIO_PROJECT?.trim() || env.RATIO_PROJECT?.trim();
+  if (envProj) {
+    return {
+      project: envProj,
+      profile: env.SWITCHBOARD_RATIO_PROFILE?.trim() || env.RATIO_PROFILE?.trim() || null,
+      source: "env",
+    };
+  }
+
+  const root = existsSync(path.join(opts.cwd, ".git")) ? opts.cwd : gitRepoRoot(opts.cwd);
+  const claudeProfile = opts.harness === "claude" ? (opts.name !== "claude" ? opts.name : "default") : null;
+
+  // 1. Check repository-local MCP config files in harness precedence order
+  if (opts.harness === "cursor") {
+    const cur = extractRatioFromMcpJson(path.join(root, ".cursor", "mcp.json"), "repo:.cursor/mcp.json");
+    if (cur) return cur;
+  } else if (opts.harness === "codex") {
+    const cdx = extractRatioFromToml(path.join(root, ".codex", "config.toml"), "repo:.codex/config.toml");
+    if (cdx) return cdx;
+  } else if (opts.harness === "grok") {
+    const grk = extractRatioFromMcpJson(path.join(root, ".grok", "mcp.json"), "repo:.grok/mcp.json");
+    if (grk) return grk;
+  } else if (opts.harness === "muse") {
+    const mse = extractRatioFromMcpJson(path.join(root, ".muse", "mcp.json"), "repo:.muse/mcp.json");
+    if (mse) return mse;
+  }
+  const repoMcp = extractRatioFromMcpJson(path.join(root, ".mcp.json"), "repo:.mcp.json", claudeProfile);
+  if (repoMcp) return repoMcp;
+
+  // 2. Check user-level harness MCP config files (isolated in tests when SWITCHBOARD_HOME is set unless home is passed)
+  if (opts.home === undefined && env.SWITCHBOARD_HOME) return null;
+  const userHome = opts.home ?? homedir();
+
+  if (opts.harness === "antigravity") {
+    return extractRatioFromMcpJson(
+      path.join(userHome, ".gemini", "antigravity", "mcp_config.json"),
+      "home:antigravity/mcp_config.json",
+    );
+  }
+  if (opts.harness === "cursor") {
+    return extractRatioFromMcpJson(path.join(userHome, ".cursor", "mcp.json"), "home:.cursor/mcp.json");
+  }
+  if (opts.harness === "codex") {
+    const codexHome = env.CODEX_HOME || path.join(userHome, ".codex");
+    return extractRatioFromToml(path.join(codexHome, "config.toml"), "home:.codex/config.toml");
+  }
+  if (opts.harness === "claude") {
+    if (opts.name && opts.name !== "claude") {
+      const isolatedFile = path.join(userHome, `.claude-${opts.name}`, ".claude.json");
+      const fromIsolated = extractRatioFromMcpJson(isolatedFile, `home:.claude-${opts.name}`, opts.name, root);
+      if (fromIsolated) return fromIsolated;
+    }
+    return extractRatioFromMcpJson(path.join(userHome, ".claude.json"), "home:.claude.json", claudeProfile, root);
+  }
+  if (opts.harness === "grok") {
+    for (const f of ["mcp.json", "settings.json", "user-settings.json"]) {
+      const found = extractRatioFromMcpJson(path.join(userHome, ".grok", f), `home:.grok/${f}`);
+      if (found) return found;
+    }
+    return null;
+  }
+  if (opts.harness === "kimi") {
+    return extractRatioFromMcpJson(path.join(userHome, ".kimi", "mcp.json"), "home:.kimi/mcp.json");
+  }
+  if (opts.harness === "muse") {
+    const fromJson = extractRatioFromMcpJson(path.join(userHome, ".muse", "mcp.json"), "home:.muse/mcp.json");
+    if (fromJson) return fromJson;
+    return extractRatioFromToml(path.join(userHome, ".muse", "config.toml"), "home:.muse/config.toml");
+  }
+  return null;
+}
+
+export function formatRatioBinding(ratio?: RatioBinding | null): string {
+  if (!ratio?.project) return "";
+  const prof = ratio.profile ? `(${ratio.profile})` : "";
+  return `ratio=${ratio.project}${prof}[${ratio.source}]`;
 }
 
 export function resolveOrchestratorName(input: string, fallback = "cursor"): string {
@@ -432,6 +595,28 @@ export const defaultSpawnTerminalTab: SpawnTerminalTab = async (spec) => {
     }
     if (isActiveZellijGridSession(listOut, zSession)) {
       try {
+        const prePids = new Set<number>();
+        try {
+          const preOut = execFileSync("ps", ["eww", "-o", "pid=,command="], {
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "ignore"],
+          });
+          for (const rawLine of preOut.split("\n")) {
+            const m = /^(\d+)\s+(.*)$/.exec(rawLine.trim());
+            if (!m) continue;
+            const pid = Number(m[1]);
+            const line = m[2]!;
+            if (
+              pid > 1 &&
+              line.includes(`ZELLIJ_SESSION_NAME=${zSession}`) &&
+              line.includes(`SWITCHBOARD_NAME=${spec.name}`)
+            ) {
+              prePids.add(pid);
+            }
+          }
+        } catch {
+          // Best-effort snapshot of existing Zellij pane PIDs
+        }
         execFileSync(
           "zellij",
           [
@@ -469,6 +654,32 @@ export const defaultSpawnTerminalTab: SpawnTerminalTab = async (spec) => {
             // Keep polling until deadline
           }
           await new Promise((r) => setTimeout(r, 120));
+        }
+        try {
+          const psPidOut = execFileSync("ps", ["eww", "-o", "pid=,command="], {
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "ignore"],
+          });
+          for (const rawLine of psPidOut.split("\n")) {
+            const m = /^(\d+)\s+(.*)$/.exec(rawLine.trim());
+            if (!m) continue;
+            const pid = Number(m[1]);
+            const line = m[2]!;
+            if (
+              pid > 1 &&
+              !prePids.has(pid) &&
+              line.includes(`ZELLIJ_SESSION_NAME=${zSession}`) &&
+              line.includes(`SWITCHBOARD_NAME=${spec.name}`)
+            ) {
+              try {
+                process.kill(pid, "SIGTERM");
+              } catch {
+                // Ignore if already exited
+              }
+            }
+          }
+        } catch {
+          // Best-effort cleanup of timed-out pane process
         }
         throw new Error(`Timed out waiting for ${spec.name} (${spec.harness}) to start in Zellij session ${zSession}`);
       } catch (err) {

@@ -4,6 +4,8 @@ import { createServer } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import {
   defaultSpawnTerminalTab,
+  discoverRatioBinding,
+  readRepoConfigByKey,
   resolveInvitedAgentSpec,
   resolveOrchestratorName,
   resolveShimCwd,
@@ -12,11 +14,13 @@ import {
 import { gitCheckoutInfo, gitRepoRoot, repoKey } from "./repo.ts";
 import { createPaneProbe, formatDiagnostics, sessionDiagnostics, type PaneProbe } from "./health.ts";
 import { BUILD, buildWarning, runtimeInfo } from "./build.ts";
+import { extractStateRatioProject } from "./status.ts";
 import { Store, inboxCursorKey } from "./store.ts";
 import {
   BODY_MAX,
   NAME_RE,
   PRESENCE_TTL_MS,
+  STATE_KEY_RE,
   TOPIC_RE,
   WAKE_COOLDOWN_MS,
   type BusMessage,
@@ -309,7 +313,28 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     }
   }
 
-  async function diagnostics(agent: AgentRecord, probe: PaneProbe) {
+  function expectedRatioProject(
+    repo: string,
+    rows: AgentRecord[],
+  ): { expected: string | null; splitProjects?: string[] } {
+    const stateEntries = store.listState(repo);
+    const fromState = extractStateRatioProject(stateEntries);
+    if (fromState) return { expected: fromState };
+    const cfg = readRepoConfigByKey(repo);
+    if (cfg?.ratioProject?.trim()) return { expected: cfg.ratioProject.trim() };
+    const onlineWithRatio = rows.filter((r) => r.online && r.ratio?.project && r.ratio.project !== "unpinned");
+    const distinctOnline = [...new Set(onlineWithRatio.map((r) => r.ratio!.project))].sort();
+    if (distinctOnline.length > 1) {
+      return { expected: null, splitProjects: distinctOnline };
+    }
+    return { expected: null };
+  }
+
+  async function diagnostics(
+    agent: AgentRecord,
+    probe: PaneProbe,
+    ratioCheck?: { expected: string | null; splitProjects?: string[] },
+  ) {
     const result = await sessionDiagnostics(agent, probe);
     for (const build of agent.builds ?? []) {
       const warning = buildWarning(BUILD, build);
@@ -318,13 +343,29 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     }
     const unknownBuilds = (agent.connectionCount ?? 0) - (agent.builds?.length ?? 0);
     if (agent.online && unknownBuilds > 0) result.warnings.push(`${unknownBuilds} client connection(s) missing build metadata; reconnect MCP after upgrading`);
+    if (ratioCheck?.expected && agent.ratio?.project && agent.ratio.project !== ratioCheck.expected) {
+      result.warnings.push(
+        `Ratio project mismatch (configured MCP header): agent has X-Ratio-Project=${agent.ratio.project} (${agent.ratio.source}), expected ${ratioCheck.expected}`,
+      );
+    } else if (
+      ratioCheck?.splitProjects &&
+      agent.online &&
+      agent.ratio?.project &&
+      agent.ratio.project !== "unpinned"
+    ) {
+      result.warnings.push(
+        `Ratio project split across online agents (${ratioCheck.splitProjects.join(" vs ")}); set bus_state key="ratio:project" or "contract" ratio_project to pin the board`,
+      );
+    }
     return result;
   }
 
   async function sendWho(conn: Conn, respond: Respond): Promise<void> {
     const probe = options.paneProbe ?? createPaneProbe();
-    const rows = await Promise.all(agents(conn.repo).map(async (agent) => ({
-      ...agent, diagnostics: await diagnostics(agent, probe),
+    const baseRows = agents(conn.repo);
+    const ratioCheck = expectedRatioProject(conn.repo, baseRows);
+    const rows = await Promise.all(baseRows.map(async (agent) => ({
+      ...agent, diagnostics: await diagnostics(agent, probe, ratioCheck),
     })));
     respond({ type: "who", agents: rows, daemon: daemonInfo });
   }
@@ -334,12 +375,17 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       ? [...new Set([...store.listRepos(), ...[...conns].filter((peer) => peer.authed).map((peer) => peer.repo)])].sort()
       : [conn.repo];
     const probe = options.paneProbe ?? createPaneProbe();
-    const candidates = repos.flatMap((repo) => agents(repo, { includeAllOffline: true })).map((agent) => ({
+    const ratioByRepo = new Map<string, { expected: string | null; splitProjects?: string[] }>();
+    const candidates = repos.flatMap((repo) => {
+      const repoAgents = agents(repo, { includeAllOffline: true });
+      ratioByRepo.set(repo, expectedRatioProject(repo, repoAgents));
+      return repoAgents;
+    }).map((agent) => ({
       agent,
       stored: store.getAgent(agent.repo, agent.sessionId || agent.name),
     }));
     const rows = await Promise.all(candidates.map(async ({ agent }) => ({
-      ...agent, diagnostics: await diagnostics(agent, probe),
+      ...agent, diagnostics: await diagnostics(agent, probe, ratioByRepo.get(agent.repo)),
     })));
     const pruned: PrunedAgent[] = [];
     if (frame.prune) {
@@ -384,6 +430,15 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     const row = rows.find((row) => row.name === conn.name && row.sessionId === conn.sessionId)
       ?? rows.find((row) => row.name === conn.name);
     const detail = row && !frame.pending ? formatDiagnostics(await sessionDiagnostics(row, options.paneProbe ?? createPaneProbe())) : "";
+    const boardState = store
+      .listState(conn.repo)
+      .filter(
+        (e) =>
+          e.key === "contract" ||
+          e.key === "ratio:project" ||
+          e.key.startsWith("verdict:") ||
+          e.key.startsWith("verdict/"),
+      );
     respond({
       type: "ok",
       daemon: daemonInfo,
@@ -392,6 +447,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         conn.role === "orchestrator" || conn.harness === "cli" ? undefined : conn.name),
       agent_metrics: store.agentMetrics(conn.repo,
         conn.role === "orchestrator" || conn.harness === "cli" ? undefined : conn.name),
+      board_state: boardState,
     });
   }
 
@@ -687,6 +743,31 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       const priorAsk = store.byCorrelation(conn.repo, supersedes);
       if (!priorAsk) throw new Error("no ask with that supersedes correlation id");
     }
+    const bodyRatioMatch = /(?:X-Ratio-Project|ratio_project)\s*[=:]\s*["']?(p-[a-z0-9_-]+)["']?/i.exec(body);
+    const boardExpectedRatio =
+      bodyRatioMatch?.[1] ??
+      extractStateRatioProject(store.listState(conn.repo)) ??
+      readRepoConfigByKey(conn.repo)?.ratioProject?.trim() ??
+      null;
+    if (boardExpectedRatio) {
+      const target = describeTarget(conn.repo, to);
+      if (target) {
+        const targetRatio = discoverRatioBinding({
+          cwd: target.cwd,
+          harness: target.harness,
+          name: target.name,
+        });
+        if (
+          targetRatio?.project &&
+          targetRatio.project !== "unpinned" &&
+          targetRatio.project !== boardExpectedRatio
+        ) {
+          throw new Error(
+            `cannot ask ${target.name}: Ratio project mismatch (${target.name} has X-Ratio-Project=${targetRatio.project} in ${targetRatio.source}, but this board/ask requires ${boardExpectedRatio})`,
+          );
+        }
+      }
+    }
     await publish(
       conn,
       { topic: topic || "dm", body, to, id: randomUUID() },
@@ -772,7 +853,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       return;
     }
     if (!frame.key) throw new Error("state key required");
-    requireTopic(frame.key);
+    requireStateKey(frame.key);
     if (action === "get") {
       const entry = store.getState(conn.repo, frame.key) ?? null;
       respond({ type: "state", action: "get", entry });
@@ -1385,6 +1466,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         connectionCount: counted.length,
         connectionIds: counted.map((member) => member.agentId),
         builds: counted.flatMap((member) => (member.build ? [member.build] : [])),
+        ratio: discoverRatioBinding({ cwd: conn.cwd, harness: conn.harness, name: conn.name }),
       };
     });
     const includeAllOffline = Boolean(opts?.includeAllOffline);
@@ -1408,6 +1490,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         wakeSessionId: row.sessionId || row.wakeSessionId || null,
         connectionCount: 0,
         role: row.name === orchestrator ? "orchestrator" : "worker",
+        ratio: discoverRatioBinding({ cwd: row.cwd, harness: row.harness, name: row.name }),
       });
     }
     rows.sort((a, b) => a.name.localeCompare(b.name) || (a.sessionId ?? "").localeCompare(b.sessionId ?? ""));
@@ -1462,6 +1545,10 @@ function looksLikeSessionTarget(to: string): boolean {
 
 function requireTopic(topic: string): void {
   if (typeof topic !== "string" || !TOPIC_RE.test(topic)) throw new Error(`bad topic: ${topic}`);
+}
+
+function requireStateKey(key: string): void {
+  if (typeof key !== "string" || !STATE_KEY_RE.test(key)) throw new Error(`bad state key: ${key}`);
 }
 
 function requireName(name: string): void {

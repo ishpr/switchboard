@@ -2,6 +2,7 @@
 
 export const PROTOCOL_VERSION = 2;
 export const TOPIC_RE = /^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,127}$/;
+export const STATE_KEY_RE = /^[a-zA-Z0-9][a-zA-Z0-9._/:-]{0,127}$/;
 export const NAME_RE = /^[a-zA-Z0-9%][a-zA-Z0-9._:%-]{0,63}$/;
 export const BODY_MAX = 32 * 1024;
 export const DEFAULT_PORT = 8787;
@@ -67,12 +68,19 @@ export type BuildInfo = {
 };
 export type RuntimeInfo = BuildInfo & { pid: number; started_at: number };
 
+export type RatioBinding = {
+  project: string;
+  profile?: string | null;
+  source: string;
+};
+
 export type AgentRecord = {
   connectionCount?: number;
   connectionIds?: string[];
   wakeSessionId?: string | null;
   builds?: BuildInfo[];
   diagnostics?: SessionDiagnostics;
+  ratio?: RatioBinding | null;
   repo: string;
   name: string;
   harness: string;
@@ -199,7 +207,7 @@ export type ServerFrame = (
       orchestrator: string | null;
     }
   | { type: "published"; id: string; seq: number; wake: WakeInfo; correlationId?: string | null }
-  | { type: "ok"; detail: string; pending_asks?: PendingAsk[]; agent_metrics?: AgentMetrics[]; daemon?: RuntimeInfo }
+  | { type: "ok"; detail: string; pending_asks?: PendingAsk[]; agent_metrics?: AgentMetrics[]; board_state?: StateEntry[]; daemon?: RuntimeInfo }
   | { type: "message"; message: BusMessage }
   | { type: "inbox"; messages: BusMessage[]; cursor: number; more: boolean; pendingAsk?: BusMessage | null }
   | { type: "who"; agents: AgentRecord[]; daemon?: RuntimeInfo }

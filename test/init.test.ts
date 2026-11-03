@@ -12,6 +12,8 @@ import {
 import {
   chosenIds,
   claudeAccountPanes,
+  discoverRatioBinding,
+  formatRatioBinding,
   gridPlan,
   gridSessionName,
   harnessPanes,
@@ -303,4 +305,93 @@ test("per-repo gridSessionName isolates concurrent project Zellij grids and reso
     ),
     `zellij:${sB}:4`,
   );
+});
+
+test("discoverRatioBinding resolves repo-local and home-level Ratio project/profile across harnesses", () => {
+  const fakeHome = mkdtempSync(path.join(tmpdir(), "switchboard-ratio-home-"));
+  const repoDir = mkdtempSync(path.join(tmpdir(), "switchboard-ratio-repo-"));
+  execFileSync("git", ["init"], { cwd: repoDir, stdio: "ignore" });
+
+  // 1. User-level configs: Cursor -> p-serveone, Codex -> p-ratio, isolated Claude 'pi' -> p-dunkbot
+  mkdirSync(path.join(fakeHome, ".cursor"), { recursive: true });
+  writeFileSync(
+    path.join(fakeHome, ".cursor", "mcp.json"),
+    JSON.stringify({
+      mcpServers: {
+        ratio: { url: "https://ratio.servsys.com", headers: { "X-Ratio-Project": "p-serveone" } },
+      },
+    }),
+  );
+
+  mkdirSync(path.join(fakeHome, ".codex"), { recursive: true });
+  writeFileSync(
+    path.join(fakeHome, ".codex", "config.toml"),
+    `[mcp_servers.ratio]\nurl = "https://ratio.servsys.com/"\nhttp_headers = { "X-Ratio-Project" = "p-ratio" }\n`,
+  );
+
+  mkdirSync(path.join(fakeHome, ".claude-pi"), { recursive: true });
+  writeFileSync(
+    path.join(fakeHome, ".claude-pi", ".claude.json"),
+    JSON.stringify({
+      mcpServers: {
+        ratio: { url: "https://ratio.servsys.com", headers: { "X-Ratio-Project": "p-dunkbot" } },
+      },
+    }),
+  );
+
+  const curGlobal = discoverRatioBinding({ cwd: repoDir, harness: "cursor", name: "cursor", env: {}, home: fakeHome });
+  assert.deepEqual(curGlobal, { project: "p-serveone", profile: null, source: "home:.cursor/mcp.json" });
+  assert.equal(formatRatioBinding(curGlobal), "ratio=p-serveone[home:.cursor/mcp.json]");
+
+  const cdxGlobal = discoverRatioBinding({
+    cwd: repoDir,
+    harness: "codex",
+    name: "codex",
+    env: { CODEX_HOME: path.join(fakeHome, ".codex") },
+    home: fakeHome,
+  });
+  assert.deepEqual(cdxGlobal, { project: "p-ratio", profile: null, source: "home:.codex/config.toml" });
+
+  // Subtable [mcp_servers.ratio.http_headers] and unpinned [mcp_servers.ratio] shapes
+  writeFileSync(
+    path.join(fakeHome, ".codex", "config.toml"),
+    `[mcp_servers.ratio]\nurl = "https://ratio.servsys.com/"\n\n[mcp_servers.ratio.http_headers]\n"X-Ratio-Project" = "p-subtable"\n`,
+  );
+  const cdxSubtable = discoverRatioBinding({
+    cwd: repoDir,
+    harness: "codex",
+    name: "codex",
+    env: { CODEX_HOME: path.join(fakeHome, ".codex") },
+    home: fakeHome,
+  });
+  assert.deepEqual(cdxSubtable, { project: "p-subtable", profile: null, source: "home:.codex/config.toml" });
+
+  writeFileSync(
+    path.join(fakeHome, ".codex", "config.toml"),
+    `[mcp_servers.ratio]\nurl = "https://ratio.servsys.com/"\n`,
+  );
+  const cdxUnpinned = discoverRatioBinding({
+    cwd: repoDir,
+    harness: "codex",
+    name: "codex",
+    env: { CODEX_HOME: path.join(fakeHome, ".codex") },
+    home: fakeHome,
+  });
+  assert.deepEqual(cdxUnpinned, { project: "unpinned", profile: null, source: "home:.codex/config.toml(no-header)" });
+
+  const piGlobal = discoverRatioBinding({ cwd: repoDir, harness: "claude", name: "pi", env: {}, home: fakeHome });
+  assert.deepEqual(piGlobal, { project: "p-dunkbot", profile: "pi", source: "home:.claude-pi" });
+  assert.equal(formatRatioBinding(piGlobal), "ratio=p-dunkbot(pi)[home:.claude-pi]");
+
+  // 2. Repo-local .mcp.json overrides global config
+  writeFileSync(
+    path.join(repoDir, ".mcp.json"),
+    JSON.stringify({
+      mcpServers: {
+        ratio: { url: "https://ratio.servsys.com", headers: { "X-Ratio-Project": "p-repo-local" } },
+      },
+    }),
+  );
+  const curLocal = discoverRatioBinding({ cwd: repoDir, harness: "cursor", name: "cursor", env: {}, home: fakeHome });
+  assert.deepEqual(curLocal, { project: "p-repo-local", profile: null, source: "repo:.mcp.json" });
 });
