@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import WebSocket from "ws";
-import { BUILD, loadBuild } from "./build.ts";
+import { BUILD } from "./build.ts";
 import type { BuildInfo, ClientFrame, ClientHello, ServerFrame } from "./types.ts";
 
 type Waiter = { socket: WebSocket; done: (frame: ServerFrame) => void; fail: (err: Error) => void };
@@ -18,6 +18,7 @@ export class BusClient {
   private closed = false;
   private reconnecting: Promise<void> | null = null;
   endpointResolver: (() => Promise<{ url: string; token: string }>) | null = null;
+  reloadOnReconnect: (() => Promise<BuildInfo | undefined>) | null = null;
   onMessage: ((frame: Extract<ServerFrame, { type: "message" }>) => void) | null = null;
 
   constructor(options: { requestTimeoutMs?: number } = {}) {
@@ -28,7 +29,7 @@ export class BusClient {
     this.closed = false;
     this.lastUrl = url;
     this.customBuild = hello.build;
-    this.lastHello = { ...hello, build: hello.build ?? loadBuild() ?? BUILD };
+    this.lastHello = { ...hello, build: hello.build ?? BUILD };
     return this.openSocket(url, this.lastHello);
   }
 
@@ -90,8 +91,13 @@ export class BusClient {
       this.reconnecting = (async () => {
         const target = this.endpointResolver ? await this.endpointResolver() : { url: this.lastUrl!, token: this.lastHello!.token };
         if (this.closed) throw new Error("client closed");
+        const reloadedBuild = this.reloadOnReconnect ? await this.reloadOnReconnect().catch(() => undefined) : undefined;
         this.lastUrl = target.url;
-        this.lastHello = { ...this.lastHello!, token: target.token, build: this.customBuild ?? loadBuild() };
+        this.lastHello = {
+          ...this.lastHello!,
+          token: target.token,
+          build: this.customBuild ?? reloadedBuild ?? this.lastHello!.build ?? BUILD,
+        };
         await this.openSocket(this.lastUrl, this.lastHello);
       })().finally(() => { this.reconnecting = null; });
     }

@@ -304,7 +304,8 @@ export async function runShim(): Promise<void> {
   }, HEARTBEAT_MS);
   heartbeat.unref?.();
 
-  registerTools(mcp, bus, welcome.role, {
+  let activeBuild = BUILD;
+  const toolContext = {
     home,
     name,
     harness,
@@ -313,17 +314,39 @@ export async function runShim(): Promise<void> {
     orchestrator: welcome.orchestrator,
     sessionId,
     wakeSessionId,
-    subscribeWake: (wake) => {
+    subscribeWake: (wake: () => void) => {
       waitListeners.add(wake);
       return () => waitListeners.delete(wake);
     },
-  });
+  };
+
+  registerTools(mcp, bus, welcome.role, toolContext);
+
+  bus.reloadOnReconnect = async () => {
+    const diskBuild = loadBuild();
+    if (!mcp) return activeBuild;
+    if (diskBuild.commit_sha && diskBuild.commit_sha !== activeBuild.commit_sha) {
+      const freshModule = (await import(`${import.meta.url}?v=${diskBuild.commit_sha}_${Date.now()}`)) as {
+        registerTools?: typeof registerTools;
+      };
+      if (typeof freshModule.registerTools === "function") {
+        const regMap = (mcp as unknown as { _registeredTools?: Record<string, unknown> })._registeredTools;
+        if (regMap) {
+          for (const key of Object.keys(regMap)) delete regMap[key];
+        }
+        freshModule.registerTools(mcp, bus, welcome.role, toolContext);
+        mcp.sendToolListChanged();
+        activeBuild = diskBuild;
+      }
+    }
+    return activeBuild;
+  };
 
   const transport = new StdioServerTransport();
   await mcp.connect(transport);
 }
 
-function registerTools(mcp: McpServer, bus: BusClient, role: Role,
+export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
   context: {
     home: string;
     name: string;
