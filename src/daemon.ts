@@ -3,6 +3,7 @@ import { createServer } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import { resolveShimCwd } from "./init.ts";
 import { repoKey } from "./repo.ts";
+import { createPaneProbe, formatDiagnostics, sessionDiagnostics, type PaneProbe } from "./health.ts";
 import { Store } from "./store.ts";
 import {
   BODY_MAX,
@@ -27,6 +28,7 @@ export type DaemonOptions = {
   logFile?: string;
   presenceTtlMs?: number;
   sweepMs?: number;
+  paneProbe?: PaneProbe;
 };
 
 export type DaemonHandle = {
@@ -183,7 +185,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         send(conn.socket, { type: "ok", detail: "acked" });
         break;
       case "who":
-        send(conn.socket, { type: "who", agents: agents(conn.repo) });
+        void sendWho(conn);
         break;
       case "ask":
         void ask(conn, frame.to, frame.body, frame.topic);
@@ -197,7 +199,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       case "status":
         conn.status = frame.status;
         store.touchAgent(conn.repo, conn.name, frame.status);
-        send(conn.socket, { type: "ok", detail: "status updated" });
+        void sendStatus(conn);
         break;
       case "orchestrator":
         setOrchestrator(conn, frame.name);
@@ -211,6 +213,23 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       default:
         send(conn.socket, { type: "error", error: "unknown frame" });
     }
+  }
+
+  async function sendWho(conn: Conn): Promise<void> {
+    const probe = options.paneProbe ?? createPaneProbe();
+    const rows = await Promise.all(agents(conn.repo).map(async (agent) => ({
+      ...agent, diagnostics: await sessionDiagnostics(agent, probe),
+    })));
+    send(conn.socket, { type: "who", agents: rows });
+  }
+
+  async function sendStatus(conn: Conn): Promise<void> {
+    // A CLI status update must diagnose the registered/live agent, not its ephemeral CLI socket.
+    const rows = agents(conn.repo);
+    const row = rows.find((row) => row.name === conn.name && row.sessionId === conn.sessionId)
+      ?? rows.find((row) => row.name === conn.name);
+    const detail = row ? formatDiagnostics(await sessionDiagnostics(row, options.paneProbe ?? createPaneProbe())) : "";
+    send(conn.socket, { type: "ok", detail: `status updated${detail ? `; ${detail}` : ""}` });
   }
 
   function hello(conn: Conn, frame: Extract<ClientFrame, { type: "hello" }>): void {

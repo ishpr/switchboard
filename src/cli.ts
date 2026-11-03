@@ -13,6 +13,7 @@ import {
   runClaudePane,
   writeSavedAccounts,
 } from "./accounts.ts";
+import { createPaneProbe, formatDiagnostics, sessionDiagnostics } from "./health.ts";
 import { BusClient } from "./busClient.ts";
 import { startDaemon } from "./daemon.ts";
 import { ensureDaemon, readDaemonInfo } from "./ensure.ts";
@@ -34,6 +35,9 @@ try {
       break;
     case "mcp":
       await runShim();
+      break;
+    case "doctor":
+      await who(true);
       break;
     case "who":
       await who();
@@ -129,6 +133,7 @@ function usage(): void {
 
   serve                 Start the localhost daemon
   mcp                   Stdio MCP shim (what harnesses spawn)
+  doctor                Diagnose stale sessions, dead tmux/Zellij panes and wake policies
   who                   List agents in this repo
   publish               Publish a message
   inbox                 Print messages since your cursor
@@ -268,7 +273,7 @@ async function serve(): Promise<void> {
   await new Promise(() => {});
 }
 
-async function who(): Promise<void> {
+async function who(doctor = false): Promise<void> {
   const { values } = parseArgs({
     args: process.argv.slice(3),
     options: {
@@ -280,6 +285,14 @@ async function who(): Promise<void> {
   try {
     const frame = await client.request({ type: "who" });
     if (frame.type !== "who") throw new Error("unexpected response");
+    // A newer CLI can diagnose records returned by an already-running older daemon.
+    if (doctor) {
+      const probe = createPaneProbe();
+      await Promise.all(frame.agents.map(async (agent) => {
+        agent.diagnostics ??= await sessionDiagnostics(agent, probe);
+      }));
+    }
+    if (doctor && frame.agents.some((agent) => agent.diagnostics?.warnings.length)) process.exitCode = 1;
     if (values.json) {
       process.stdout.write(`${JSON.stringify(frame.agents)}\n`);
       return;
@@ -293,7 +306,7 @@ async function who(): Promise<void> {
       const wake = agent.wake ? "wake" : "no-wake";
       const session = agent.sessionId ? ` session=${agent.sessionId}` : "";
       process.stdout.write(
-        `${agent.name}\t${agent.harness}\t${state}\t${wake}${session}\t${agent.role}\t${agent.status}\n`,
+        `${agent.name}\t${agent.harness}\t${state}\t${wake}${session}\t${agent.role}\t${agent.status}\t${formatDiagnostics(agent.diagnostics)}\n`,
       );
     }
   } finally {
