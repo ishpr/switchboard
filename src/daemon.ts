@@ -308,7 +308,9 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
   }
 
   function clientKey(conn: Conn): string {
-    return conn.declaredSession ? `${conn.name}:${conn.declaredSession}` : conn.name;
+    return conn.declaredSession && !conn.declaredSession.startsWith("zellij:")
+      ? `${conn.name}:${conn.declaredSession}`
+      : conn.name;
   }
 
   async function publish(
