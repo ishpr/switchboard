@@ -80,7 +80,7 @@ If you want the CLIs in one terminal, install [Zellij](https://zellij.dev/) and 
 3. Which agent is the orchestrator for this repository (defaults to the repo's saved orchestrator or `cursor`).
 
 A number such as `4` opens that many isolated Claude panes. Names such as `pi,eg`, `id:email:plan` specs, or the 1-based numbers from the discovered list `init` prints (such as `1 3`) open those accounts. `all` opens every account it discovered. Each isolated account automatically gets:
-- its own `~/.claude-<id>` config directory with shared settings, skills, agents, and hooks symlinked from `~/.claude`
+- its own `~/.claude-<id>` config directory, with `settings.json`, `CLAUDE.md`, skills, agents, hooks, and `statusline-command.sh` symlinked from `~/.claude`
 - the `switchboard` MCP server registered in `~/.claude-<id>/.claude.json` with `SWITCHBOARD_NAME=<id>` and `SWITCHBOARD_SCOPE=share`
 - an isolated git worktree at `~/claude-ws/<id>/<repo>` on branch `ws/<id>`
 - its own Zellij pane running `switchboard claude-pane`
@@ -192,9 +192,9 @@ The prompt tells the headless process to answer with `bus_reply` and stop. It do
 
 | Program | What you get |
 | --- | --- |
-| Any CLI in Zellij | When started inside a Zellij pane, the shim binds `zellij:<session>:<pane>` automatically. Directed wakes inject into the pane via `zellij action write-chars`. |
+| Any CLI in Zellij | When started inside a Zellij pane, the shim binds `zellij:<session>:<pane>` automatically. Directed wakes type into that pane with `zellij action write-chars` and then Enter. |
 | Claude Code | Tools always. Isolated accounts (`~/.claude-<id>`) connect under their own `SWITCHBOARD_NAME` and wake headless with `CLAUDE_CONFIG_DIR=~/.claude-<id>`. A session started with `--dangerously-load-development-channels server:switchboard` also gets `notifications/claude/channel`. `UserPromptSubmit` / `PostToolUse` hooks attach unread mail during a turn (skipping subagents). |
-| Antigravity (`agy`) | Tools always. `switchboard init` registers the `switchboard` MCP server on `agy`. Desktop GUI connections started with `cwd="/"` automatically resolve to the active configured repository. |
+| Antigravity (`agy`) | Tools always. `switchboard init` registers the `switchboard` MCP server on `agy`. |
 | Codex CLI | Tools always. A bound thread receives `codex queue --thread <id> --resume`. Offline wake is `codex exec`. The binary is often inside ChatGPT.app rather than on `PATH`. |
 | Codex desktop | Same `~/.codex` as the CLI. `codex queue` reaches a desktop thread when that thread id is bound. The desktop app is not a separate bus. |
 | cursor-agent | Tools always. Offline wake is `cursor-agent -p`. A `postToolUse` hook can attach `additional_context` during a turn. |
@@ -206,6 +206,8 @@ The prompt tells the headless process to answer with `bus_reply` and stop. It do
 | muse | Tools always. A bound session receives `muse session-message send`. Offline wake is `muse exec`. `session-message` is the Muse inject command only. It is not the bus to the other CLIs. |
 | Muse.app | Do not assume the desktop app shares a CLI session. Bind a session id before expecting inject. |
 | Claude.app | The desktop chat. `claude -p` starts Claude Code, not that chat. |
+
+A desktop app that starts the shim with `cwd="/"` (Antigravity.app and ChatGPT.app) is bound to `SWITCHBOARD_CWD` when that is set, otherwise to the most recently configured repository in `~/.switchboard/repos/`.
 
 `notifications/message` is not a wake. The shim emits `notifications/claude/channel` only when `SWITCHBOARD_HARNESS=claude`. Codex has dropped sessions on an unknown notification method.
 
