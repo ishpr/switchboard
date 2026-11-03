@@ -56,6 +56,15 @@ export type PendingAsk = {
   preview: string;
 };
 
+export type AgentMetrics = {
+  agent: string;
+  asks_received: number;
+  replies_sent: number;
+  pending_asks_count: number;
+  avg_reply_latency_seconds: number | null;
+  last_reply_at: number | null;
+};
+
 export type PrunedAgent = {
   repo: string;
   name: string;
@@ -113,7 +122,7 @@ export type ServerFrame =
       orchestrator: string | null;
     }
   | { type: "published"; id: string; seq: number; wake: WakeInfo; correlationId?: string | null }
-  | { type: "ok"; detail: string; pending_asks?: PendingAsk[] }
+  | { type: "ok"; detail: string; pending_asks?: PendingAsk[]; agent_metrics?: AgentMetrics[] }
   | { type: "message"; message: BusMessage }
   | { type: "inbox"; messages: BusMessage[]; cursor: number; more: boolean; pendingAsk?: BusMessage | null }
   | { type: "who"; agents: AgentRecord[] }

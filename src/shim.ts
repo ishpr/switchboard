@@ -4,14 +4,16 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { inferClaudeAgentName } from "./accounts.ts";
 import { formatDiagnostics } from "./health.ts";
-import { formatPendingAsks } from "./status.ts";
+import { formatAgentMetrics, formatPendingAsks } from "./status.ts";
 import { BusClient } from "./busClient.ts";
 import { ensureDaemon } from "./ensure.ts";
 import { resolveShimCwd } from "./init.ts";
-import { switchboardHome } from "./paths.ts";
+import { Store } from "./store.ts";
+import { formatWaitResult, waitForMessages } from "./wait.ts";
+import { dbPath, switchboardHome } from "./paths.ts";
 import { repoKey } from "./repo.ts";
 import { readToken } from "./token.ts";
-import { HEARTBEAT_MS, type BusMessage, type Role } from "./types.ts";
+import { HEARTBEAT_MS, NAME_RE, type BusMessage, type Role } from "./types.ts";
 import { formatMessage } from "./hook.ts";
 
 export function parseZellijSessionFromPs(output: string): { ppid: number; session: string | null } {
@@ -153,13 +155,14 @@ export async function runShim(): Promise<void> {
   }, HEARTBEAT_MS);
   heartbeat.unref?.();
 
-  registerTools(mcp, bus, welcome.role);
+  registerTools(mcp, bus, welcome.role, { home, name, repo: welcome.repoKey, sessionId });
 
   const transport = new StdioServerTransport();
   await mcp.connect(transport);
 }
 
-function registerTools(mcp: McpServer, bus: BusClient, role: Role): void {
+function registerTools(mcp: McpServer, bus: BusClient, role: Role,
+  context: { home: string; name: string; repo: string; sessionId?: string }): void {
   mcp.registerTool(
     "bus_publish",
     {
@@ -307,9 +310,42 @@ function registerTools(mcp: McpServer, bus: BusClient, role: Role): void {
   );
 
   mcp.registerTool(
+    "bus_wait",
+    {
+      description: "Wait without consuming inbox messages. Defaults to your own session inbox; orchestrators may monitor another recipient by name. Broadcasts also match. Timeout defaults to 30 seconds (1..120); set the MCP client timeout above the requested wait. Use bus_inbox after a wake to consume mail.",
+      annotations: { readOnlyHint: true, idempotentHint: true },
+      inputSchema: {
+        to: z.string().regex(NAME_RE).or(z.literal("*")).optional(),
+        timeout_seconds: z.number().int().min(1).max(120).default(30),
+        interval_ms: z.number().int().min(1).max(60_000).default(1500),
+        since_seq: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
+        wake_existing: z.boolean().optional(),
+      },
+    },
+    async ({ to, timeout_seconds, interval_ms, since_seq, wake_existing }, extra) => {
+      const recipient = to ?? context.name;
+      const store = new Store(dbPath(context.home));
+      try {
+        if (recipient !== context.name && recipient !== "*" && store.getOrchestrator(context.repo) !== context.name) {
+          return { ...text("Only the orchestrator can wait on another agent's inbox."), isError: true };
+        }
+        const ownSession = recipient === context.name ? context.sessionId : undefined;
+        const cursorKey = ownSession && !ownSession.startsWith("zellij:") ? `${recipient}:${ownSession}` : recipient;
+        const result = await waitForMessages(store, {
+          repo: context.repo, to: recipient, timeoutMs: timeout_seconds * 1000, intervalMs: interval_ms,
+          sinceSeq: since_seq, wakeExisting: wake_existing, cursorKey, signal: extra.signal,
+        });
+        return { ...text(formatWaitResult(result)), structuredContent: { ...result } };
+      } finally {
+        store.close();
+      }
+    },
+  );
+
+  mcp.registerTool(
     "bus_status",
     {
-      description: "Show workspace status and the most recent unanswered asks with reply correlation IDs. Optionally set this agent's status (shown by bus_who). pending filters out session diagnostics; limit defaults to 50 (max 200).",
+      description: "Show workspace status, per-agent orchestration metrics, and the most recent unanswered asks with reply correlation IDs. Optionally set this agent's status (shown by bus_who). pending filters out session diagnostics and metrics; limit defaults to 50 (max 200).",
       inputSchema: {
         status: z.string().optional(),
         pending: z.boolean().optional(),
@@ -320,8 +356,8 @@ function registerTools(mcp: McpServer, bus: BusClient, role: Role): void {
       const frame = await bus.request({ type: "status", status, pending, limit });
       if (frame.type !== "ok" || !frame.pending_asks) return text("pending-ask tracking unavailable; restart the daemon after upgrading");
       return {
-        ...text(`${pending ? "" : `${frame.detail}\n`}${formatPendingAsks(frame.pending_asks)}`),
-        structuredContent: { ...(pending ? {} : { detail: frame.detail }), pending_asks: frame.pending_asks },
+        ...text(`${pending ? "" : `${frame.detail}\n`}${formatPendingAsks(frame.pending_asks)}${pending ? "" : `\n${formatAgentMetrics(frame.agent_metrics ?? [])}`}`),
+        structuredContent: { ...(pending ? {} : { detail: frame.detail, agent_metrics: frame.agent_metrics ?? [] }), pending_asks: frame.pending_asks },
       };
     },
   );

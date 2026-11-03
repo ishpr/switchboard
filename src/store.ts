@@ -1,5 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
-import type { AgentRecord, BusMessage, Kind, PendingAsk } from "./types.ts";
+import type { AgentRecord, BusMessage, Kind, PendingAsk, AgentMetrics } from "./types.ts";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS messages (
@@ -176,6 +176,46 @@ export class Store {
       age_seconds: Math.max(0, Math.floor((now - row.ts) / 1000)),
       preview: row.body.replace(/\s+/g, " ").trim().slice(0, 160),
     }));
+  }
+
+  /** Cumulative board telemetry; first recipient reply per ask determines latency. */
+  agentMetrics(repo: string, participant?: string): AgentMetrics[] {
+    const rows = this.db.prepare(
+      `WITH names AS (
+         SELECT name AS agent FROM agents WHERE repo = ?
+         UNION SELECT from_name FROM messages WHERE repo = ? AND kind IN ('ask', 'reply')
+         UNION SELECT to_name FROM messages WHERE repo = ? AND kind IN ('ask', 'reply')
+           AND to_name IS NOT NULL AND to_name != '*'
+       ), asks AS (
+         SELECT to_name AS agent, COUNT(*) AS received,
+           SUM(CASE WHEN a.correlation_id IS NOT NULL AND NOT EXISTS (
+             SELECT 1 FROM messages r WHERE r.repo = a.repo AND r.kind = 'reply'
+               AND r.correlation_id = a.correlation_id
+           ) THEN 1 ELSE 0 END) AS pending
+         FROM messages a WHERE repo = ? AND kind = 'ask' AND to_name IS NOT NULL AND to_name != '*'
+         GROUP BY to_name
+       ), replies AS (
+         SELECT from_name AS agent, COUNT(*) AS sent, MAX(ts) AS last_reply
+         FROM messages WHERE repo = ? AND kind = 'reply' GROUP BY from_name
+       ), latency AS (
+         SELECT a.to_name AS agent, AVG(MAX(0, (
+           SELECT r.ts FROM messages r WHERE r.repo = a.repo AND r.kind = 'reply'
+             AND r.correlation_id = a.correlation_id AND r.from_name = a.to_name AND r.seq > a.seq
+           ORDER BY r.seq LIMIT 1
+         ) - a.ts) / 1000.0) AS avg_latency
+         FROM messages a WHERE a.repo = ? AND a.kind = 'ask' AND a.correlation_id IS NOT NULL
+           AND a.to_name IS NOT NULL AND a.to_name != '*' GROUP BY a.to_name
+       )
+       SELECT names.agent,
+         COALESCE(asks.received, 0) AS asks_received,
+         COALESCE(replies.sent, 0) AS replies_sent,
+         COALESCE(asks.pending, 0) AS pending_asks_count,
+         latency.avg_latency AS avg_reply_latency_seconds,
+         replies.last_reply AS last_reply_at
+       FROM names LEFT JOIN asks USING (agent) LEFT JOIN replies USING (agent) LEFT JOIN latency USING (agent)
+       WHERE (? IS NULL OR names.agent = ?) ORDER BY names.agent`,
+    ).all(repo, repo, repo, repo, repo, repo, participant ?? null, participant ?? null) as AgentMetrics[];
+    return rows.map((row) => ({ ...row }));
   }
 
   unansweredAsk(
