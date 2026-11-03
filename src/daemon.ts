@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { createServer } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import { resolveShimCwd } from "./init.ts";
-import { gitCheckoutInfo, repoKey } from "./repo.ts";
+import { gitCheckoutInfo, gitRepoRoot, repoKey } from "./repo.ts";
 import { createPaneProbe, formatDiagnostics, sessionDiagnostics, type PaneProbe } from "./health.ts";
 import { BUILD, buildWarning, runtimeInfo } from "./build.ts";
 import { Store, inboxCursorKey } from "./store.ts";
@@ -22,7 +23,7 @@ import {
   type WakeInfo,
   type PrunedAgent,
 } from "./types.ts";
-import { decideWake, isCodexTurnInProgress, launchFor, logWake, type SpawnWake } from "./wake.ts";
+import { TTY_RE, UUID_RE, decideWake, isCodexTurnInProgress, launchFor, logWake, type SpawnWake } from "./wake.ts";
 
 export type DaemonOptions = {
   /** Use port 0 in tests to take a free port. */
@@ -204,6 +205,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         await publish(conn, frame, respond);
         break;
       case "subscribe": {
+        requireBoundRepo(conn);
         for (const topic of frame.topics) requireTopic(topic);
         const sinceSeq = store.maxSeq(conn.repo);
         store.subscribe(conn.repo, subscriptionKey(conn), frame.topics, sinceSeq);
@@ -221,6 +223,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         break;
       }
       case "unsubscribe": {
+        requireBoundRepo(conn);
         for (const topic of frame.topics) requireTopic(topic);
         const removable = frame.topics.filter((topic) => topic !== "repo" && topic !== "presence");
         store.unsubscribe(conn.repo, subscriptionKey(conn), removable);
@@ -240,9 +243,10 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         break;
       }
       case "inbox":
-        inbox(conn, frame.since, frame.topic, frame.limit, respond);
+        inbox(conn, frame.since, frame.topic, frame.limit, frame.ack, respond);
         break;
       case "ack":
+        requireBoundRepo(conn);
         store.ack(conn.repo, clientKey(conn), frame.cursor);
         respond({ type: "ok", detail: "acked" });
         break;
@@ -416,9 +420,21 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     conn.wake = frame.wake === undefined ? (existing?.wake ?? false) : frame.wake;
     conn.status = [...conns].find((peer) => peer !== conn && peer.authed && groupKey(peer) === groupKey(conn))?.status
       || frame.status || existing?.status || "online";
-    conn.role = elect(conn.repo, conn.name, frame.role === "orchestrator");
-    restoreSubscriptions(conn);
+    conn.role = conn.cwd === "/" ? "worker" : elect(conn.repo, conn.name, frame.role === "orchestrator");
+    if (conn.cwd !== "/") {
+      restoreSubscriptions(conn);
+      if (declaredSession && !declaredSession.startsWith("zellij:")) {
+        const sessionKey = `${conn.name}:${declaredSession}`;
+        const baseCursor = store.cursor(conn.repo, conn.name);
+        if (store.cursor(conn.repo, sessionKey) === 0 && baseCursor > 0) {
+          store.ack(conn.repo, sessionKey, baseCursor);
+        }
+      }
+    }
     if (conn.cwd !== "/" && conn.harness !== "cli" && !conn.waitOnly && (!existing || conn.sessionBound)) {
+      if (!isSessionLiveInOtherRepo(conn.repo, conn.declaredSession, frame.wakeSessionId)) {
+        store.evictCrossRepoBinding(conn.repo, conn.declaredSession, frame.wakeSessionId);
+      }
       store.upsertAgent({
         repo: conn.repo,
         name: conn.name,
@@ -452,11 +468,14 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       daemon: daemonInfo,
       agentId: conn.agentId,
       repoKey: conn.repo,
-      cursor: store.cursor(conn.repo, clientKey(conn)),
+      cursor: conn.cwd === "/" ? 0 : store.cursor(conn.repo, clientKey(conn)),
       role: conn.role,
-      orchestrator: store.getOrchestrator(conn.repo),
+      orchestrator: conn.cwd === "/" ? null : store.getOrchestrator(conn.repo),
     });
-    presence(conn, "online");
+    if (conn.cwd !== "/") {
+      presence(conn, "online");
+      replayDeferredWakes(conn.repo);
+    }
   }
 
   function elect(repo: string, name: string, wants: boolean): Role {
@@ -470,6 +489,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
   }
 
   function setOrchestrator(conn: Conn, name: string | undefined, respond: Respond): void {
+    requireBoundRepo(conn);
     if (name !== undefined) {
       requireName(name);
       store.setOrchestrator(conn.repo, name);
@@ -592,9 +612,15 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     correlationId: string | null = null,
     extra?: { replyState?: ReplyState | null; supersedes?: string | null },
   ): Promise<void> {
+    requireBoundRepo(conn);
     requireTopic(frame.topic);
     requireBody(frame.body);
-    if (frame.to !== undefined && frame.to !== "*") requireName(frame.to);
+    if (frame.to !== undefined && frame.to !== "*") {
+      requireName(frame.to);
+      if (looksLikeSessionTarget(frame.to) && !describeTarget(conn.repo, frame.to)) {
+        throw new Error(`target session ${frame.to} is not registered in this repository`);
+      }
+    }
     const message = store.insert({
       repo: conn.repo,
       id: frame.id || randomUUID(),
@@ -629,7 +655,11 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     supersedes: string | undefined,
     respond: Respond,
   ): Promise<void> {
+    requireBoundRepo(conn);
     requireName(to);
+    if (looksLikeSessionTarget(to) && !describeTarget(conn.repo, to)) {
+      throw new Error(`target session ${to} is not registered in this repository`);
+    }
     const others = [...conns].filter(
       (peer) =>
         peer.authed &&
@@ -657,6 +687,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
 
   async function report(conn: Conn, body: string, respond: Respond): Promise<void> {
     try {
+      requireBoundRepo(conn);
       requireBody(body);
       const name = store.getOrchestrator(conn.repo);
       if (!name) throw new Error("no orchestrator yet");
@@ -675,6 +706,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     state: ReplyState | undefined,
     respond: Respond,
   ): Promise<void> {
+    requireBoundRepo(conn);
     if (typeof correlationId !== "string" || !correlationId) throw new Error("correlation id required");
     const replyState: ReplyState = state ?? "done";
     if (replyState !== "done" && replyState !== "progress" && replyState !== "blocked") {
@@ -711,6 +743,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     frame: Extract<ClientFrame, { type: "state" }>,
     respond: Respond,
   ): void {
+    requireBoundRepo(conn);
     const action = frame.action;
     if (action !== "get" && action !== "set" && action !== "list" && action !== "delete") {
       throw new Error("state action must be get, set, list, or delete");
@@ -774,7 +807,15 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     respond({ type: "state", action: "delete", ok: true, entry: null, deleted: res.deleted, rev: res.rev });
   }
 
-  function inbox(conn: Conn, since: number | undefined, topic: string | undefined, limit: number | undefined, respond: Respond): void {
+  function inbox(
+    conn: Conn,
+    since: number | undefined,
+    topic: string | undefined,
+    limit: number | undefined,
+    ack: boolean | undefined,
+    respond: Respond,
+  ): void {
+    requireBoundRepo(conn);
     if (topic) requireTopic(topic);
     const baseKey = clientKey(conn);
     const key = inboxCursorKey(baseKey, topic);
@@ -790,8 +831,9 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       isOrchestrator: conn.role === "orchestrator",
       limit: pageSize,
     });
+    const shouldAck = ack !== false;
     const next = messages.length ? messages[messages.length - 1]!.seq : cursor;
-    if (messages.length) {
+    if (shouldAck && messages.length) {
       store.ack(conn.repo, key, next);
       const primary = store.getAgent(conn.repo, conn.name)?.sessionId;
       const multiSession = [...conns].some(
@@ -809,14 +851,17 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
           store.ack(conn.repo, companionKey, next);
         }
       }
+      store.clearDeferredWake(conn.repo, conn.name);
+      if (conn.sessionId) store.clearDeferredWake(conn.repo, conn.sessionId);
+      if (primary) store.clearDeferredWake(conn.repo, primary);
     }
     store.touchAgent(conn.repo, conn.name, undefined, conn.sessionId);
-    const updatedCursor = store.cursor(conn.repo, key);
+    const updatedCursor = shouldAck ? store.cursor(conn.repo, key) : next;
     const pendingAsk = store.unansweredAsk(conn.repo, conn.name, updatedCursor, 0, conn.sessionId);
     respond({
       type: "inbox",
       messages,
-      cursor: updatedCursor,
+      cursor: store.cursor(conn.repo, key),
       more: messages.length === pageSize,
       pendingAsk,
     });
@@ -827,9 +872,26 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     frame: Extract<ClientFrame, { type: "register" }>,
     respond: Respond,
   ): void {
+    requireBoundRepo(conn);
     requireName(frame.name);
-    if (!frame.cwd) throw new Error("cwd required");
+    if (!frame.cwd || frame.cwd === "/") throw new Error('cannot register: cwd is "/"');
     if (!frame.harness) throw new Error("harness required");
+    if (
+      frame.cwd !== conn.cwd &&
+      existsSync(frame.cwd) &&
+      existsSync(conn.cwd) &&
+      existsSync(`${gitRepoRoot(frame.cwd)}/.git`) &&
+      existsSync(`${gitRepoRoot(conn.cwd)}/.git`) &&
+      repoKey(frame.cwd) !== conn.repo &&
+      repoKey(frame.cwd, "split") !== conn.repo &&
+      repoKey(frame.cwd) !== repoKey(conn.cwd)
+    ) {
+      throw new Error("cannot register: cwd belongs to a different repository board");
+    }
+    if (isSessionLiveInOtherRepo(conn.repo, frame.sessionId, frame.wakeSessionId)) {
+      throw new Error("cannot register: session is currently active in another repository board");
+    }
+    store.evictCrossRepoBinding(conn.repo, frame.sessionId, frame.wakeSessionId);
     const existing = frame.sessionId
       ? store.getAgentBySession(conn.repo, frame.sessionId)
       : store.getAgent(conn.repo, frame.name);
@@ -932,7 +994,33 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     return true;
   }
 
+  function isSessionLiveInOtherRepo(
+    repo: string,
+    sessionId?: string | null,
+    wakeSessionId?: string | null,
+  ): boolean {
+    for (const id of [sessionId, wakeSessionId]) {
+      if (!id) continue;
+      for (const peer of conns) {
+        if (
+          peer.authed &&
+          peer.repo !== repo &&
+          peer.cwd !== "/" &&
+          peer.harness !== "cli" &&
+          !peer.waitOnly &&
+          (peer.sessionId === id || peer.declaredSession === id || peer.wakeSessionId === id)
+        ) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
   function scheduleTrailingWake(key: string, repo: string, message: BusMessage): void {
+    if (message.to) {
+      store.saveDeferredWake(repo, message.to, message.seq);
+    }
     const existing = trailingWakes.get(key);
     if (existing) clearTimeout(existing);
     const elapsed = Date.now() - (lastWake.get(key) ?? 0);
@@ -944,11 +1032,28 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     const timer = setTimeout(() => {
       trailingWakes.delete(key);
       if (stopping) return;
-      if (!isMessageUnreadForTarget(repo, message)) return;
+      if (!isMessageUnreadForTarget(repo, message)) {
+        if (message.to) store.clearDeferredWake(repo, message.to);
+        return;
+      }
       void wakeFor(repo, message);
     }, delay);
     timer.unref?.();
     trailingWakes.set(key, timer);
+  }
+
+  function replayDeferredWakes(repoFilter?: string): void {
+    for (const entry of store.listDeferredWakes(repoFilter)) {
+      const msg = store.bySeq(entry.repo, entry.seq);
+      if (!msg || !msg.to || !isMessageUnreadForTarget(entry.repo, msg)) {
+        store.clearDeferredWake(entry.repo, entry.target);
+        continue;
+      }
+      const key = JSON.stringify([entry.repo, msg.to]);
+      if (!trailingWakes.has(key)) {
+        scheduleTrailingWake(key, entry.repo, msg);
+      }
+    }
   }
 
   async function wakeFor(repo: string, message: BusMessage): Promise<WakeInfo> {
@@ -961,7 +1066,12 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     });
     const target = describeTarget(repo, message.to);
     if (!target) {
+      store.clearDeferredWake(repo, message.to);
       return { mode: "skip", detail: `no agent named ${message.to} in this repo` };
+    }
+    if (target.sessionId && isSessionLiveInOtherRepo(repo, target.sessionId, target.sessionId)) {
+      store.clearDeferredWake(repo, message.to);
+      return { mode: "skip", detail: "session is active in another repository" };
     }
     const info = decideWake({
       directed: true,
@@ -970,7 +1080,10 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       sessionId: target.sessionId,
       wakeEnabled: target.wake,
     });
-    if (info.mode !== "inject" && info.mode !== "headless") return info;
+    if (info.mode !== "inject" && info.mode !== "headless") {
+      store.clearDeferredWake(repo, message.to);
+      return info;
+    }
     const key = JSON.stringify([repo, message.to]);
     if (info.mode === "inject" && turnInProgress(target.harness, target.sessionId)) {
       scheduleTrailingWake(key, repo, message);
@@ -992,6 +1105,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       message,
     });
     if (!launch || !options.spawnWake) {
+      store.clearDeferredWake(repo, message.to);
       return { mode: "skip", detail: "wake command is not available" };
     }
     waking.add(key);
@@ -999,6 +1113,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       if (options.logFile) logWake(options.logFile, launch, message.id);
       await options.spawnWake(launch);
       lastWake.set(key, Date.now());
+      store.clearDeferredWake(repo, message.to);
       return info;
     } catch (error) {
       const messageText = error instanceof Error ? error.message : "spawn failed";
@@ -1112,6 +1227,8 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     return rows;
   }
 
+  replayDeferredWakes();
+
   return {
     port,
     url: `ws://127.0.0.1:${port}`,
@@ -1136,6 +1253,24 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
 
 function send(socket: WebSocket, frame: ServerFrame): void {
   if (socket.readyState === socket.OPEN) socket.send(JSON.stringify(frame));
+}
+
+function requireBoundRepo(conn: Conn): void {
+  if (!conn.cwd || conn.cwd === "/" || !conn.repo) {
+    throw new Error(
+      'session is not bound to a repository checkout (cwd is "/"); start the harness inside a repo or set SWITCHBOARD_CWD',
+    );
+  }
+}
+
+function looksLikeSessionTarget(to: string): boolean {
+  return (
+    UUID_RE.test(to) ||
+    TTY_RE.test(to) ||
+    to.startsWith("zellij:") ||
+    to.startsWith("tmux:") ||
+    /^%\d+$/.test(to)
+  );
 }
 
 function requireTopic(topic: string): void {

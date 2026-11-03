@@ -1259,3 +1259,163 @@ test("active Codex turn defers codex queue injection, cancels if read via hook/i
     await daemon.close();
   }
 });
+
+test("deferred wakes survive daemon restarts, non-acking compaction hooks preserve unread mail, and repo boundaries reject cross-repo leaks", async () => {
+  const home = mkdtempSync(path.join(tmpdir(), "switchboard-reconnect-boundary-"));
+  const token = ensureToken(home);
+  const dbFile = path.join(home, "switchboard.db");
+  const launches: WakeLaunch[] = [];
+  let turnActive = true;
+
+  let daemon = await startDaemon({
+    port: 0,
+    dbFile,
+    token,
+    spawnWake: async (launch) => {
+      launches.push(launch);
+    },
+    isTurnInProgress: (harness) => harness === "codex" && turnActive,
+    wakeCooldownMs: 60,
+    presenceTtlMs: 250,
+    sweepMs: 40,
+  });
+
+  const codexUuid = "01a175cd-251c-7571-abb3-21ea77b5d73d";
+  const muse = new BusClient();
+  const codex = new BusClient();
+  const unboundRoot = new BusClient();
+  const repoBGrok = new BusClient();
+
+  try {
+    // 1. Unbound cwd="/" connection is isolated and rejected from repo operations
+    await unboundRoot.connect(daemon.url, hello(token, "codex", "root-repo", { cwd: "/", role: "orchestrator" }));
+    await assert.rejects(
+      unboundRoot.request({ type: "publish", topic: "repo", body: "should fail" }),
+      /not bound to a repository checkout/,
+    );
+    await assert.rejects(
+      unboundRoot.request({ type: "inbox" }),
+      /not bound to a repository checkout/,
+    );
+
+    // 2. Connect repo-a agents and repo-b agent
+    await muse.connect(daemon.url, hello(token, "muse", "repo-a", { harness: "muse", cwd: "/work/repo-a" }));
+    await codex.connect(
+      daemon.url,
+      hello(token, "codex", "repo-a", {
+        harness: "codex",
+        cwd: "/work/repo-a",
+        sessionId: codexUuid,
+        boundSession: true,
+        wake: true,
+      }),
+    );
+    await repoBGrok.connect(
+      daemon.url,
+      hello(token, "grok", "repo-b", {
+        harness: "grok",
+        cwd: "/work/repo-b",
+        sessionId: "01a19fbd-4072-75d0-8058-d2f4627dffb3",
+        wakeSessionId: "tty:/dev/ttys003",
+        boundSession: true,
+      }),
+    );
+
+    // Repo-a cannot hijack a session or tty that is currently live in repo-b
+    await assert.rejects(
+      muse.request({
+        type: "register",
+        name: "grok",
+        harness: "grok",
+        cwd: "/work/repo-a",
+        sessionId: "01a19fbd-4072-75d0-8058-d2f4627dffb3",
+        wakeSessionId: "tty:/dev/ttys003",
+      }),
+      /currently active in another repository/,
+    );
+
+    // Repo-a cannot ask or publish to a session UUID belonging to repo-b
+    await assert.rejects(
+      muse.request({
+        type: "ask",
+        to: "01a19fbd-4072-75d0-8058-d2f4627dffb3",
+        body: "cross-repo session ask",
+      }),
+      /not registered in this repository/,
+    );
+
+    // 3. Send a message while Codex turn is active -> deferred in SQLite (deferred_wakes)
+    const asked = await muse.request({
+      type: "ask",
+      to: "codex",
+      body: "survives daemon restart and compaction",
+    });
+    assert.equal(asked.type, "published");
+    assert.equal(launches.length, 0);
+
+    // Simulate SessionStart / compaction hook reading with ack: false -> returns message WITHOUT advancing cursor
+    const peeked = await codex.request({ type: "inbox", ack: false });
+    assert.equal(peeked.type, "inbox");
+    if (peeked.type === "inbox") {
+      assert.equal(peeked.messages.length, 1);
+      assert.equal(peeked.messages[0]?.body, "survives daemon restart and compaction");
+      assert.equal(peeked.cursor, 0);
+    }
+
+    // Restart the daemon while the message is still unread and turn finishes during restart
+    muse.close();
+    codex.close();
+    unboundRoot.close();
+    repoBGrok.close();
+    await daemon.close();
+
+    turnActive = false;
+    daemon = await startDaemon({
+      port: 0,
+      dbFile,
+      token,
+      spawnWake: async (launch) => {
+        launches.push(launch);
+      },
+      isTurnInProgress: (harness) => harness === "codex" && turnActive,
+      wakeCooldownMs: 60,
+      presenceTtlMs: 250,
+      sweepMs: 40,
+    });
+
+    // Replayed deferred wake from SQLite fires automatically on the new daemon!
+    await new Promise((r) => setTimeout(r, 150));
+    assert.equal(launches.length, 1);
+    assert.ok(launches[0]?.args.includes("queue"));
+    assert.ok(launches[0]?.args.includes(codexUuid));
+
+    // And reconnecting codex can still consume the unread message via bus_inbox
+    const codexReconnected = new BusClient();
+    await codexReconnected.connect(
+      daemon.url,
+      hello(token, "codex", "repo-a", {
+        harness: "codex",
+        cwd: "/work/repo-a",
+        sessionId: codexUuid,
+        boundSession: true,
+        wake: true,
+      }),
+    );
+    try {
+      const consumed = await codexReconnected.request({ type: "inbox" });
+      assert.equal(consumed.type, "inbox");
+      if (consumed.type === "inbox") {
+        assert.equal(consumed.messages.length, 1);
+        assert.equal(consumed.messages[0]?.body, "survives daemon restart and compaction");
+      }
+    } finally {
+      codexReconnected.close();
+    }
+  } finally {
+    muse.close();
+    codex.close();
+    unboundRoot.close();
+    repoBGrok.close();
+    await daemon.close();
+  }
+});

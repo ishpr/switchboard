@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -143,11 +143,43 @@ export function discoverCodexThread(
   }
 }
 
+export function discoverGrokSession(
+  cwd: string,
+  grokHome = process.env.GROK_HOME || path.join(homedir(), ".grok"),
+): string | undefined {
+  if (!cwd || cwd === "/" || !existsSync(cwd)) return undefined;
+  const activeFile = path.join(grokHome, "active_sessions.json");
+  if (!existsSync(activeFile)) return undefined;
+  try {
+    const raw = JSON.parse(readFileSync(activeFile, "utf8")) as Array<{
+      session_id?: string;
+      pid?: number;
+      cwd?: string;
+      opened_at?: string;
+    }>;
+    if (!Array.isArray(raw)) return undefined;
+    const root = gitRepoRoot(cwd, "split");
+    const matching = raw
+      .filter((entry) => {
+        if (!entry?.session_id || !UUID_RE.test(entry.session_id) || !entry.cwd) return false;
+        if (entry.cwd === cwd) return true;
+        return root !== "/" && gitRepoRoot(entry.cwd, "split") === root;
+      })
+      .sort((a, b) => String(b.opened_at ?? "").localeCompare(String(a.opened_at ?? "")));
+    const byPpid = matching.find((entry) => entry.pid === process.ppid);
+    if (byPpid?.session_id) return byPpid.session_id;
+    return matching[0]?.session_id;
+  } catch {
+    return undefined;
+  }
+}
+
 export function discoverHarnessSession(opts: {
   cwd: string;
   harness: string;
   env?: NodeJS.ProcessEnv;
   codexHome?: string;
+  grokHome?: string;
 }): { sessionId?: string; wakeSessionId?: string } {
   const env = opts.env ?? process.env;
   const explicit = env.SWITCHBOARD_SESSION?.trim() || undefined;
@@ -158,16 +190,21 @@ export function discoverHarnessSession(opts: {
     env.CODEX_THREAD_ID?.trim() ||
     env.MUSE_SESSION_ID?.trim() ||
     env.CLAUDE_CODE_SESSION_ID?.trim() ||
+    env.GROK_SESSION_ID?.trim() ||
     undefined;
   const codexThread =
     !explicit && !paneSession && !envSession && opts.harness === "codex"
       ? discoverCodexThread(opts.cwd, opts.codexHome)
       : undefined;
+  const grokSession =
+    !explicit && !paneSession && !envSession && opts.harness === "grok"
+      ? discoverGrokSession(opts.cwd, opts.grokHome)
+      : undefined;
   const ttySession =
     !explicit && !paneSession && opts.harness !== "codex"
       ? discoverTerminalTty(env, opts.harness)
       : undefined;
-  const sessionId = explicit || paneSession || envSession || codexThread || undefined;
+  const sessionId = explicit || paneSession || envSession || codexThread || grokSession || undefined;
   const wakeSessionId = explicit || paneSession || ttySession || sessionId || undefined;
   return { sessionId, wakeSessionId };
 }
@@ -183,8 +220,10 @@ export function missingSessionSource(harness: string, cwd: string): string {
       return "cannot register: no session id found for claude; expected CLAUDE_CODE_SESSION_ID (or ZELLIJ_PANE_ID / TMUX_PANE / SWITCHBOARD_SESSION)";
     case "codex":
       return `cannot register: no session id found for codex; expected CODEX_THREAD_ID or an active user thread row for ${cwd} in ~/.codex/state_5.sqlite (or ZELLIJ_PANE_ID / TMUX_PANE / SWITCHBOARD_SESSION)`;
+    case "grok":
+      return `cannot register: no session id found for grok; expected GROK_SESSION_ID or an active session row for ${cwd} in ~/.grok/active_sessions.json (or ZELLIJ_PANE_ID / TMUX_PANE / SWITCHBOARD_SESSION)`;
     default:
-      return `cannot register: no session id found for ${harness}; expected SWITCHBOARD_SESSION, ZELLIJ_PANE_ID, TMUX_PANE, MUSE_SESSION_ID, CLAUDE_CODE_SESSION_ID, or CODEX_THREAD_ID`;
+      return `cannot register: no session id found for ${harness}; expected SWITCHBOARD_SESSION, ZELLIJ_PANE_ID, TMUX_PANE, MUSE_SESSION_ID, CLAUDE_CODE_SESSION_ID, GROK_SESSION_ID, or CODEX_THREAD_ID`;
   }
 }
 
@@ -200,6 +239,7 @@ export function instructions(role: Role, orchestrator: string | null): string {
     "bus_reply accepts state=done|progress|blocked (default done); only state=done closes the ask, while progress and blocked keep it open.",
     "bus_ask accepts supersedes=<correlationId> when replacing an earlier ask.",
     "Use bus_state (get/set/list/delete with rev and if_rev compare-and-swap) for shared per-repo facts and lease keys without triggering automatic wakes.",
+    "Do not send pure acknowledgment messages for replies or broadcasts unless a follow-up answer or action was requested.",
     "Dedupe messages by id.",
   ];
   if (role === "orchestrator") {

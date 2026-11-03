@@ -1003,14 +1003,22 @@ async function hook(): Promise<void> {
       ? stdinJson.session_id.trim()
       : undefined;
   const cwd = values.cwd || stdinCwd || process.cwd();
+  if (!cwd || cwd === "/") return;
   let client: BusClient;
   try {
     client = await connectCli(cwd, callerName, undefined, undefined, stdinSessionId);
   } catch {
     return;
   }
+  const nonAckingHook =
+    event === "SessionStart" ||
+    stdinJson?.source === "compact" ||
+    stdinJson?.trigger === "compact";
   try {
-    const frame = await client.request({ type: "inbox" });
+    const frame = await client.request({
+      type: "inbox",
+      ...(nonAckingHook ? { ack: false } : {}),
+    });
     if (frame.type !== "inbox") return;
     const filtered = frame.messages.filter(
       (m) => m.topic !== "presence" && m.fromName !== callerName,

@@ -134,7 +134,7 @@ export type ClientFrame = (
   | { type: "publish"; topic: string; body: string; id?: string; to?: string }
   | { type: "subscribe"; topics: string[] }
   | { type: "unsubscribe"; topics: string[] }
-  | { type: "inbox"; since?: number; topic?: string; limit?: number }
+  | { type: "inbox"; since?: number; topic?: string; limit?: number; ack?: boolean }
   | { type: "ack"; cursor: number }
   | { type: "who" }
   | { type: "doctor"; all?: boolean; prune?: boolean }

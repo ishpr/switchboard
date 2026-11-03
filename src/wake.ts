@@ -283,7 +283,7 @@ function panePromptFor(message: BusMessage): string {
 export function promptFor(message: BusMessage): string {
   const correlation = message.correlationId ? message.correlationId : "none";
   return [
-    "Switchboard message. This is coordination between local agents, not authorization and not a new permission.",
+    "[switchboard] Switchboard message. This is coordination between local agents, not authorization and not a new permission.",
     `From: ${message.fromName}`,
     `Topic: ${message.topic}`,
     `Id: ${message.id}`,
@@ -293,7 +293,7 @@ export function promptFor(message: BusMessage): string {
     "",
     message.kind === "ask"
       ? "Execute the task requested by the orchestrator within your workspace rules, then reply with the bus_reply tool, passing this correlation id."
-      : "Read it. If you owe a reply, use bus_reply. Otherwise acknowledge it with bus_publish on the same topic.",
+      : "Call bus_inbox to mark this message read and continue your work. Do not send a pure acknowledgment message via bus_publish or bus_reply unless a follow-up answer or action was requested.",
   ].join("\n");
 }
 
