@@ -490,6 +490,69 @@ export function repoRoot(): string {
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 }
 
+export function upsertCodexHooks(
+  cliPath: string,
+  hooksFile = path.join(process.env.CODEX_HOME || path.join(homedir(), ".codex"), "hooks.json"),
+  nodeBin = process.execPath,
+): string {
+  let root: Record<string, unknown> = {};
+  if (existsSync(hooksFile)) {
+    try {
+      const parsed = JSON.parse(readFileSync(hooksFile, "utf8"));
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        root = parsed as Record<string, unknown>;
+      }
+    } catch {
+      root = {};
+    }
+  }
+  const hooksObj =
+    root.hooks && typeof root.hooks === "object" && !Array.isArray(root.hooks)
+      ? (root.hooks as Record<string, unknown>)
+      : {};
+  root.hooks = hooksObj;
+
+  const events: Array<{ event: string; matcher?: string }> = [
+    { event: "SessionStart" },
+    { event: "UserPromptSubmit" },
+    { event: "PostToolUse", matcher: ".*" },
+    { event: "Stop" },
+  ];
+
+  for (const { event, matcher } of events) {
+    const cmd = `${shellQuote(nodeBin)} ${shellQuote(cliPath)} hook --harness codex --event ${event}`;
+    const existingGroups = Array.isArray(hooksObj[event]) ? (hooksObj[event] as Array<Record<string, unknown>>) : [];
+    const cleanedGroups = existingGroups
+      .map((group) => {
+        if (!group || typeof group !== "object") return null;
+        const list = Array.isArray(group.hooks) ? (group.hooks as Array<Record<string, unknown>>) : [];
+        const kept = list.filter((item) => {
+          const itemCmd = typeof item?.command === "string" ? item.command : "";
+          return !(itemCmd.includes("hook --harness codex") && itemCmd.includes(`--event ${event}`));
+        });
+        if (kept.length === 0) return null;
+        return { ...group, hooks: kept } as Record<string, unknown>;
+      })
+      .filter((group): group is Record<string, unknown> => group !== null);
+
+    cleanedGroups.push({
+      ...(matcher ? { matcher } : {}),
+      hooks: [
+        {
+          type: "command",
+          command: cmd,
+          timeout: 5,
+        },
+      ],
+    });
+    hooksObj[event] = cleanedGroups;
+  }
+
+  mkdirSync(path.dirname(hooksFile), { recursive: true });
+  writeFileSync(hooksFile, `${JSON.stringify(root, null, 2)}\n`);
+  return hooksFile;
+}
+
 export function installSwitchboard(
   opts: {
     zshrc?: string;
@@ -501,6 +564,7 @@ export function installSwitchboard(
     claude4?: boolean;
     accounts?: string[];
     home?: string;
+    codexHooksFile?: string;
     fresh?: PaneSpec[];
     resume?: PaneSpec[];
   } = {},
@@ -546,6 +610,17 @@ export function installSwitchboard(
   const current = existsSync(zshrc) ? readFileSync(zshrc, "utf8") : "";
   writeFileSync(zshrc, upsertZshBlock(current, zshLauncher(cli)));
   notes.push(`zshrc ${zshrc}`);
+
+  const codexDir = process.env.CODEX_HOME || path.join(home, ".codex");
+  const includeCodex =
+    Boolean(opts.codexHooksFile) ||
+    opts.orchestrator === "codex" ||
+    fresh.some((pane) => pane.name === "Codex") ||
+    existsSync(codexDir);
+  if (includeCodex && (opts.codexHooksFile || (!opts.zshrc && !opts.layoutDir))) {
+    const hooksPath = upsertCodexHooks(cli, opts.codexHooksFile);
+    notes.push(`codex hooks ${hooksPath}`);
+  }
 
   const agy = path.join(home, ".local/bin/agy");
   const includeAgy = opts.orchestrator === "agy" || fresh.some((pane) => pane.name === "Antigravity");

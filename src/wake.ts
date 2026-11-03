@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { appendFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import type { BusMessage, WakeInfo, WakeLaunch, WakeMode } from "./types.ts";
 
 const CODEX_APP_BIN =
@@ -9,6 +10,47 @@ const CODEX_APP_BIN =
 
 export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export const TTY_RE = /^tty:\/dev\/ttys\d+$/;
+
+/**
+ * Checks whether a Codex session UUID currently has an active turn (`status = 'inProgress'`)
+ * in `~/.codex/thread_history_1.sqlite`.
+ *
+ * When a turn is in progress in Codex Desktop, `codex queue` inserts into `queued_items`,
+ * which Codex Desktop holds as a `when-idle` queued item in the bottom bar (even when
+ * `followUpQueueMode = "steer"` is configured) and does not clear when the agent consumes
+ * the message mid-turn via `PostToolUse` hook or `bus_inbox`. Deferring `codex queue` while
+ * a turn is in progress lets hooks/`bus_inbox` deliver the message in real time during the
+ * active turn without piling up duplicate queued turns afterward.
+ */
+export function isCodexTurnInProgress(
+  sessionId: string | null | undefined,
+  codexHome = process.env.CODEX_HOME || path.join(homedir(), ".codex"),
+): boolean {
+  if (!sessionId || !UUID_RE.test(sessionId)) return false;
+  const dbFile = path.join(codexHome, "thread_history_1.sqlite");
+  if (!existsSync(dbFile)) return false;
+  let db: DatabaseSync | null = null;
+  try {
+    db = new DatabaseSync(dbFile, { open: true, readOnly: true });
+    const row = db
+      .prepare(
+        `SELECT status FROM thread_turns
+         WHERE thread_id = ?
+         ORDER BY rollout_ordinal DESC
+         LIMIT 1`,
+      )
+      .get(sessionId) as { status?: string } | undefined;
+    return row?.status === "inProgress";
+  } catch {
+    return false;
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      // ignore close errors on read-only lookup
+    }
+  }
+}
 
 function isPaneOrTtySession(sessionId?: string | null): boolean {
   if (!sessionId) return false;

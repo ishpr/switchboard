@@ -20,6 +20,7 @@ import {
   resolveOrchestratorName,
   resolveShimCwd,
   switchboardLayout,
+  upsertCodexHooks,
   upsertZshBlock,
   writeRepoConfig,
   zshLauncher,
@@ -233,4 +234,30 @@ test("multi-account Claude resolution and isolated environment provisioning are 
     layout: "/Users/ishprasad/.config/zellij/layouts/switchboard-resume.kdl",
     deleteFirst: true,
   });
+});
+
+test("upsertCodexHooks installs and merges SessionStart, UserPromptSubmit, PostToolUse, and Stop hooks idempotently", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "sb-codex-hooks-"));
+  const hooksFile = path.join(dir, ".codex", "hooks.json");
+  mkdirSync(path.dirname(hooksFile), { recursive: true });
+  writeFileSync(
+    hooksFile,
+    JSON.stringify({
+      hooks: {
+        Stop: [{ hooks: [{ type: "command", command: "echo custom-stop" }] }],
+      },
+    }),
+  );
+
+  upsertCodexHooks("/opt/switchboard/dist/cli.js", hooksFile);
+  upsertCodexHooks("/opt/switchboard/dist/cli.js", hooksFile);
+
+  const parsed = JSON.parse(readFileSync(hooksFile, "utf8"));
+  assert.equal(parsed.hooks.SessionStart.length, 1);
+  assert.equal(parsed.hooks.UserPromptSubmit.length, 1);
+  assert.equal(parsed.hooks.PostToolUse.length, 1);
+  assert.equal(parsed.hooks.PostToolUse[0].matcher, ".*");
+  assert.equal(parsed.hooks.Stop.length, 2);
+  assert.match(parsed.hooks.PostToolUse[0].hooks[0].command, /hook --harness codex --event PostToolUse/);
+  assert.match(parsed.hooks.Stop[1].hooks[0].command, /hook --harness codex --event Stop/);
 });

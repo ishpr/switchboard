@@ -26,6 +26,7 @@ async function fixture(): Promise<Fixture> {
     spawnWake: async (launch) => {
       launches.push(launch);
     },
+    isTurnInProgress: () => false,
     presenceTtlMs: 250,
     sweepMs: 40,
   });
@@ -1175,5 +1176,86 @@ test("wake_session_id persists in SQLite across legacy shim reconnects and falls
   } finally {
     cli.close();
     await fx.daemon.close();
+  }
+});
+
+test("active Codex turn defers codex queue injection, cancels if read via hook/inbox mid-turn, and fires when turn finishes if unread", async () => {
+  const home = mkdtempSync(path.join(tmpdir(), "switchboard-turn-defer-"));
+  const token = ensureToken(home);
+  const launches: WakeLaunch[] = [];
+  let turnActive = true;
+  const daemon = await startDaemon({
+    port: 0,
+    dbFile: path.join(home, "switchboard.db"),
+    token,
+    spawnWake: async (launch) => {
+      launches.push(launch);
+    },
+    isTurnInProgress: (harness) => harness === "codex" && turnActive,
+    wakeCooldownMs: 60,
+    presenceTtlMs: 250,
+    sweepMs: 40,
+  });
+
+  const codexUuid = "01a175cd-251c-7571-abb3-21ea77b5d73d";
+  const muse = new BusClient();
+  const codex = new BusClient();
+  await muse.connect(daemon.url, hello(token, "muse", "repo-a", { harness: "muse" }));
+  await codex.connect(
+    daemon.url,
+    hello(token, "codex", "repo-a", {
+      harness: "codex",
+      sessionId: codexUuid,
+      boundSession: true,
+      wake: true,
+    }),
+  );
+
+  try {
+    // 1. Message 1 arrives while Codex turn is active -> deferred, not queued immediately
+    const ask1 = await muse.request({
+      type: "ask",
+      to: "codex",
+      body: "mid-turn message 1",
+    });
+    assert.equal(ask1.type, "published");
+    if (ask1.type === "published") {
+      assert.equal(ask1.wake.mode, "skip");
+      assert.match(ask1.wake.detail ?? "", /turn is in progress/);
+    }
+    assert.equal(launches.length, 0);
+
+    // Codex consumes message 1 mid-turn via PostToolUse hook / bus_inbox
+    const inbox1 = await codex.request({ type: "inbox" });
+    assert.equal(inbox1.type, "inbox");
+    if (inbox1.type === "inbox") {
+      assert.equal(inbox1.messages.length, 1);
+      assert.equal(inbox1.messages[0]?.body, "mid-turn message 1");
+    }
+
+    // Even after turn ends, message 1 was already read so codex queue never fires for it
+    turnActive = false;
+    await new Promise((r) => setTimeout(r, 120));
+    assert.equal(launches.length, 0);
+
+    // 2. Message 2 arrives while Codex turn is active, and turn ends before any hook reads it -> codex queue fires once idle
+    turnActive = true;
+    const ask2 = await muse.request({
+      type: "ask",
+      to: "codex",
+      body: "mid-turn message 2 unread",
+    });
+    assert.equal(ask2.type, "published");
+    assert.equal(launches.length, 0);
+
+    turnActive = false;
+    await new Promise((r) => setTimeout(r, 150));
+    assert.equal(launches.length, 1);
+    assert.ok(launches[0]?.args.includes("queue"));
+    assert.ok(launches[0]?.args.includes(codexUuid));
+  } finally {
+    muse.close();
+    codex.close();
+    await daemon.close();
   }
 });

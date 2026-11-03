@@ -22,7 +22,7 @@ import {
   type WakeInfo,
   type PrunedAgent,
 } from "./types.ts";
-import { decideWake, launchFor, logWake, type SpawnWake } from "./wake.ts";
+import { decideWake, isCodexTurnInProgress, launchFor, logWake, type SpawnWake } from "./wake.ts";
 
 export type DaemonOptions = {
   /** Use port 0 in tests to take a free port. */
@@ -36,6 +36,7 @@ export type DaemonOptions = {
   paneProbe?: PaneProbe;
   presenceDebounceMs?: number;
   wakeCooldownMs?: number;
+  isTurnInProgress?: (harness: string, sessionId: string | null) => boolean;
 };
 
 export type DaemonHandle = {
@@ -86,6 +87,10 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
   const lastWake = new Map<string, number>();
   const waking = new Set<string>();
   const wakeCooldownMs = options.wakeCooldownMs ?? WAKE_COOLDOWN_MS;
+  const turnInProgress =
+    options.isTurnInProgress ??
+    ((harness: string, sessionId: string | null) =>
+      harness === "codex" && isCodexTurnInProgress(sessionId));
   const trailingWakes = new Map<string, ReturnType<typeof setTimeout>>();
   const daemonInfo = runtimeInfo();
   const onlineGroups = new Set<string>();
@@ -786,7 +791,25 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       limit: pageSize,
     });
     const next = messages.length ? messages[messages.length - 1]!.seq : cursor;
-    if (messages.length) store.ack(conn.repo, key, next);
+    if (messages.length) {
+      store.ack(conn.repo, key, next);
+      const primary = store.getAgent(conn.repo, conn.name)?.sessionId;
+      const multiSession = [...conns].some(
+        (peer) =>
+          peer.authed &&
+          peer.repo === conn.repo &&
+          peer.name === conn.name &&
+          peer.declaredSession &&
+          peer.declaredSession !== (conn.declaredSession ?? primary),
+      );
+      if (!multiSession && primary && !primary.startsWith("zellij:")) {
+        const companionBase = conn.declaredSession === primary ? conn.name : `${conn.name}:${primary}`;
+        const companionKey = inboxCursorKey(companionBase, topic);
+        if (store.cursor(conn.repo, companionKey) < next) {
+          store.ack(conn.repo, companionKey, next);
+        }
+      }
+    }
     store.touchAgent(conn.repo, conn.name, undefined, conn.sessionId);
     const updatedCursor = store.cursor(conn.repo, key);
     const pendingAsk = store.unansweredAsk(conn.repo, conn.name, updatedCursor, 0, conn.sessionId);
@@ -913,7 +936,11 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     const existing = trailingWakes.get(key);
     if (existing) clearTimeout(existing);
     const elapsed = Date.now() - (lastWake.get(key) ?? 0);
-    const delay = Math.max(25, wakeCooldownMs - Math.max(0, elapsed));
+    const remainingCooldown = wakeCooldownMs - Math.max(0, elapsed);
+    const delay =
+      remainingCooldown > 0
+        ? Math.max(25, remainingCooldown)
+        : Math.max(25, Math.min(wakeCooldownMs, 1000));
     const timer = setTimeout(() => {
       trailingWakes.delete(key);
       if (stopping) return;
@@ -945,6 +972,13 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     });
     if (info.mode !== "inject" && info.mode !== "headless") return info;
     const key = JSON.stringify([repo, message.to]);
+    if (info.mode === "inject" && turnInProgress(target.harness, target.sessionId)) {
+      scheduleTrailingWake(key, repo, message);
+      return {
+        mode: "skip",
+        detail: "turn is in progress; delivering via hook/inbox before queueing",
+      };
+    }
     const last = lastWake.get(key) ?? 0;
     if (waking.has(key) || Date.now() - last < wakeCooldownMs) {
       scheduleTrailingWake(key, repo, message);
