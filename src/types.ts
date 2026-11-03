@@ -100,4 +100,5 @@ export type WakeLaunch = {
   args: string[];
   cwd: string;
   stdin?: string;
+  env?: Record<string, string>;
 };
