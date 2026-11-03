@@ -45,6 +45,17 @@ export type AgentRecord = {
   role: Role;
 };
 
+export type PendingAsk = {
+  id: string;
+  correlation_id: string;
+  seq: number;
+  from: string;
+  to: string | null;
+  topic: string;
+  age_seconds: number;
+  preview: string;
+};
+
 export type PrunedAgent = {
   repo: string;
   name: string;
@@ -82,7 +93,7 @@ export type ClientFrame =
   | { type: "ask"; to: string; body: string; topic?: string }
   | { type: "reply"; correlationId: string; body: string }
   | { type: "report"; body: string }
-  | { type: "status"; status: string }
+  | { type: "status"; status?: string; pending?: boolean; limit?: number }
   | { type: "orchestrator"; name?: string }
   | { type: "register"; name: string; harness: string; cwd: string; sessionId?: string; wake: boolean }
   | { type: "heartbeat" };
@@ -102,7 +113,7 @@ export type ServerFrame =
       orchestrator: string | null;
     }
   | { type: "published"; id: string; seq: number; wake: WakeInfo; correlationId?: string | null }
-  | { type: "ok"; detail: string }
+  | { type: "ok"; detail: string; pending_asks?: PendingAsk[] }
   | { type: "message"; message: BusMessage }
   | { type: "inbox"; messages: BusMessage[]; cursor: number; more: boolean; pendingAsk?: BusMessage | null }
   | { type: "who"; agents: AgentRecord[] }

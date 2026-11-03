@@ -4,6 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { inferClaudeAgentName } from "./accounts.ts";
 import { formatDiagnostics } from "./health.ts";
+import { formatPendingAsks } from "./status.ts";
 import { BusClient } from "./busClient.ts";
 import { ensureDaemon } from "./ensure.ts";
 import { resolveShimCwd } from "./init.ts";
@@ -308,12 +309,20 @@ function registerTools(mcp: McpServer, bus: BusClient, role: Role): void {
   mcp.registerTool(
     "bus_status",
     {
-      description: "Set what this agent is doing. Shown by bus_who. Returns session health and pane/wake warnings.",
-      inputSchema: { status: z.string() },
+      description: "Show workspace status and the most recent unanswered asks with reply correlation IDs. Optionally set this agent's status (shown by bus_who). pending filters out session diagnostics; limit defaults to 50 (max 200).",
+      inputSchema: {
+        status: z.string().optional(),
+        pending: z.boolean().optional(),
+        limit: z.number().int().min(1).max(200).optional(),
+      },
     },
-    async ({ status }) => {
-      const frame = await bus.request({ type: "status", status });
-      return text(frame.type === "ok" ? frame.detail : "status updated");
+    async ({ status, pending, limit }) => {
+      const frame = await bus.request({ type: "status", status, pending, limit });
+      if (frame.type !== "ok" || !frame.pending_asks) return text("pending-ask tracking unavailable; restart the daemon after upgrading");
+      return {
+        ...text(`${pending ? "" : `${frame.detail}\n`}${formatPendingAsks(frame.pending_asks)}`),
+        structuredContent: { ...(pending ? {} : { detail: frame.detail }), pending_asks: frame.pending_asks },
+      };
     },
   );
 }

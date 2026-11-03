@@ -203,9 +203,17 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         void report(conn, frame.body);
         break;
       case "status":
-        conn.status = frame.status;
-        store.touchAgent(conn.repo, conn.name, frame.status);
-        void sendStatus(conn);
+        if (frame.limit !== undefined && (!Number.isInteger(frame.limit) || frame.limit < 1 || frame.limit > 200)) {
+          throw new Error("status limit must be an integer from 1 to 200");
+        }
+        if (frame.status !== undefined) {
+          if (typeof frame.status !== "string") throw new Error("status must be a string");
+          conn.status = frame.status;
+          store.touchAgent(conn.repo, conn.name, frame.status);
+        }
+        void sendStatus(conn, frame).catch((error) => {
+          send(conn.socket, { type: "error", error: error instanceof Error ? error.message : "status failed" });
+        });
         break;
       case "orchestrator":
         setOrchestrator(conn, frame.name);
@@ -270,13 +278,18 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     send(conn.socket, { type: "doctor", agents: rows, pruned });
   }
 
-  async function sendStatus(conn: Conn): Promise<void> {
+  async function sendStatus(conn: Conn, frame: Extract<ClientFrame, { type: "status" }>): Promise<void> {
     // A CLI status update must diagnose the registered/live agent, not its ephemeral CLI socket.
     const rows = agents(conn.repo);
     const row = rows.find((row) => row.name === conn.name && row.sessionId === conn.sessionId)
       ?? rows.find((row) => row.name === conn.name);
-    const detail = row ? formatDiagnostics(await sessionDiagnostics(row, options.paneProbe ?? createPaneProbe())) : "";
-    send(conn.socket, { type: "ok", detail: `status updated${detail ? `; ${detail}` : ""}` });
+    const detail = row && !frame.pending ? formatDiagnostics(await sessionDiagnostics(row, options.paneProbe ?? createPaneProbe())) : "";
+    send(conn.socket, {
+      type: "ok",
+      detail: `${frame.status === undefined ? "status" : "status updated"}${detail ? `; ${detail}` : ""}`,
+      pending_asks: store.pendingAsks(conn.repo, frame.limit, Date.now(),
+        conn.role === "orchestrator" || conn.harness === "cli" ? undefined : conn.name),
+    });
   }
 
   function hello(conn: Conn, frame: Extract<ClientFrame, { type: "hello" }>): void {

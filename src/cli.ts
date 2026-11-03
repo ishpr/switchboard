@@ -14,6 +14,7 @@ import {
   writeSavedAccounts,
 } from "./accounts.ts";
 import { createPaneProbe, formatDiagnostics, sessionDiagnostics } from "./health.ts";
+import { formatPendingAsks } from "./status.ts";
 import { BusClient } from "./busClient.ts";
 import { startDaemon } from "./daemon.ts";
 import { ensureDaemon, readDaemonInfo } from "./ensure.ts";
@@ -140,7 +141,7 @@ function usage(): void {
   ask                   Ask one agent (may wake a headless CLI)
   reply                 Reply to an ask
   report                Report a result or status to the repo's orchestrator
-  status                Update an agent's status string
+  status                Show status and pending asks [--pending] [--json] [--limit 1..200] [--status text]
   orchestrator          Get or set the orchestrator for this repo
   agent add             Register an agent and its wake policy
   account               List or add isolated Claude accounts (list | add)
@@ -510,9 +511,15 @@ async function setStatus(): Promise<void> {
       name: { type: "string" },
       cwd: { type: "string" },
       role: { type: "string" },
+      pending: { type: "boolean", default: false },
+      json: { type: "boolean", default: false },
+      limit: { type: "string" },
     },
   });
-  if (!values.status) throw new Error("status requires --status");
+  const limit = values.limit === undefined ? undefined : Number(values.limit);
+  if (limit !== undefined && (!Number.isInteger(limit) || limit < 1 || limit > 200)) {
+    throw new Error("--limit must be an integer from 1 to 200");
+  }
   const client = await connectCli(
     values.cwd || process.cwd(),
     values.name || process.env.SWITCHBOARD_NAME || "cli",
@@ -522,9 +529,17 @@ async function setStatus(): Promise<void> {
     const frame = await client.request({
       type: "status",
       status: values.status,
+      pending: values.pending,
+      limit,
     });
     if (frame.type !== "ok") throw new Error("unexpected response");
-    process.stdout.write(`${frame.detail}\n`);
+    if (!frame.pending_asks) throw new Error("pending-ask tracking unavailable; restart the daemon after upgrading");
+    if (values.json) {
+      process.stdout.write(`${JSON.stringify({ ...(values.pending ? {} : { detail: frame.detail }), pending_asks: frame.pending_asks })}\n`);
+    } else {
+      if (!values.pending) process.stdout.write(`${frame.detail}\n`);
+      process.stdout.write(`${formatPendingAsks(frame.pending_asks)}\n`);
+    }
   } finally {
     client.close();
   }
