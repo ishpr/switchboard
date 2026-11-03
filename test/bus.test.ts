@@ -1444,6 +1444,7 @@ test("invite reuses live sessions, registers headless CLI wakes without spending
 
   const agy = new BusClient();
   const grok = new BusClient();
+  const claudeWork = new BusClient();
   const otherRepoClient = new BusClient();
 
   try {
@@ -1459,9 +1460,40 @@ test("invite reuses live sessions, registers headless CLI wakes without spending
         wake: true,
       }),
     );
+    // Connect an isolated Claude account ('work') to verify it does NOT shadow shared 'claude'
+    await claudeWork.connect(
+      daemon.url,
+      hello(token, "work", "repo-alpha", {
+        harness: "claude",
+        cwd: "/work/repo-alpha",
+        sessionId: "22222222-2222-4222-8222-222222222222",
+        boundSession: true,
+        wake: true,
+      }),
+    );
     await otherRepoClient.connect(daemon.url, hello(token, "agy", "repo-beta", { harness: "antigravity", cwd: "/work/repo-beta" }));
 
-    // 1. Inviting grok (already online) + muse (offline, terminal mode)
+    // Seed an offline muse row with a stale UUID session_id to verify terminal invite clears it
+    await agy.request({
+      type: "register",
+      name: "muse",
+      harness: "muse",
+      cwd: "/work/repo-alpha",
+      sessionId: "11111111-1111-4111-8111-111111111111",
+      wake: true,
+    });
+
+    // Worker cannot steal orchestrator role via invite when agy is already orchestrator
+    await assert.rejects(
+      grok.request({
+        type: "invite",
+        agents: ["muse"],
+        orchestrator: "grok",
+      }),
+      /orchestrator is already agy/,
+    );
+
+    // 1. Inviting grok (already online) + muse (offline with stale UUID, terminal mode)
     const invited1 = await agy.request({
       type: "invite",
       agents: ["grok", "muse"],
@@ -1482,7 +1514,7 @@ test("invite reuses live sessions, registers headless CLI wakes without spending
     assert.equal(terminalSpawns[0]?.name, "muse");
     assert.equal(wakeLaunches.length, 0); // zero wake turns wasted on invite itself
 
-    // 2. Inviting claude in headless mode registers wake=true without opening a terminal tab
+    // 2. Inviting claude in headless mode registers wake=true even though 'work' (harness=claude) is online
     const invited2 = await agy.request({
       type: "invite",
       agents: ["claude"],
@@ -1496,7 +1528,8 @@ test("invite reuses live sessions, registers headless CLI wakes without spending
     }
     assert.equal(terminalSpawns.length, 1);
 
-    // 3. Subsequent bus_ask to muse injects into tty:/dev/ttys011, and bus_ask to claude runs headless CLI
+    // 3. Subsequent bus_ask to muse injects into tty:/dev/ttys011 (not headless muse exec --session-id),
+    //    and bus_ask to claude runs headless CLI
     const askMuse = await agy.request({ type: "ask", to: "muse", body: "review module A" });
     assert.equal(askMuse.type, "published");
     if (askMuse.type === "published") {
@@ -1520,6 +1553,7 @@ test("invite reuses live sessions, registers headless CLI wakes without spending
   } finally {
     agy.close();
     grok.close();
+    claudeWork.close();
     otherRepoClient.close();
     await daemon.close();
   }

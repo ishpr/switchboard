@@ -192,12 +192,7 @@ function switchboardSessionLine(session = GRID_SESSION): string | null {
       error && typeof error === "object" && "stdout" in error ? String(error.stdout ?? "") : "";
     out = stdout;
   }
-  const lines = out.split("\n");
-  return (
-    lines.find((line) => line.startsWith(`${session} `)) ??
-    lines.find((line) => line.startsWith(`${GRID_SESSION} `)) ??
-    null
-  );
+  return out.split("\n").find((line) => line.startsWith(`${session} `)) ?? null;
 }
 
 function runZellij(args: string[]): Promise<void> {

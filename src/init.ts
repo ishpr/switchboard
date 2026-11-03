@@ -366,12 +366,14 @@ export const defaultSpawnTerminalTab: SpawnTerminalTab = async (spec) => {
     "on run argv",
     "  set launchCmd to item 1 of argv",
     '  tell application "Terminal"',
-    "    activate",
     "    set newTab to do script launchCmd",
     "    repeat 25 times",
     "      try",
     "        set tabTty to tty of newTab",
-    '        if tabTty is not "" then return "tty:" & tabTty',
+    '        if tabTty is not "" then',
+    "          delay 0.4",
+    '          return "tty:" & tabTty',
+    "        end if",
     "      end try",
     "      delay 0.1",
     "    end repeat",
@@ -539,41 +541,21 @@ ${rows.map(row).join("\n")}
 }
 
 export function zshLauncher(cli: string): string {
-  return `# switchboard              attach the grid, or start fresh sessions
-# switchboard --resume    attach, or continue each harness's latest session in this repo
+  return `# switchboard              attach the per-repo grid, or start fresh sessions (switchboard.kdl)
+# switchboard --resume    attach, or continue each harness's latest session in this repo (switchboard-resume.kdl)
 # switchboard -c          same as --resume
 # switchboard who         the bus CLI
 switchboard() {
-  local resume=0
   if [[ \$1 == --resume || \$1 == -c || \$1 == --continue ]]; then
-    if (( \$# > 1 )); then
-      command node ${shellQuote(cli)} --resume "\${@:2}"
-      return
-    fi
-    resume=1
     shift
+    command node ${shellQuote(cli)} --resume "\$@"
+    return
   fi
   if (( \$# )); then
     command node ${shellQuote(cli)} "\$@"
     return
   fi
-  local session=switchboard
-  local layout="\$HOME/.config/zellij/layouts/switchboard.kdl"
-  if (( resume )); then
-    layout="\$HOME/.config/zellij/layouts/switchboard-resume.kdl"
-  fi
-  local state
-  state=\$(zellij list-sessions --no-formatting 2>/dev/null | grep "^\$session " || true)
-  if [[ -n \$state && \$state != *EXITED* ]]; then
-    zellij attach "\$session"
-    return
-  fi
-  if [[ -n \$state ]]; then
-    zellij kill-session "\$session" >/dev/null 2>&1 || true
-    zellij delete-session --force "\$session" >/dev/null 2>&1 || true
-    zellij delete-session "\$session" >/dev/null 2>&1 || true
-  fi
-  zellij --session "\$session" --new-session-with-layout "\$layout"
+  command node ${shellQuote(cli)} start
 }`;
 }
 

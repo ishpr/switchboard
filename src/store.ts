@@ -667,6 +667,41 @@ export class Store {
     return this.getAgent(agent.repo, agent.sessionId ?? agent.name)!;
   }
 
+  saveInvitedAgent(agent: {
+    repo: string;
+    name: string;
+    harness: string;
+    sessionId: string | null;
+    wakeSessionId: string | null;
+    cwd: string;
+    branch: string | null;
+    head: string | null;
+    status: string;
+  }): AgentRecord {
+    const now = Date.now();
+    this.db.prepare("DELETE FROM agents WHERE repo = ? AND name = ?").run(agent.repo, agent.name);
+    const sessionKey = agent.sessionId ?? `name:${agent.name}`;
+    this.db
+      .prepare(
+        `INSERT INTO agents (repo, session_key, name, harness, session_id, wake_session_id, cwd, branch, head, wake, last_seen, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+      )
+      .run(
+        agent.repo,
+        sessionKey,
+        agent.name,
+        agent.harness,
+        agent.sessionId,
+        agent.wakeSessionId,
+        agent.cwd,
+        agent.branch,
+        agent.head,
+        now,
+        agent.status,
+      );
+    return this.getAgent(agent.repo, agent.sessionId ?? agent.name)!;
+  }
+
   touchAgent(repo: string, name: string, status?: string, sessionId?: string | null): void {
     const now = Date.now();
     if (sessionId) {
