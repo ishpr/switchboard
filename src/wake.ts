@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
 import { appendFileSync, existsSync } from "node:fs";
+import { homedir } from "node:os";
+import path from "node:path";
 import type { BusMessage, WakeInfo, WakeLaunch, WakeMode } from "./types.ts";
 
 const CODEX_APP_BIN =
@@ -110,7 +112,23 @@ export function launchFor(input: {
     }
     return null;
   }
-  return headlessLaunch(input.harness, input.cwd, input.sessionId, prompt);
+  const launch = headlessLaunch(input.harness, input.cwd, input.sessionId, prompt);
+  if (!launch) return null;
+  if (input.message.to) {
+    const env: Record<string, string> = {
+      SWITCHBOARD_NAME: input.message.to,
+      SWITCHBOARD_HARNESS: input.harness,
+      SWITCHBOARD_SCOPE: "share",
+    };
+    if (input.harness === "claude") {
+      const acctDir = path.join(homedir(), `.claude-${input.message.to}`);
+      if (existsSync(acctDir)) {
+        env.CLAUDE_CONFIG_DIR = acctDir;
+      }
+    }
+    launch.env = env;
+  }
+  return launch;
 }
 
 export function headlessLaunch(
@@ -189,6 +207,7 @@ export function spawnWake(logFile: string): SpawnWake {
       const child = spawn(launch.cmd, launch.args, {
         cwd: launch.cwd,
         detached: true,
+        env: launch.env ? { ...process.env, ...launch.env } : process.env,
         stdio: launch.stdin === undefined ? "ignore" : ["pipe", "ignore", "ignore"],
       });
       const finish = (error?: Error) => {
