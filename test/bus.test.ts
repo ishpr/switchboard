@@ -948,3 +948,144 @@ test("state get/set/list/delete supports rev compare-and-swap and never triggers
     await fx.daemon.close();
   }
 });
+
+test("default inbox honors session subscriptions, persists them across reconnects, protects repo/presence, and never leaks directed topic mail", async () => {
+  const fx = await fixture();
+  const sender = await join(fx, "claude", "repo-a");
+  const muse1 = await join(fx, "muse", "repo-a", {
+    harness: "muse",
+    sessionId: "01a1957b-b088-76e1-b08b-ad1ac5ed8594",
+    boundSession: true,
+  });
+  const muse2 = await join(fx, "muse", "repo-a", {
+    harness: "muse",
+    sessionId: "01a19366-9ddb-7781-aab6-33bc60c5810a",
+    boundSession: true,
+  });
+  const codex = await join(fx, "codex", "repo-a", {
+    harness: "codex",
+    sessionId: "01a175cd-251c-7571-abb3-21ea77b5d73d",
+    boundSession: true,
+  });
+
+  try {
+    // 1. Broadcast on review BEFORE muse1 subscribes
+    await sender.request({ type: "publish", topic: "review", body: "older review broadcast" });
+
+    // Unsubscribed agents do not see review broadcast in default inbox
+    const unsubInbox = await codex.request({ type: "inbox" });
+    assert.equal(unsubInbox.type, "inbox");
+    if (unsubInbox.type === "inbox") {
+      assert.equal(
+        unsubInbox.messages.some((m) => m.body === "older review broadcast"),
+        false,
+      );
+    }
+
+    // 2. muse1 subscribes to review: response states it is live from now on and how to read older mail
+    const subRes = await muse1.request({ type: "subscribe", topics: ["review"] });
+    assert.equal(subRes.type, "ok");
+    if (subRes.type === "ok") {
+      assert.match(subRes.detail, /live from now on/);
+      assert.match(subRes.detail, /bus_inbox.*topic=review/);
+    }
+
+    // 3. New broadcast on review after muse1 subscribed
+    await sender.request({ type: "publish", topic: "review", body: "live review broadcast" });
+
+    // Directed message to codex on topic review (must reach codex, and must NOT leak to muse1!)
+    await sender.request({
+      type: "publish",
+      topic: "review",
+      to: "codex",
+      body: "private review for codex",
+    });
+
+    // muse1 default inbox gets "live review broadcast", NOT "older review broadcast" and NOT "private review for codex"
+    const muse1Default = await muse1.request({ type: "inbox" });
+    assert.equal(muse1Default.type, "inbox");
+    if (muse1Default.type === "inbox") {
+      const bodies = muse1Default.messages.map((m) => m.body);
+      assert.ok(bodies.includes("live review broadcast"));
+      assert.equal(bodies.includes("older review broadcast"), false);
+      assert.equal(bodies.includes("private review for codex"), false);
+    }
+
+    // muse1 can read older review mail by passing topic="review", still without seeing codex's private review
+    const muse1Topic = await muse1.request({ type: "inbox", topic: "review" });
+    assert.equal(muse1Topic.type, "inbox");
+    if (muse1Topic.type === "inbox") {
+      const bodies = muse1Topic.messages.map((m) => m.body);
+      assert.deepEqual(bodies, ["older review broadcast", "live review broadcast"]);
+    }
+
+    // codex default inbox receives the directed message on review even without subscribing to review, but not the broadcast
+    const codexDefault = await codex.request({ type: "inbox" });
+    assert.equal(codexDefault.type, "inbox");
+    if (codexDefault.type === "inbox") {
+      const bodies = codexDefault.messages.map((m) => m.body);
+      assert.deepEqual(bodies, ["private review for codex"]);
+    }
+
+    // muse2 (different session id of same harness) did NOT subscribe to review and does not see review broadcast
+    const muse2Default = await muse2.request({ type: "inbox" });
+    assert.equal(muse2Default.type, "inbox");
+    if (muse2Default.type === "inbox") {
+      assert.equal(
+        muse2Default.messages.some((m) => m.topic === "review"),
+        false,
+      );
+    }
+
+    // 4. Reconnect muse1 with a brand new BusClient (simulating a new shim for the same Muse session):
+    //    subscription to review is restored from SQLite on connect!
+    muse1.close();
+    const muse1Reconnected = await join(fx, "muse", "repo-a", {
+      harness: "muse",
+      sessionId: "01a1957b-b088-76e1-b08b-ad1ac5ed8594",
+      boundSession: true,
+    });
+    try {
+      const pushedPromise = waitForMessage(muse1Reconnected);
+      await sender.request({ type: "publish", topic: "review", body: "after reconnect review" });
+      const pushed = await pushedPromise;
+      assert.equal(pushed.topic, "review");
+      assert.equal(pushed.body, "after reconnect review");
+
+      const afterReconnInbox = await muse1Reconnected.request({ type: "inbox" });
+      assert.equal(afterReconnInbox.type, "inbox");
+      if (afterReconnInbox.type === "inbox") {
+        assert.ok(afterReconnInbox.messages.some((m) => m.body === "after reconnect review"));
+      }
+
+      // 5. repo and presence cannot be removed by unsubscribe
+      const unsubProtected = await muse1Reconnected.request({
+        type: "unsubscribe",
+        topics: ["repo", "presence", "review"],
+      });
+      assert.equal(unsubProtected.type, "ok");
+      if (unsubProtected.type === "ok") {
+        assert.match(unsubProtected.detail, /repo,presence cannot be removed/);
+      }
+
+      await sender.request({ type: "publish", topic: "repo", body: "repo stays subscribed" });
+      await sender.request({ type: "publish", topic: "review", body: "review was unsubscribed" });
+
+      const finalInbox = await muse1Reconnected.request({ type: "inbox" });
+      assert.equal(finalInbox.type, "inbox");
+      if (finalInbox.type === "inbox") {
+        const bodies = finalInbox.messages.map((m) => m.body);
+        assert.ok(bodies.includes("repo stays subscribed"));
+        assert.equal(bodies.includes("review was unsubscribed"), false);
+      }
+    } finally {
+      muse1Reconnected.close();
+    }
+  } finally {
+    sender.close();
+    muse1.close();
+    muse2.close();
+    codex.close();
+    await fx.daemon.close();
+  }
+});

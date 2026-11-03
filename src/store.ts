@@ -93,6 +93,14 @@ CREATE TABLE IF NOT EXISTS state (
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (repo, key)
 );
+
+CREATE TABLE IF NOT EXISTS subscriptions (
+  repo TEXT NOT NULL,
+  session_key TEXT NOT NULL,
+  topic TEXT NOT NULL,
+  since_seq INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (repo, session_key, topic)
+);
 `;
 
 export class Store {
@@ -348,24 +356,110 @@ export class Store {
     return row ? mapMessage(row) : null;
   }
 
+  maxSeq(repo: string): number {
+    const row = this.db
+      .prepare("SELECT COALESCE(MAX(seq), 0) AS seq FROM messages WHERE repo = ?")
+      .get(repo) as { seq: number };
+    return row.seq;
+  }
+
+  subscribe(repo: string, sessionKey: string, topics: Iterable<string>, sinceSeq = this.maxSeq(repo)): void {
+    const stmt = this.db.prepare(
+      `INSERT INTO subscriptions (repo, session_key, topic, since_seq)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(repo, session_key, topic) DO NOTHING`,
+    );
+    for (const topic of topics) {
+      if (topic === "repo" || topic === "presence") continue;
+      stmt.run(repo, sessionKey, topic, sinceSeq);
+    }
+  }
+
+  unsubscribe(repo: string, sessionKey: string, topics: Iterable<string>): void {
+    const stmt = this.db.prepare(
+      "DELETE FROM subscriptions WHERE repo = ? AND session_key = ? AND topic = ?",
+    );
+    for (const topic of topics) {
+      if (topic === "repo" || topic === "presence") continue;
+      stmt.run(repo, sessionKey, topic);
+    }
+  }
+
+  subscriptions(repo: string, sessionKey: string): Map<string, number> {
+    const rows = this.db
+      .prepare("SELECT topic, since_seq FROM subscriptions WHERE repo = ? AND session_key = ? ORDER BY topic ASC")
+      .all(repo, sessionKey) as { topic: string; since_seq: number }[];
+    return new Map(rows.map((r) => [r.topic, r.since_seq]));
+  }
+
+  migrateSubscriptions(repo: string, fromKey: string, toKey: string): void {
+    if (fromKey === toKey) return;
+    const existing = this.subscriptions(repo, fromKey);
+    if (existing.size === 0) return;
+    const insert = this.db.prepare(
+      `INSERT INTO subscriptions (repo, session_key, topic, since_seq)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(repo, session_key, topic) DO UPDATE SET
+         since_seq = MIN(subscriptions.since_seq, excluded.since_seq)`,
+    );
+    for (const [topic, sinceSeq] of existing) {
+      insert.run(repo, toKey, topic, sinceSeq);
+    }
+  }
+
   inbox(
     repo: string,
     since: number,
-    opts: { topic?: string; to?: string; sessionId?: string | null; limit: number },
+    opts: {
+      topic?: string;
+      to?: string;
+      sessionId?: string | null;
+      subscriptionKey?: string;
+      isOrchestrator?: boolean;
+      limit: number;
+    },
   ): BusMessage[] {
     const limit = Math.max(1, Math.min(opts.limit, 200));
     const topic = opts.topic ?? null;
     const session = opts.sessionId ?? null;
+    if (topic !== null) {
+      const rows = this.db
+        .prepare(
+          `SELECT * FROM messages
+           WHERE repo = ? AND seq > ?
+             AND topic = ?
+             AND (to_name IS NULL OR to_name = '*' OR to_name = ? OR (? IS NOT NULL AND to_name = ?))
+           ORDER BY seq ASC
+           LIMIT ?`,
+        )
+        .all(repo, since, topic, opts.to ?? "", session, session, limit) as Row[];
+      return rows.map(mapMessage);
+    }
+    const subKey = opts.subscriptionKey ?? (session || `name:${opts.to ?? ""}`);
+    const isOrch = opts.isOrchestrator ? 1 : 0;
     const rows = this.db
       .prepare(
-        `SELECT * FROM messages
-         WHERE repo = ? AND seq > ?
-           AND (to_name IS NULL OR to_name = '*' OR to_name = ? OR (? IS NOT NULL AND to_name = ?))
-           AND ((? IS NULL AND topic != 'presence') OR topic = ?)
-         ORDER BY seq ASC
+        `SELECT * FROM messages m
+         WHERE m.repo = ? AND m.seq > ? AND m.topic != 'presence'
+           AND (
+             (m.to_name IS NOT NULL AND m.to_name != '*' AND (m.to_name = ? OR (? IS NOT NULL AND m.to_name = ?)))
+             OR
+             ((m.to_name IS NULL OR m.to_name = '*') AND (
+               m.topic = 'repo'
+               OR (? = 1 AND m.topic = 'reports')
+               OR EXISTS (
+                 SELECT 1 FROM subscriptions sub
+                 WHERE sub.repo = m.repo
+                   AND sub.session_key = ?
+                   AND sub.topic = m.topic
+                   AND m.seq > sub.since_seq
+               )
+             ))
+           )
+         ORDER BY m.seq ASC
          LIMIT ?`,
       )
-      .all(repo, since, opts.to ?? "", session, session, topic, topic, limit) as Row[];
+      .all(repo, since, opts.to ?? "", session, session, isOrch, subKey, limit) as Row[];
     return rows.map(mapMessage);
   }
 
