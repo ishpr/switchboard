@@ -178,6 +178,20 @@ function runZellij(args: string[]): Promise<void> {
   });
 }
 
+function clearZellijSession(session: string): void {
+  for (const args of [
+    ["kill-session", session],
+    ["delete-session", "--force", session],
+    ["delete-session", session],
+  ]) {
+    try {
+      execFileSync("zellij", args, { stdio: "ignore" });
+    } catch {
+      // Ignore if session does not exist or is already stopped
+    }
+  }
+}
+
 async function openGrid(resume: boolean, restart = false): Promise<void> {
   const { values, positionals } = parseArgs({
     args: process.argv.slice(3),
@@ -192,8 +206,8 @@ async function openGrid(resume: boolean, restart = false): Promise<void> {
     cwd: targetCwd,
     restart,
   });
-  if (plan.action === "start" && plan.deleteFirst) {
-    execFileSync("zellij", ["delete-session", "--force", plan.session], { stdio: "ignore" });
+  if (plan.action === "start") {
+    clearZellijSession(plan.session);
   }
   const args =
     plan.action === "attach"

@@ -438,7 +438,11 @@ switchboard() {
     zellij attach "\$session"
     return
   fi
-  [[ -n \$state ]] && zellij delete-session "\$session" >/dev/null 2>&1
+  if [[ -n \$state ]]; then
+    zellij kill-session "\$session" >/dev/null 2>&1 || true
+    zellij delete-session --force "\$session" >/dev/null 2>&1 || true
+    zellij delete-session "\$session" >/dev/null 2>&1 || true
+  fi
   zellij --session "\$session" --new-session-with-layout "\$layout"
 }`;
 }
@@ -526,7 +530,7 @@ export function installSwitchboard(
   notes.push(`zshrc ${zshrc}`);
 
   const agy = path.join(home, ".local/bin/agy");
-  const includeAgy = fresh.some((pane) => pane.name === "Antigravity");
+  const includeAgy = opts.orchestrator === "agy" || fresh.some((pane) => pane.name === "Antigravity");
   if (includeAgy && existsSync(agy)) {
     execFileSync(
       agy,
