@@ -497,6 +497,44 @@ async function agent(): Promise<void> {
   }
 }
 
+function labelToAgentName(label?: string): string | undefined {
+  if (!label) return undefined;
+  const low = label.trim().toLowerCase();
+  if (low.startsWith("pi")) return "pi";
+  if (low.startsWith("eg")) return "eg";
+  if (low.includes("team")) return "team";
+  if (low.includes("servsys")) return "servsys";
+  return undefined;
+}
+
+async function readStdinJson(): Promise<Record<string, unknown> | null> {
+  if (process.stdin.isTTY) return null;
+  return new Promise((resolve) => {
+    let raw = "";
+    const timer = setTimeout(() => resolve(null), 50);
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (chunk: string) => {
+      raw += chunk;
+    });
+    process.stdin.on("end", () => {
+      clearTimeout(timer);
+      if (!raw.trim()) {
+        resolve(null);
+        return;
+      }
+      try {
+        resolve(JSON.parse(raw) as Record<string, unknown>);
+      } catch {
+        resolve(null);
+      }
+    });
+    process.stdin.on("error", () => {
+      clearTimeout(timer);
+      resolve(null);
+    });
+  });
+}
+
 async function hook(): Promise<void> {
   const { values } = parseArgs({
     args: process.argv.slice(3),
@@ -507,14 +545,24 @@ async function hook(): Promise<void> {
       cwd: { type: "string" },
     },
   });
+  const stdinJson = await readStdinJson();
+  if (stdinJson && typeof stdinJson.agent_id === "string" && stdinJson.agent_id.length > 0) {
+    return;
+  }
   const harness = values.harness || process.env.SWITCHBOARD_HARNESS || "";
-  const event = values.event || "";
+  const stdinEvent = stdinJson && typeof stdinJson.hook_event_name === "string" ? stdinJson.hook_event_name : "";
+  const event = values.event || stdinEvent || "";
   if (!harness || !event) throw new Error("hook requires --harness and --event");
   const home = switchboardHome();
   const info = readDaemonInfo(home);
   if (!info) return;
-  const callerName = values.name || process.env.SWITCHBOARD_NAME || harness;
-  const cwd = values.cwd || process.cwd();
+  const callerName =
+    values.name ||
+    process.env.SWITCHBOARD_NAME ||
+    labelToAgentName(process.env.CLAUDE_ACCOUNT_LABEL) ||
+    harness;
+  const stdinCwd = stdinJson && typeof stdinJson.cwd === "string" ? stdinJson.cwd : "";
+  const cwd = values.cwd || stdinCwd || process.cwd();
   let client: BusClient;
   try {
     client = await connectCli(cwd, callerName);

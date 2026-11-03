@@ -23,7 +23,7 @@ export function decideWake(input: {
     return { mode: "skip", detail: "broadcast is stored for subscribers; it does not start a session" };
   }
   const harness = input.harness ?? "";
-  if (input.sessionId && canInject(harness)) {
+  if (input.sessionId && canInject(harness, input.sessionId)) {
     return { mode: "inject", detail: `inject into the ${harness} session` };
   }
   if (input.online && harness === "claude") {
@@ -49,7 +49,8 @@ export function decideWake(input: {
   };
 }
 
-function canInject(harness: string): boolean {
+function canInject(harness: string, sessionId?: string | null): boolean {
+  if (sessionId?.startsWith("zellij:")) return true;
   return harness === "codex" || harness === "muse";
 }
 
@@ -63,6 +64,26 @@ export function launchFor(input: {
   if (input.mode !== "inject" && input.mode !== "headless") return null;
   const prompt = promptFor(input.message);
   if (input.mode === "inject") {
+    if (input.sessionId?.startsWith("zellij:")) {
+      const parts = input.sessionId.split(":");
+      const zSession = parts[1];
+      const zPane = parts[2];
+      if (zSession && zPane) {
+        const oneLine = `[switchboard] Message from ${input.message.fromName} (id=${input.message.id}): call bus_inbox and reply with bus_reply.`;
+        return {
+          cmd: "sh",
+          args: [
+            "-c",
+            'zellij -s "$1" action write-chars -p "$2" "$3" && zellij -s "$1" action write -p "$2" 13',
+            "switchboard-zellij-wake",
+            zSession,
+            zPane,
+            oneLine,
+          ],
+          cwd: input.cwd,
+        };
+      }
+    }
     if (input.harness === "codex" && input.sessionId) {
       return {
         cmd: codexBin(),

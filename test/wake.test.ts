@@ -111,3 +111,25 @@ test("hook stdout matches the harness that can actually attach context", () => {
 
   assert.equal(hookStdout("kimi", "UserPromptSubmit", [message]), "");
 });
+
+test("a zellij-bound session is injected directly into its zellij pane", () => {
+  const info = decideWake({
+    directed: true,
+    online: true,
+    harness: "claude",
+    sessionId: "zellij:claude4:2",
+    wakeEnabled: true,
+  });
+  assert.equal(info.mode, "inject");
+  const launch = launchFor({
+    mode: "inject",
+    harness: "claude",
+    cwd: "/work",
+    sessionId: "zellij:claude4:2",
+    message,
+  });
+  assert.ok(launch);
+  assert.equal(launch.cmd, "sh");
+  assert.ok(launch.args.includes("claude4"));
+  assert.ok(launch.args.includes("2"));
+});

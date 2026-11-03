@@ -78,7 +78,12 @@ export async function runShim(): Promise<void> {
 
   // Omit wake unless the env var is set, so `agent add --wake` survives a later connect.
   const wakeFlag = process.env.SWITCHBOARD_WAKE;
-  const boundSession = Boolean(process.env.SWITCHBOARD_SESSION);
+  const zellijSession =
+    process.env.ZELLIJ_SESSION_NAME && process.env.ZELLIJ_PANE_ID
+      ? `zellij:${process.env.ZELLIJ_SESSION_NAME}:${process.env.ZELLIJ_PANE_ID}`
+      : undefined;
+  const sessionId = process.env.SWITCHBOARD_SESSION || zellijSession;
+  const boundSession = Boolean(sessionId);
   const welcome = await bus.connect(endpoint.url, {
     type: "hello",
     token: endpoint.token,
@@ -86,7 +91,7 @@ export async function runShim(): Promise<void> {
     harness,
     repoKey: repoKey(cwd),
     cwd,
-    sessionId: process.env.SWITCHBOARD_SESSION || undefined,
+    sessionId,
     boundSession,
     ...(wakeFlag === "1" ? { wake: true } : wakeFlag === "0" ? { wake: false } : {}),
     ...(process.env.SWITCHBOARD_ROLE === "orchestrator" ? { role: "orchestrator" as const } : {}),
