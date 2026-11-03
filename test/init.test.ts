@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import {
   chosenIds,
+  claudeAccountPanes,
   gridPlan,
   harnessPanes,
   panesFor,
@@ -117,4 +118,28 @@ test("per-repo config persists different orchestrators for different repos", () 
   assert.deepEqual(cfgA?.panes, ["antigravity", "claude"]);
   assert.equal(cfgB?.orchestrator, "cursor");
   assert.deepEqual(cfgB?.panes, ["orchestrator", "codex"]);
+});
+
+test("claude4 mode expands the Claude choice into all 4 Claude account panes with resume support", () => {
+  const fresh = claudeAccountPanes("/Users/ishprasad/code/servone", false);
+  assert.equal(fresh.length, 4);
+  assert.deepEqual(
+    fresh.map((p) => p.name),
+    ["PI · eprasad7in (Max)", "EG · eprasad7 (Max)", "Servsys · Team", "Servsys · Personal (Max)"],
+  );
+  assert.ok(!fresh[0]?.args?.includes("--resume"));
+
+  const resumed = claudeAccountPanes("/Users/ishprasad/code/servone", true);
+  assert.equal(resumed.length, 4);
+  for (const pane of resumed) {
+    assert.deepEqual(pane.args?.slice(-2), ["--", "--resume"]);
+  }
+
+  const dir = "/Users/ishprasad/.config/zellij/layouts";
+  assert.deepEqual(gridPlan(true, "switchboard [Created 1m ago]", dir, { restart: true }), {
+    action: "start",
+    session: "switchboard",
+    layout: "/Users/ishprasad/.config/zellij/layouts/switchboard-resume.kdl",
+    deleteFirst: true,
+  });
 });

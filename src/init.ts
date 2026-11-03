@@ -14,6 +14,7 @@ export type RepoConfig = {
   repoRoot: string;
   orchestrator: string;
   panes?: string[];
+  claude4?: boolean;
   updatedAt: number;
 };
 
@@ -34,7 +35,7 @@ export function readRepoConfig(cwd: string, home = switchboardHome()): RepoConfi
 
 export function writeRepoConfig(
   cwd: string,
-  update: { orchestrator?: string; panes?: string[] },
+  update: { orchestrator?: string; panes?: string[]; claude4?: boolean },
   home = switchboardHome(),
 ): RepoConfig {
   const key = repoKey(cwd);
@@ -45,6 +46,7 @@ export function writeRepoConfig(
     repoRoot: root,
     orchestrator: update.orchestrator ?? existing?.orchestrator ?? "cursor",
     panes: update.panes ?? existing?.panes,
+    claude4: update.claude4 ?? existing?.claude4,
     updatedAt: Date.now(),
   };
   const dir = path.join(home, "repos");
@@ -69,9 +71,25 @@ export type GridPlan =
   | { action: "start"; session: string; layout: string; deleteFirst: boolean };
 
 /** What `switchboard` or `switchboard --resume` should do with the Zellij session. */
-export function gridPlan(resume: boolean, sessionLine: string | null, layoutDir: string): GridPlan {
-  const layout = path.join(layoutDir, resume ? "switchboard-resume.kdl" : "switchboard.kdl");
-  if (sessionLine && !sessionLine.includes("EXITED")) {
+export function gridPlan(
+  resume: boolean,
+  sessionLine: string | null,
+  layoutDir: string,
+  opts: { cwd?: string; restart?: boolean } = {},
+): GridPlan {
+  let layoutName = resume || opts.restart ? "switchboard-resume.kdl" : "switchboard.kdl";
+  if (opts.cwd) {
+    const key = repoKey(opts.cwd);
+    const repoCandidate = path.join(
+      layoutDir,
+      resume || opts.restart ? `switchboard-${key}-resume.kdl` : `switchboard-${key}.kdl`,
+    );
+    if (existsSync(repoCandidate)) {
+      layoutName = path.basename(repoCandidate);
+    }
+  }
+  const layout = path.join(layoutDir, layoutName);
+  if (!opts.restart && sessionLine && !sessionLine.includes("EXITED")) {
     return { action: "attach", session: GRID_SESSION };
   }
   return {
@@ -235,12 +253,89 @@ export function chosenIds(answer: string, choices: PaneChoice[]): string[] {
   return ids;
 }
 
-export function panesFor(ids: string[], resume: boolean, choices = gridChoices()): PaneSpec[] {
+export type ClaudeAccountSpec = {
+  id: "pi" | "eg" | "team" | "servsys";
+  pane: string;
+  configDir: string;
+  email: string;
+  plan: "max" | "team";
+  label: string;
+  wsSubdir: string;
+};
+
+export const CLAUDE_ACCOUNTS: ClaudeAccountSpec[] = [
+  {
+    id: "pi",
+    pane: "PI · eprasad7in (Max)",
+    configDir: path.join(homedir(), ".claude-pi"),
+    email: "eprasad7in@gmail.com",
+    plan: "max",
+    label: "PI eprasad7in",
+    wsSubdir: "pi",
+  },
+  {
+    id: "eg",
+    pane: "EG · eprasad7 (Max)",
+    configDir: path.join(homedir(), ".claude-eg"),
+    email: "eprasad7@gmail.com",
+    plan: "max",
+    label: "EG eprasad7",
+    wsSubdir: "eg",
+  },
+  {
+    id: "team",
+    pane: "Servsys · Team",
+    configDir: path.join(homedir(), ".claude-team"),
+    email: "eprasad@servsys.com",
+    plan: "team",
+    label: "Servsys Team",
+    wsSubdir: "team",
+  },
+  {
+    id: "servsys",
+    pane: "Servsys · Personal (Max)",
+    configDir: path.join(homedir(), ".claude-servsys"),
+    email: "eprasad@servsys.com",
+    plan: "max",
+    label: "Servsys Personal",
+    wsSubdir: "servsys",
+  },
+];
+
+export function claudeAccountPanes(targetRepo: string, resume: boolean): PaneSpec[] {
+  const repoName = path.basename(gitRepoRoot(targetRepo));
+  const cmd = homeBin("claude-acct");
+  return CLAUDE_ACCOUNTS.map((acct) => {
+    const wsRepo = path.join(homedir(), "claude-ws", acct.wsSubdir, repoName);
+    const rootDir = existsSync(wsRepo) ? wsRepo : path.join(homedir(), "claude-ws", acct.wsSubdir);
+    const baseArgs = [acct.configDir, acct.email, acct.plan, acct.label, rootDir];
+    return {
+      name: acct.pane,
+      command: cmd,
+      args: resume ? [...baseArgs, "--", "--resume"] : baseArgs,
+    };
+  });
+}
+
+export function panesFor(
+  ids: string[],
+  resume: boolean,
+  choices = gridChoices(),
+  opts: { claude4?: boolean; targetRepo?: string } = {},
+): PaneSpec[] {
   const wanted = new Set(ids);
-  const panes = HARNESSES.filter((def) => wanted.has(def.id))
-    .filter((def) => def.shell || choices.find((choice) => choice.id === def.id)?.command)
-    .map((def) => paneFrom(def, resume, choices.find((choice) => choice.id === def.id)?.command ?? def.candidates[0] ?? null));
-  return panes.length > 0 ? panes : [{ name: "Bus" }];
+  const out: PaneSpec[] = [];
+  for (const def of HARNESSES) {
+    if (!wanted.has(def.id)) continue;
+    if (def.id === "claude" && opts.claude4 && opts.targetRepo) {
+      out.push(...claudeAccountPanes(opts.targetRepo, resume));
+      continue;
+    }
+    const foundCmd = choices.find((choice) => choice.id === def.id)?.command;
+    if (!def.shell && !foundCmd) continue;
+    out.push(paneFrom(def, resume, foundCmd ?? def.candidates[0] ?? null));
+  }
+  return out.length > 0 ? out : [{ name: "Bus" }];
 }
 
 function paneFrom(def: HarnessDef, resume: boolean, command: string | null): PaneSpec {
@@ -340,6 +435,7 @@ export function installSwitchboard(
     targetRepo?: string;
     orchestrator?: string;
     panes?: string[];
+    claude4?: boolean;
     home?: string;
     fresh?: PaneSpec[];
     resume?: PaneSpec[];
@@ -372,7 +468,7 @@ export function installSwitchboard(
     notes.push(`repo layout ${repoLayoutPath}`);
     const cfg = writeRepoConfig(
       targetRepo,
-      { orchestrator: opts.orchestrator, panes: opts.panes },
+      { orchestrator: opts.orchestrator, panes: opts.panes, claude4: opts.claude4 },
       opts.home ?? switchboardHome(),
     );
     notes.push(`repo config ${repoConfigPath(cfg.repoKey, opts.home ?? switchboardHome())} (orchestrator=${cfg.orchestrator})`);
@@ -442,10 +538,12 @@ export async function init(
 ): Promise<void> {
   const { values } = parseArgs({
     args: process.argv.slice(3),
+    allowNegative: true,
     options: {
       orchestrator: { type: "string" },
       panes: { type: "string" },
       cwd: { type: "string" },
+      claude4: { type: "boolean" },
     },
   });
   const targetCwd = values.cwd ? path.resolve(values.cwd) : process.cwd();
@@ -456,6 +554,12 @@ export async function init(
   if (ids.length === 0) {
     stdout.write("Nothing matched. Using the panes found on this machine.\n");
     ids = chosenIds("", choices);
+  }
+  const useClaude4 =
+    values.claude4 ??
+    (answer.toLowerCase().includes("claude4") ? true : existingCfg?.claude4 ?? false);
+  if (useClaude4 && !ids.includes("claude")) {
+    ids.push("claude");
   }
   for (const choice of choices) {
     if (ids.includes(choice.id) && !choice.found) stdout.write(`skipped ${choice.pane}: not found\n`);
@@ -471,19 +575,22 @@ export async function init(
     }
   }
   const orchestrator = resolveOrchestratorName(orchRaw ?? "", defaultOrch);
+  const freshPanes = panesFor(ids, false, choices, { claude4: useClaude4, targetRepo: targetCwd });
+  const resumePanes = panesFor(ids, true, choices, { claude4: useClaude4, targetRepo: targetCwd });
   const notes = installSwitchboard({
     targetRepo: targetCwd,
     orchestrator,
     panes: ids,
-    fresh: panesFor(ids, false, choices),
-    resume: panesFor(ids, true, choices),
+    claude4: useClaude4,
+    fresh: freshPanes,
+    resume: resumePanes,
   });
   if (onOrchestratorChosen) {
     await onOrchestratorChosen(targetCwd, orchestrator);
   }
   for (const note of notes) stdout.write(`${note}\n`);
-  const names = panesFor(ids, false, choices).map((pane) => pane.name);
+  const names = freshPanes.map((pane) => pane.name);
   stdout.write(`panes ${names.join(", ")}\n`);
   stdout.write(`orchestrator ${orchestrator}\n`);
-  stdout.write("Open a new terminal and run: switchboard\n");
+  stdout.write("Open a new terminal and run: switchboard (or switchboard --resume)\n");
 }
