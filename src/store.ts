@@ -679,12 +679,26 @@ export class Store {
     status: string;
   }): AgentRecord {
     const now = Date.now();
-    this.db.prepare("DELETE FROM agents WHERE repo = ? AND name = ?").run(agent.repo, agent.name);
     const sessionKey = agent.sessionId ?? `name:${agent.name}`;
     this.db
       .prepare(
+        "DELETE FROM agents WHERE repo = ? AND name = ? AND (session_key = ? OR status = 'invited' OR session_id IS NULL)",
+      )
+      .run(agent.repo, agent.name, `name:${agent.name}`);
+    this.db
+      .prepare(
         `INSERT INTO agents (repo, session_key, name, harness, session_id, wake_session_id, cwd, branch, head, wake, last_seen, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+         ON CONFLICT(repo, session_key) DO UPDATE SET
+           harness = excluded.harness,
+           session_id = excluded.session_id,
+           wake_session_id = excluded.wake_session_id,
+           cwd = excluded.cwd,
+           branch = COALESCE(excluded.branch, agents.branch),
+           head = COALESCE(excluded.head, agents.head),
+           wake = 1,
+           last_seen = excluded.last_seen,
+           status = excluded.status`,
       )
       .run(
         agent.repo,
@@ -766,14 +780,18 @@ export class Store {
     const bySession = this.getAgentBySession(repo, nameOrSession);
     if (bySession) return bySession;
     const row = this.db
-      .prepare("SELECT * FROM agents WHERE repo = ? AND name = ? ORDER BY last_seen DESC LIMIT 1")
+      .prepare(
+        "SELECT * FROM agents WHERE repo = ? AND name = ? ORDER BY last_seen DESC, CASE WHEN status = 'invited' THEN 1 ELSE 0 END DESC, rowid DESC LIMIT 1",
+      )
       .get(repo, nameOrSession) as AgentRow | undefined;
     return row ? mapAgent(row, false) : undefined;
   }
 
   listAgents(repo: string, onlineNames: Set<string>): AgentRecord[] {
     const rows = this.db
-      .prepare("SELECT * FROM agents WHERE repo = ? ORDER BY name, session_id")
+      .prepare(
+        "SELECT * FROM agents WHERE repo = ? ORDER BY name, last_seen DESC, CASE WHEN status = 'invited' THEN 1 ELSE 0 END DESC, rowid DESC",
+      )
       .all(repo) as AgentRow[];
     return rows.map((row) => mapAgent(row, onlineNames.has(row.name)));
   }

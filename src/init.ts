@@ -349,6 +349,62 @@ export type SpawnTerminalTab = (spec: {
   args: string[];
 }) => Promise<string>;
 
+export function isHarnessProcessInPsOutput(psOut: string, cmd: string, harness: string): boolean {
+  const targetBin = path.basename(cmd).toLowerCase();
+  const targetHarness = harness.toLowerCase();
+  const shells = new Set(["login", "-zsh", "zsh", "-bash", "bash", "-sh", "sh", "ps"]);
+  for (const rawLine of psOut.split("\n")) {
+    const trimmed = rawLine.trim();
+    if (!trimmed) continue;
+    const tokens = trimmed.split(/\s+/).filter((tok) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(tok));
+    if (tokens.length === 0) continue;
+    const firstBin = path.basename(tokens[0]!).toLowerCase();
+    if (!firstBin || shells.has(firstBin)) continue;
+    for (const tok of tokens) {
+      const base = path.basename(tok).toLowerCase();
+      if (!base) continue;
+      if (base.includes(targetBin) || base.includes(targetHarness)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+export function isActiveZellijGridSession(listSessionsOutput: string, sessionName: string): boolean {
+  for (const rawLine of listSessionsOutput.split("\n")) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (line === sessionName || line.startsWith(`${sessionName} `)) {
+      return !line.includes("EXITED");
+    }
+  }
+  return false;
+}
+
+export function parseZellijPaneForInvitedAgent(
+  psEwwOut: string,
+  zSession: string,
+  agentName: string,
+  cmd: string,
+  harness: string,
+): string | null {
+  for (const rawLine of psEwwOut.split("\n")) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const sMatch = /(?:^|\s)ZELLIJ_SESSION_NAME=([^\s]+)/.exec(line);
+    if (!sMatch || sMatch[1] !== zSession) continue;
+    const nMatch = /(?:^|\s)SWITCHBOARD_NAME=([^\s]+)/.exec(line);
+    if (!nMatch || nMatch[1] !== agentName) continue;
+    const pMatch = /(?:^|\s)ZELLIJ_PANE_ID=(\d+)/.exec(line);
+    if (!pMatch) continue;
+    if (isHarnessProcessInPsOutput(line, cmd, harness)) {
+      return `zellij:${zSession}:${pMatch[1]}`;
+    }
+  }
+  return null;
+}
+
 export const defaultSpawnTerminalTab: SpawnTerminalTab = async (spec) => {
   const envExports = [
     `SWITCHBOARD_CWD=${shellQuote(spec.cwd)}`,
@@ -362,6 +418,68 @@ export const defaultSpawnTerminalTab: SpawnTerminalTab = async (spec) => {
   }
   const cmdString = [spec.cmd, ...spec.args].map(shellQuote).join(" ");
   const shellLine = `cd ${shellQuote(spec.cwd)} && export ${envExports.join(" ")} && exec ${cmdString}`;
+
+  const zSession = gridSessionName(spec.cwd);
+  if (zSession && zSession !== GRID_SESSION) {
+    let listOut = "";
+    try {
+      listOut = execFileSync("zellij", ["list-sessions", "--no-formatting"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+    } catch {
+      // Zellij not running or not installed; fall back to Terminal.app
+    }
+    if (isActiveZellijGridSession(listOut, zSession)) {
+      try {
+        execFileSync(
+          "zellij",
+          [
+            "-s",
+            zSession,
+            "action",
+            "new-pane",
+            "--cwd",
+            spec.cwd,
+            "--name",
+            spec.name,
+            "--",
+            "zsh",
+            "-lc",
+            shellLine,
+          ],
+          { stdio: ["ignore", "ignore", "ignore"] },
+        );
+        const zDeadline = Date.now() + 3000;
+        while (Date.now() < zDeadline) {
+          try {
+            const psEww = execFileSync("ps", ["eww", "-o", "command="], {
+              encoding: "utf8",
+              stdio: ["ignore", "pipe", "ignore"],
+            });
+            const paneSession = parseZellijPaneForInvitedAgent(
+              psEww,
+              zSession,
+              spec.name,
+              spec.cmd,
+              spec.harness,
+            );
+            if (paneSession) return paneSession;
+          } catch {
+            // Keep polling until deadline
+          }
+          await new Promise((r) => setTimeout(r, 120));
+        }
+        throw new Error(`Timed out waiting for ${spec.name} (${spec.harness}) to start in Zellij session ${zSession}`);
+      } catch (err) {
+        if (err instanceof Error && err.message.startsWith("Timed out waiting for")) {
+          throw err;
+        }
+        // If zellij action new-pane failed, fall through to Terminal.app
+      }
+    }
+  }
+
   const script = [
     "on run argv",
     "  set launchCmd to item 1 of argv",
@@ -371,7 +489,6 @@ export const defaultSpawnTerminalTab: SpawnTerminalTab = async (spec) => {
     "      try",
     "        set tabTty to tty of newTab",
     '        if tabTty is not "" then',
-    "          delay 0.4",
     '          return "tty:" & tabTty',
     "        end if",
     "      end try",
@@ -387,6 +504,27 @@ export const defaultSpawnTerminalTab: SpawnTerminalTab = async (spec) => {
   }).trim();
   if (!out.startsWith("tty:/dev/ttys")) {
     throw new Error(`Terminal.app did not return a valid tty (got: ${out || "empty"})`);
+  }
+  const shortTty = out.replace(/^tty:\/dev\//, "");
+  const deadline = Date.now() + 3000;
+  let matched = false;
+  while (Date.now() < deadline) {
+    try {
+      const psOut = execFileSync("ps", ["-t", shortTty, "-o", "args="], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      if (isHarnessProcessInPsOutput(psOut, spec.cmd, spec.harness)) {
+        matched = true;
+        break;
+      }
+    } catch {
+      // Wait for TTY process table entry
+    }
+    await new Promise((r) => setTimeout(r, 120));
+  }
+  if (!matched) {
+    throw new Error(`Timed out waiting for ${spec.name} (${spec.harness}) to start on ${out}`);
   }
   return out;
 };
@@ -730,8 +868,6 @@ export function installSwitchboard(
         "SWITCHBOARD_NAME=agy",
         "--env",
         "SWITCHBOARD_SCOPE=share",
-        "--env",
-        `SWITCHBOARD_CWD=${targetRepo}`,
         "switchboard",
         "--",
         process.execPath,

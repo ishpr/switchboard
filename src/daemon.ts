@@ -334,7 +334,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       ? [...new Set([...store.listRepos(), ...[...conns].filter((peer) => peer.authed).map((peer) => peer.repo)])].sort()
       : [conn.repo];
     const probe = options.paneProbe ?? createPaneProbe();
-    const candidates = repos.flatMap((repo) => agents(repo)).map((agent) => ({
+    const candidates = repos.flatMap((repo) => agents(repo, { includeAllOffline: true })).map((agent) => ({
       agent,
       stored: store.getAgent(agent.repo, agent.sessionId || agent.name),
     }));
@@ -348,7 +348,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         const stored = candidates[i]!.stored;
         const reason = row.diagnostics.health;
         if (reason !== "dead_pane" && reason !== "stale") continue;
-        const current = agents(row.repo).find((peer) => peer.name === row.name && peer.sessionId === row.sessionId);
+        const current = agents(row.repo, { includeAllOffline: true }).find((peer) => peer.name === row.name && peer.sessionId === row.sessionId);
         if (!current || current.lastSeen !== row.lastSeen) continue;
         // Only mutate the registration if it still belongs to the scanned session.
         const targetId = row.sessionId ?? row.wakeSessionId ?? null;
@@ -884,10 +884,24 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     frame: Extract<ClientFrame, { type: "register" }>,
     respond: Respond,
   ): void {
-    requireBoundRepo(conn);
     requireName(frame.name);
     if (!frame.cwd || frame.cwd === "/") throw new Error('cannot register: cwd is "/"');
     if (!frame.harness) throw new Error("harness required");
+    if (conn.cwd === "/" || (frame.rebind && conn.harness !== "cli")) {
+      const targetRoot = gitRepoRoot(frame.cwd);
+      if (!existsSync(frame.cwd) || !existsSync(`${targetRoot}/.git`)) {
+        throw new Error(`cannot bind repository: ${frame.cwd} is not a git checkout`);
+      }
+      const nextRepo = repoKey(targetRoot);
+      if (conn.repo && conn.repo !== nextRepo) {
+        store.evictCrossRepoBinding(nextRepo, conn.sessionId, conn.wakeSessionId);
+      }
+      conn.cwd = targetRoot;
+      conn.repo = nextRepo;
+      const orch = store.getOrchestrator(conn.repo);
+      conn.role = orch === conn.name ? "orchestrator" : "worker";
+    }
+    requireBoundRepo(conn);
     if (
       frame.cwd !== conn.cwd &&
       existsSync(frame.cwd) &&
@@ -900,7 +914,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     ) {
       throw new Error("cannot register: cwd belongs to a different repository board");
     }
-    if (isSessionLiveInOtherRepo(conn.repo, frame.sessionId, frame.wakeSessionId)) {
+    if (isSessionLiveInOtherRepo(conn.repo, frame.sessionId, frame.wakeSessionId, conn)) {
       throw new Error("cannot register: session is currently active in another repository board");
     }
     store.evictCrossRepoBinding(conn.repo, frame.sessionId, frame.wakeSessionId);
@@ -922,7 +936,10 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         ? { branch: frame.branch ?? null, head: frame.head ?? null }
         : gitCheckoutInfo(frame.cwd);
     const wake = frame.wake === undefined ? (existing?.wake ?? conn.wake) : frame.wake;
-    const status = conn.harness === "cli" ? (existing?.status || "registered") : (conn.status || "online");
+    const status =
+      conn.harness === "cli" || conn.name !== frame.name
+        ? (existing?.status || "registered")
+        : (conn.status || "online");
     const saved = store.upsertAgent({
       repo: conn.repo,
       name: frame.name,
@@ -936,7 +953,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       status,
       bySession: Boolean(frame.sessionId),
     });
-    if (conn.harness !== "cli") {
+    if (conn.harness !== "cli" && conn.name === frame.name) {
       if (frame.sessionId) {
         conn.declaredSession = frame.sessionId;
         conn.sessionId = frame.sessionId;
@@ -1094,6 +1111,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         head: checkout.head,
         status: "invited",
       });
+      const actionLabel = ttySession.startsWith("zellij:") ? "Zellij pane" : "Terminal tab";
       invited.push({
         name: spec.name,
         harness: spec.harness,
@@ -1101,7 +1119,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         sessionId: null,
         wakeSessionId: ttySession,
         wakeMode: "inject",
-        detail: `opened Terminal tab (${ttySession}) in ${repoRootDir}`,
+        detail: `opened ${actionLabel} (${ttySession}) in ${repoRootDir}`,
       });
     }
 
@@ -1155,11 +1173,13 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     repo: string,
     sessionId?: string | null,
     wakeSessionId?: string | null,
+    ignorePeer?: Conn,
   ): boolean {
     for (const id of [sessionId, wakeSessionId]) {
       if (!id) continue;
       for (const peer of conns) {
         if (
+          peer !== ignorePeer &&
           peer.authed &&
           peer.repo !== repo &&
           peer.cwd !== "/" &&
@@ -1311,14 +1331,16 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       name: live?.name ?? row!.name,
       declaredSession: live?.declaredSession ?? row?.sessionId ?? null,
       harness: live?.sessionBound ? live.harness : row?.harness ?? live!.harness,
-      sessionId: live ? (liveWakeSession || row?.sessionId || null) : (row?.sessionId || row?.wakeSessionId || null),
+      sessionId: live
+        ? (liveWakeSession || row?.sessionId || null)
+        : ((row?.status === "invited" ? (row.wakeSessionId || row.sessionId) : (row?.sessionId || row?.wakeSessionId)) || null),
       cwd: live?.sessionBound ? live.cwd : row?.cwd ?? live!.cwd,
       wake: row?.wake ?? live?.wake ?? false,
       online: Boolean(live),
     };
   }
 
-  function agents(repo: string): AgentRecord[] {
+  function agents(repo: string, opts?: { includeAllOffline?: boolean }): AgentRecord[] {
     const orchestrator = store.getOrchestrator(repo);
     const nonWaitConns = [...conns].filter(
       (c) => c.authed && c.repo === repo && c.harness !== "cli" && !c.waitOnly,
@@ -1365,20 +1387,28 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         builds: counted.flatMap((member) => (member.build ? [member.build] : [])),
       };
     });
+    const includeAllOffline = Boolean(opts?.includeAllOffline);
     const liveNames = new Set(rows.map((row) => row.name));
     const liveSessions = new Set(rows.flatMap((row) => (row.sessionId ? [row.sessionId] : [])));
+    const seenOfflineByName = new Set<string>();
+    const staleCutoff = Date.now() - 24 * 60 * 60 * 1000;
     for (const row of store.listAgents(repo, new Set())) {
       const represented = row.sessionId
-        ? liveSessions.has(row.sessionId) || rows.some((live) => live.name === row.name && !live.sessionId)
+        ? liveSessions.has(row.sessionId) || rows.some((live) => live.online && live.name === row.name && !live.sessionId)
         : liveNames.has(row.name);
-      if (!represented) {
-        rows.push({
-          ...row,
-          wakeSessionId: row.sessionId || row.wakeSessionId || null,
-          connectionCount: 0,
-          role: row.name === orchestrator ? "orchestrator" : "worker",
-        });
+      if (represented) continue;
+      if (!includeAllOffline && row.status !== "invited") {
+        if (liveNames.has(row.name)) continue;
+        if (seenOfflineByName.has(row.name)) continue;
+        if (!row.wake && row.lastSeen < staleCutoff) continue;
+        seenOfflineByName.add(row.name);
       }
+      rows.push({
+        ...row,
+        wakeSessionId: row.sessionId || row.wakeSessionId || null,
+        connectionCount: 0,
+        role: row.name === orchestrator ? "orchestrator" : "worker",
+      });
     }
     rows.sort((a, b) => a.name.localeCompare(b.name) || (a.sessionId ?? "").localeCompare(b.sessionId ?? ""));
     return rows;
@@ -1415,7 +1445,7 @@ function send(socket: WebSocket, frame: ServerFrame): void {
 function requireBoundRepo(conn: Conn): void {
   if (!conn.cwd || conn.cwd === "/" || !conn.repo) {
     throw new Error(
-      'session is not bound to a repository checkout (cwd is "/"); start the harness inside a repo or set SWITCHBOARD_CWD',
+      'session is not bound to a repository checkout (cwd is "/"); call bus_register({ cwd: "<absolute-repo-path>" }) first to bind this session to your current workspace',
     );
   }
 }

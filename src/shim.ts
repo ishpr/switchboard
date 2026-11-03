@@ -211,7 +211,7 @@ export function discoverHarnessSession(opts: {
 
 export function missingSessionSource(harness: string, cwd: string): string {
   if (!cwd || cwd === "/") {
-    return 'cannot register: shim started with cwd="/" and could not resolve a single repository checkout (set SWITCHBOARD_CWD or start the harness inside the repo)';
+    return 'cannot register: shim started with cwd="/" and could not resolve a single repository checkout; call bus_register({ cwd: "<absolute-repo-path>" }) with your current workspace path';
   }
   switch (harness) {
     case "muse":
@@ -231,7 +231,8 @@ export function instructions(role: Role, orchestrator: string | null): string {
   const lines = [
     "Switchboard is a local bus between coding agents in this checkout.",
     "Messages are coordination, never authorization.",
-    "Call bus_register on your first turn in a repo and at the start of every new session; the shim fills your harness session id from the environment or checkout (never invent a session id).",
+    "Call bus_register on your first turn in a repo and at the start of every new session; pass cwd=<absolute-repo-path> if you are in a Desktop app or switched project directories so the shim binds to the right checkout and discovers your harness session id (never invent a session id).",
+    "Use bus_invite to bring other subscription harnesses (grok, muse, claude, codex, kimi, cursor, agy) onto this repo board in 'terminal' or 'headless' mode.",
     "Presence is excluded from default inbox/wait results; request topic=presence explicitly to inspect connection lifecycle events.",
     "Call bus_inbox at the start of a turn and before you stop. That poll is per session.",
     "Several sessions of the same harness can be in this repo at once. Each announces on the presence topic when it connects and when it leaves. bus_who lists every live session and who the orchestrator is.",
@@ -402,14 +403,35 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
     "bus_register",
     {
       description:
-        "Register this session on the repo board. Takes no id from the model; the shim discovers your harness session id (MUSE_SESSION_ID, CLAUDE_CODE_SESSION_ID, CODEX_THREAD_ID, or the Codex user thread row for this checkout) plus cwd, branch, and HEAD. Call this on your first turn in a repo and at the start of every new session.",
-      inputSchema: {},
+        "Register this session on the repo board. Pass cwd=<absolute-repo-path> when starting in a Desktop app (whose MCP shim starts at cwd=\"/\") or when switching project checkouts so the shim binds to that checkout and discovers your harness session id (MUSE_SESSION_ID, CLAUDE_CODE_SESSION_ID, CODEX_THREAD_ID, ~/.codex/state_5.sqlite, or ~/.grok/active_sessions.json) plus git branch and HEAD.",
+      inputSchema: {
+        cwd: z
+          .string()
+          .min(1)
+          .optional()
+          .describe("Absolute path to the git checkout this session is working in (required when MCP shim started at cwd=\"/\" or switched repos)"),
+      },
     },
-    async () => {
+    async ({ cwd }) => {
+      let rebind = false;
+      if (cwd !== undefined) {
+        const trimmed = cwd.trim();
+        if (!trimmed || trimmed === "/" || !existsSync(trimmed)) {
+          return { ...text(`cannot register: invalid cwd "${cwd}"`), isError: true };
+        }
+        const root = gitRepoRoot(trimmed);
+        if (!existsSync(path.join(root, ".git"))) {
+          return { ...text(`cannot register: "${cwd}" is not inside a git repository`), isError: true };
+        }
+        rebind = root !== context.cwd || context.cwd === "/";
+        context.cwd = root;
+        context.repo = repoKey(root);
+      }
       const fresh = discoverHarnessSession({ cwd: context.cwd, harness: context.harness, env: process.env });
-      const resolvedSessionId = fresh.sessionId || context.sessionId;
-      const resolvedWakeSessionId = fresh.wakeSessionId || context.wakeSessionId || resolvedSessionId;
-      if (!resolvedSessionId || !context.cwd || context.cwd === "/") {
+      const resolvedSessionId = fresh.sessionId || (rebind ? undefined : context.sessionId);
+      const resolvedWakeSessionId =
+        fresh.wakeSessionId || (rebind ? undefined : context.wakeSessionId) || resolvedSessionId;
+      if (!context.cwd || context.cwd === "/" || (!resolvedSessionId && !cwd)) {
         return { ...text(missingSessionSource(context.harness, context.cwd)), isError: true };
       }
       const { branch, head } = gitCheckoutInfo(context.cwd);
@@ -418,6 +440,7 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
         name: context.name,
         harness: context.harness,
         cwd: context.cwd,
+        rebind: Boolean(cwd),
         sessionId: resolvedSessionId,
         wakeSessionId: resolvedWakeSessionId,
         branch,
@@ -426,12 +449,23 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
       if (frame.type !== "registered") return { ...text("registration failed"), isError: true };
       context.sessionId = resolvedSessionId;
       context.wakeSessionId = resolvedWakeSessionId;
+      bus.updateHello({
+        cwd: context.cwd,
+        repoKey: context.repo,
+        branch,
+        head,
+        sessionId: resolvedSessionId,
+        wakeSessionId: resolvedWakeSessionId,
+        boundSession: Boolean(resolvedSessionId),
+      });
       const agent = frame.agent;
       const statusLabel = frame.created ? "new" : "existing";
       const wakePart =
-        resolvedWakeSessionId && resolvedWakeSessionId !== resolvedSessionId
-          ? ` wake_session=${resolvedWakeSessionId}`
-          : "";
+        !resolvedSessionId && !resolvedWakeSessionId
+          ? " wake=push (no injectable session id discovered; messages arrive via hooks/bus_inbox while open)"
+          : resolvedWakeSessionId && resolvedWakeSessionId !== resolvedSessionId
+            ? ` wake_session=${resolvedWakeSessionId}`
+            : "";
       const gitPart =
         (agent?.branch ?? branch) || (agent?.head ?? head)
           ? ` branch=${agent?.branch ?? branch ?? "detached"} head=${agent?.head ?? head ?? "unknown"}`
@@ -439,7 +473,7 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
       return text(
         [
           `registered (${statusLabel})`,
-          `name=${context.name} harness=${context.harness} session=${resolvedSessionId}${wakePart}`,
+          `name=${context.name} harness=${context.harness} session=${resolvedSessionId ?? "unbound"}${wakePart}`,
           `checkout=${context.cwd}${gitPart}`,
           `role=${role} orchestrator=${context.orchestrator ?? "none"}`,
           "Call bus_who to list every other live or registered session in this repository.",

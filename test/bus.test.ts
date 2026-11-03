@@ -1473,7 +1473,16 @@ test("invite reuses live sessions, registers headless CLI wakes without spending
     );
     await otherRepoClient.connect(daemon.url, hello(token, "agy", "repo-beta", { harness: "antigravity", cwd: "/work/repo-beta" }));
 
-    // Seed an offline muse row with a stale UUID session_id to verify terminal invite clears it
+    // Seed two offline muse rows with UUID session_ids (older + newer) to verify terminal invite keeps only the newest resumable UUID alongside the invited TTY row in who
+    await agy.request({
+      type: "register",
+      name: "muse",
+      harness: "muse",
+      cwd: "/work/repo-alpha",
+      sessionId: "00000000-0000-4000-8000-000000000000",
+      wake: true,
+    });
+    await new Promise((r) => setTimeout(r, 5));
     await agy.request({
       type: "register",
       name: "muse",
@@ -1549,6 +1558,43 @@ test("invite reuses live sessions, registers headless CLI wakes without spending
         whoBeta.agents.map((a) => a.name),
         ["agy"],
       );
+    }
+
+    // 5. Newest offline UUID row 11111111-1111-4111-8111-111111111111 was preserved alongside the new invited TTY row,
+    //    while superseded older offline UUID 00000000-0000-4000-8000-000000000000 is hidden from who
+    const whoAlpha = await agy.request({ type: "who" });
+    assert.equal(whoAlpha.type, "who");
+    if (whoAlpha.type === "who") {
+      const museRows = whoAlpha.agents.filter((a) => a.name === "muse");
+      assert.ok(museRows.some((r) => r.sessionId === "11111111-1111-4111-8111-111111111111"));
+      assert.ok(museRows.some((r) => r.wakeSessionId === "tty:/dev/ttys011"));
+      assert.equal(museRows.some((r) => r.sessionId === "00000000-0000-4000-8000-000000000000"), false);
+    }
+
+    // 6. A Desktop app started at cwd="/" can dynamically bind to a real git checkout via register(rebind: true)
+    const desktopRoot = new BusClient();
+    await desktopRoot.connect(daemon.url, hello(token, "cursor", "root", { harness: "cursor", cwd: "/" }));
+    try {
+      await assert.rejects(
+        desktopRoot.request({ type: "publish", topic: "repo", body: "blocked before bind" }),
+        /call bus_register/,
+      );
+      const rebound = await desktopRoot.request({
+        type: "register",
+        name: "cursor",
+        harness: "cursor",
+        cwd: "/Users/ishprasad/Switchboard",
+        rebind: true,
+      });
+      assert.equal(rebound.type, "registered");
+      const pubAfterBind = await desktopRoot.request({
+        type: "publish",
+        topic: "repo",
+        body: "bound to Switchboard repo",
+      });
+      assert.equal(pubAfterBind.type, "published");
+    } finally {
+      desktopRoot.close();
     }
   } finally {
     agy.close();
