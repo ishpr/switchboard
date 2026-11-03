@@ -9,16 +9,16 @@ import { z } from "zod";
 import { inferClaudeAgentName } from "./accounts.ts";
 import { BUILD, buildWarning, formatBuild, loadBuild } from "./build.ts";
 import { formatDiagnostics } from "./health.ts";
-import { formatAgentMetrics, formatPendingAsks } from "./status.ts";
+import { formatAgentMetrics, formatBoardState, formatPendingAsks } from "./status.ts";
 import { BusClient } from "./busClient.ts";
 import { ensureDaemon } from "./ensure.ts";
-import { resolveShimCwd } from "./init.ts";
+import { formatRatioBinding, resolveShimCwd } from "./init.ts";
 import { Store } from "./store.ts";
 import { formatWaitResult, waitForMessages } from "./wait.ts";
 import { dbPath, switchboardHome } from "./paths.ts";
 import { gitCheckoutInfo, gitRepoRoot, repoKey } from "./repo.ts";
 import { readToken } from "./token.ts";
-import { HEARTBEAT_MS, NAME_RE, TOPIC_RE, type BusMessage, type Role } from "./types.ts";
+import { HEARTBEAT_MS, NAME_RE, STATE_KEY_RE, TOPIC_RE, type BusMessage, type Role } from "./types.ts";
 import { formatMessage } from "./hook.ts";
 import { UUID_RE } from "./wake.ts";
 
@@ -563,7 +563,7 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
     "bus_who",
     {
       description:
-        "List every live session in this repo, plus registered agents that are offline. Several sessions may share one name. The orchestrator row is marked orchestrator. Includes session health and pane/wake warnings.",
+        "List every live session in this repo, plus registered agents that are offline. Several sessions may share one name. The orchestrator row is marked orchestrator. Includes session health, pane/wake warnings, and each agent's configured Ratio MCP header (ratio=<project>(<profile>)[<source>]; note: reflects the MCP config file header, not live OAuth token state).",
       inputSchema: {},
     },
     async () => {
@@ -577,7 +577,9 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
             const wake = agent.wake ? "wake=on" : "wake=off";
             const session = `${agent.sessionId ? ` session=${agent.sessionId}` : ""}${agent.wakeSessionId && agent.wakeSessionId !== agent.sessionId ? ` wake_session=${agent.wakeSessionId}` : ""} connections=${agent.connectionCount ?? (agent.online ? 1 : 0)}`;
             const git = agent.branch || agent.head ? ` git=${agent.branch ?? "detached"}@${agent.head ?? "unknown"}` : "";
-            return `${agent.name} ${agent.harness} ${state} ${wake}${session}${git} ${agent.role} ${agent.status} ${formatDiagnostics(agent.diagnostics)}`;
+            const ratioStr = formatRatioBinding(agent.ratio);
+            const ratio = ratioStr ? ` ${ratioStr}` : "";
+            return `${agent.name} ${agent.harness} ${state} ${wake}${session}${git}${ratio} ${agent.role} ${agent.status} ${formatDiagnostics(agent.diagnostics)}`;
           })
           .join("\n"),
       );
@@ -682,9 +684,10 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
       const frame = await bus.request({ type: "status", status, pending, limit });
       if (frame.type !== "ok" || !frame.pending_asks) return text("pending-ask tracking unavailable; restart the daemon after upgrading");
       const currentBuild = loadBuild();
+      const boardStateText = pending ? "" : formatBoardState(frame.board_state ?? [], gitCheckoutInfo(context.cwd).head);
       return {
-        ...text(`${pending ? "" : `${frame.detail}\n${formatBuild("daemon", frame.daemon)}\n${formatBuild("MCP", currentBuild)}${buildWarning(currentBuild, frame.daemon) ? `\nWARNING: ${buildWarning(currentBuild, frame.daemon)}` : ""}\n`}${formatPendingAsks(frame.pending_asks)}${pending ? "" : `\n${formatAgentMetrics(frame.agent_metrics ?? [])}`}`),
-        structuredContent: { ...(pending ? {} : { detail: frame.detail, daemon: frame.daemon ?? null, shim: currentBuild, agent_metrics: frame.agent_metrics ?? [] }), pending_asks: frame.pending_asks },
+        ...text(`${pending ? "" : `${frame.detail}\n${formatBuild("daemon", frame.daemon)}\n${formatBuild("MCP", currentBuild)}${buildWarning(currentBuild, frame.daemon) ? `\nWARNING: ${buildWarning(currentBuild, frame.daemon)}` : ""}\n`}${formatPendingAsks(frame.pending_asks)}${pending ? "" : `\n${formatAgentMetrics(frame.agent_metrics ?? [])}`}${boardStateText ? `\n${boardStateText}` : ""}`),
+        structuredContent: { ...(pending ? {} : { detail: frame.detail, daemon: frame.daemon ?? null, shim: currentBuild, agent_metrics: frame.agent_metrics ?? [], board_state: frame.board_state ?? [] }), pending_asks: frame.pending_asks },
       };
     },
   );
@@ -693,21 +696,46 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
     "bus_state",
     {
       description:
-        "Read or write shared per-repo key-value state with compare-and-swap (rev / if_rev). Does not trigger automatic wakes.",
+        "Read or write shared per-repo key-value state with compare-and-swap (rev / if_rev). Canonical coordination keys: 'contract' (active task summary, git head/branch, declared paths, ratio_project) and 'verdict:<agent>' (each reviewer/lens verdict, git head, lens, summary). Does not trigger automatic wakes.",
       inputSchema: {
         action: z.enum(["get", "set", "list", "delete"]),
-        key: z.string().regex(TOPIC_RE).optional().describe("State key (required for get, set, delete)"),
-        value: z.string().optional().describe("State value (required for set)"),
-        prefix: z.string().optional().describe("Optional key prefix filter for list"),
+        key: z.string().regex(STATE_KEY_RE).optional().describe("State key (required for get, set, delete; e.g. 'contract', 'verdict:grok', 'ratio:project')"),
+        value: z.string().optional().describe("State value (required for set unless structured contract/verdict fields are passed)"),
+        prefix: z.string().optional().describe("Optional key prefix filter for list (e.g. 'verdict:')"),
         if_rev: z.number().int().min(0).optional().describe("Compare-and-swap expected revision (0 for create-only, N to update/delete only if current rev == N)"),
+        head: z.string().optional().describe("Optional git HEAD SHA for structured 'contract' or 'verdict:<agent>' entries (auto-detected from checkout if omitted when structured fields are used)"),
+        paths: z.array(z.string()).optional().describe("Optional declared file/module paths for 'contract'"),
+        ratio_project: z.string().optional().describe("Optional expected Ratio project id (e.g. 'p-serveone') for 'contract'"),
+        verdict: z.enum(["pass", "fail", "blocked"]).optional().describe("Optional structured verdict status for 'verdict:<agent>'"),
+        lens: z.string().optional().describe("Optional review lens name (e.g. 'correctness', 'security') for 'verdict:<agent>'"),
       },
     },
-    async ({ action, key, value, prefix, if_rev }) => {
+    async ({ action, key, value, prefix, if_rev, head, paths, ratio_project, verdict, lens }) => {
+      let resolvedValue = value;
+      if (
+        action === "set" &&
+        (head !== undefined ||
+          paths !== undefined ||
+          ratio_project !== undefined ||
+          verdict !== undefined ||
+          lens !== undefined)
+      ) {
+        const git = gitCheckoutInfo(context.cwd);
+        const payload: Record<string, unknown> = {};
+        if (value !== undefined) payload.summary = value;
+        if (verdict !== undefined) payload.verdict = verdict;
+        if (lens !== undefined) payload.lens = lens;
+        if (paths !== undefined) payload.paths = paths;
+        if (ratio_project !== undefined) payload.ratio_project = ratio_project;
+        payload.head = head ?? git.head ?? "unknown";
+        if (git.branch) payload.branch = git.branch;
+        resolvedValue = JSON.stringify(payload);
+      }
       const frame = await bus.request({
         type: "state",
         action,
         key,
-        value,
+        value: resolvedValue,
         prefix,
         ifRev: if_rev,
       });

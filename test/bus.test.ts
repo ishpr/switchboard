@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { BusClient } from "../src/busClient.ts";
 import { startDaemon, type DaemonHandle, isLoopback } from "../src/daemon.ts";
 import { formatMessage, hookStdout, shouldSkipHookForPrompt } from "../src/hook.ts";
+import { formatBoardState } from "../src/status.ts";
 import { ensureToken } from "../src/token.ts";
 import type { BusMessage, ClientHello, WakeLaunch } from "../src/types.ts";
 
@@ -1602,5 +1604,130 @@ test("invite reuses live sessions, registers headless CLI wakes without spending
     claudeWork.close();
     otherRepoClient.close();
     await daemon.close();
+  }
+});
+
+test("bus_who detects Ratio project mismatches across agents, and bus_state/bus_status track contract and colon-prefixed lens verdicts", async () => {
+  const fx = await fixture();
+  const repoDir = mkdtempSync(path.join(tmpdir(), "switchboard-ratio-board-"));
+  execFileSync("git", ["init"], { cwd: repoDir, stdio: "ignore" });
+  mkdirSync(path.join(repoDir, ".cursor"), { recursive: true });
+  writeFileSync(
+    path.join(repoDir, ".cursor", "mcp.json"),
+    JSON.stringify({
+      mcpServers: {
+        ratio: { url: "https://ratio.servsys.com", headers: { "X-Ratio-Project": "p-serveone" } },
+      },
+    }),
+  );
+  writeFileSync(
+    path.join(repoDir, ".mcp.json"),
+    JSON.stringify({
+      mcpServers: {
+        ratio: { url: "https://ratio.servsys.com", headers: { "X-Ratio-Project": "p-ratio" } },
+      },
+    }),
+  );
+
+  const claude = await join(fx, "claude", "repo-ratio", {
+    harness: "claude",
+    cwd: repoDir,
+    role: "orchestrator",
+  });
+  const cursor = await join(fx, "cursor", "repo-ratio", {
+    harness: "cursor",
+    cwd: repoDir,
+  });
+
+  try {
+    // 0. Before a contract is set, online agents with conflicting Ratio configs both receive a symmetric split warning
+    const whoSplit = await claude.request({ type: "who" });
+    assert.equal(whoSplit.type, "who");
+    if (whoSplit.type === "who") {
+      const claudeSplit = whoSplit.agents.find((a) => a.name === "claude");
+      const cursorSplit = whoSplit.agents.find((a) => a.name === "cursor");
+      assert.ok(claudeSplit?.diagnostics?.warnings.some((w) => w.includes("Ratio project split across online agents")));
+      assert.ok(cursorSplit?.diagnostics?.warnings.some((w) => w.includes("Ratio project split across online agents")));
+    }
+
+    // 1. Store contract (with ratio_project = "p-ratio" and head = "aaaa111") and colon-keyed verdicts
+    const setContract = await claude.request({
+      type: "state",
+      action: "set",
+      key: "contract",
+      value: JSON.stringify({
+        summary: "Audit Ratio binding and state keys",
+        head: "aaaa111",
+        paths: ["src/init.ts", "src/daemon.ts"],
+        ratio_project: "p-ratio",
+      }),
+    });
+    assert.equal(setContract.type, "state");
+    if (setContract.type === "state") assert.equal(setContract.ok, true);
+
+    // Asking cursor (configured for p-serveone) when the board contract requires p-ratio is refused outright
+    await assert.rejects(
+      claude.request({
+        type: "ask",
+        to: "cursor",
+        body: "Run Ratio lens review on PR",
+      }),
+      /Ratio project mismatch.*cursor has X-Ratio-Project=p-serveone.*requires p-ratio/,
+    );
+
+    const setVerdictGrok = await claude.request({
+      type: "state",
+      action: "set",
+      key: "verdict:grok",
+      value: JSON.stringify({
+        verdict: "pass",
+        lens: "correctness",
+        head: "aaaa111",
+        summary: "No merge blocker",
+      }),
+    });
+    assert.equal(setVerdictGrok.type, "state");
+    if (setVerdictGrok.type === "state") assert.equal(setVerdictGrok.ok, true);
+
+    const setVerdictMuse = await claude.request({
+      type: "state",
+      action: "set",
+      key: "verdict:muse",
+      value: JSON.stringify({
+        verdict: "pass",
+        lens: "security",
+        head: "0000999",
+        summary: "Reviewed older commit",
+      }),
+    });
+    assert.equal(setVerdictMuse.type, "state");
+
+    // 2. bus_who surfaces each agent's Ratio binding and warns that cursor (p-serveone) mismatches contract's p-ratio
+    const who = await claude.request({ type: "who" });
+    assert.equal(who.type, "who");
+    if (who.type === "who") {
+      const claudeRow = who.agents.find((a) => a.name === "claude");
+      const cursorRow = who.agents.find((a) => a.name === "cursor");
+      assert.equal(claudeRow?.ratio?.project, "p-ratio");
+      assert.equal(claudeRow?.diagnostics?.warnings.some((w) => w.includes("Ratio project mismatch")), false);
+      assert.equal(cursorRow?.ratio?.project, "p-serveone");
+      assert.ok(cursorRow?.diagnostics?.warnings.some((w) => w.includes("Ratio project mismatch")));
+    }
+
+    // 3. bus_status returns board_state and formatBoardState flags stale verdict head (0000999 != aaaa111)
+    const status = await claude.request({ type: "status" });
+    assert.equal(status.type, "ok");
+    if (status.type === "ok") {
+      assert.equal(status.board_state?.length, 3);
+      const formatted = formatBoardState(status.board_state ?? [], "aaaa111");
+      assert.match(formatted, /contract rev=1/);
+      assert.match(formatted, /verdict:grok rev=1/);
+      assert.doesNotMatch(formatted, /verdict:grok[^\n]*stale verdict head/);
+      assert.match(formatted, /verdict:muse[^\n]*WARNING: stale verdict head \(0000999 != aaaa111\)/);
+    }
+  } finally {
+    claude.close();
+    cursor.close();
+    await fx.daemon.close();
   }
 });

@@ -17,17 +17,17 @@ import { BUILD, buildWarning, formatBuild } from "./build.ts";
 import { createPaneProbe, formatDiagnostics, sessionDiagnostics } from "./health.ts";
 import { Store } from "./store.ts";
 import { formatWaitResult, waitForMessages } from "./wait.ts";
-import { formatAgentMetrics, formatPendingAsks } from "./status.ts";
+import { formatAgentMetrics, formatBoardState, formatPendingAsks } from "./status.ts";
 import { BusClient } from "./busClient.ts";
 import { startDaemon } from "./daemon.ts";
 import { ensureDaemon, readDaemonInfo } from "./ensure.ts";
 import { hookStdout, shouldSkipHookForPrompt, supportsHookOutput } from "./hook.ts";
 import { daemonInfoPath, dbPath, switchboardHome, wakeLogPath } from "./paths.ts";
-import { repoKey, type RepoScope } from "./repo.ts";
+import { gitCheckoutInfo, repoKey, type RepoScope } from "./repo.ts";
 import { runShim } from "./shim.ts";
 import { ensureToken, readToken } from "./token.ts";
 import { DEFAULT_PORT, HEARTBEAT_MS, NAME_RE, type ClientHello, type InviteMode, type ReplyState } from "./types.ts";
-import { GRID_SESSION, gridPlan, gridSessionName, init, resolveOrchestratorName, writeRepoConfig } from "./init.ts";
+import { formatRatioBinding, GRID_SESSION, gridPlan, gridSessionName, init, resolveOrchestratorName, writeRepoConfig } from "./init.ts";
 import { spawnWake } from "./wake.ts";
 
 const command = process.argv[2];
@@ -353,8 +353,10 @@ async function who(doctor = false): Promise<void> {
       const wake = agent.wake ? "wake" : "no-wake";
       const session = `${agent.sessionId ? ` session=${agent.sessionId}` : ""}${agent.wakeSessionId && agent.wakeSessionId !== agent.sessionId ? ` wake_session=${agent.wakeSessionId}` : ""} connections=${agent.connectionCount ?? (agent.online ? 1 : 0)}`;
       const git = agent.branch || agent.head ? ` git=${agent.branch ?? "detached"}@${agent.head ?? "unknown"}` : "";
+      const ratioStr = formatRatioBinding(agent.ratio);
+      const ratio = ratioStr ? ` ${ratioStr}` : "";
       process.stdout.write(
-        `${values.all ? `${agent.repo}\t` : ""}${agent.name}\t${agent.harness}\t${state}\t${wake}${session}${git}\t${agent.role}\t${agent.status}\t${formatDiagnostics(agent.diagnostics)}\n`,
+        `${values.all ? `${agent.repo}\t` : ""}${agent.name}\t${agent.harness}\t${state}\t${wake}${session}${git}${ratio}\t${agent.role}\t${agent.status}\t${formatDiagnostics(agent.diagnostics)}\n`,
       );
     }
     if (values.prune) {
@@ -735,11 +737,15 @@ async function setStatus(): Promise<void> {
     if (frame.type !== "ok") throw new Error("unexpected response");
     if (!frame.pending_asks) throw new Error("pending-ask tracking unavailable; restart the daemon after upgrading");
     if (values.json) {
-      process.stdout.write(`${JSON.stringify({ ...(values.pending ? {} : { detail: frame.detail, daemon: frame.daemon ?? null, client: BUILD, agent_metrics: frame.agent_metrics ?? [] }), pending_asks: frame.pending_asks })}\n`);
+      process.stdout.write(`${JSON.stringify({ ...(values.pending ? {} : { detail: frame.detail, daemon: frame.daemon ?? null, client: BUILD, agent_metrics: frame.agent_metrics ?? [], board_state: frame.board_state ?? [] }), pending_asks: frame.pending_asks })}\n`);
     } else {
       if (!values.pending) process.stdout.write(`${frame.detail}\n${formatBuild("daemon", frame.daemon)}\n${formatBuild("client", BUILD)}${buildWarning(BUILD, frame.daemon) ? `\nWARNING: ${buildWarning(BUILD, frame.daemon)}` : ""}\n`);
       process.stdout.write(`${formatPendingAsks(frame.pending_asks)}\n`);
-      if (!values.pending) process.stdout.write(`${formatAgentMetrics(frame.agent_metrics ?? [])}\n`);
+      if (!values.pending) {
+        process.stdout.write(`${formatAgentMetrics(frame.agent_metrics ?? [])}\n`);
+        const boardStateText = formatBoardState(frame.board_state ?? [], gitCheckoutInfo(values.cwd || process.cwd()).head);
+        if (boardStateText) process.stdout.write(`${boardStateText}\n`);
+      }
     }
   } finally {
     client.close();
