@@ -17,6 +17,7 @@ import {
   readRepoConfig,
   resolveAccountProfiles,
   resolveOrchestratorName,
+  resolveShimCwd,
   switchboardLayout,
   upsertZshBlock,
   writeRepoConfig,
@@ -124,6 +125,9 @@ test("per-repo config persists different orchestrators for different repos", () 
   assert.deepEqual(cfgA?.panes, ["antigravity", "claude"]);
   assert.equal(cfgB?.orchestrator, "cursor");
   assert.deepEqual(cfgB?.panes, ["orchestrator", "codex"]);
+
+  // Desktop GUI shims started with cwd="/" fall back to a configured repoRoot
+  assert.ok([cfgA?.repoRoot, cfgB?.repoRoot].includes(resolveShimCwd("/", home)));
 });
 
 test("multi-account Claude resolution and isolated environment provisioning are completely generic", () => {
