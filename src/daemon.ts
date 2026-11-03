@@ -16,6 +16,7 @@ import {
   type Role,
   type ServerFrame,
   type WakeInfo,
+  type PrunedAgent,
 } from "./types.ts";
 import { decideWake, launchFor, logWake, type SpawnWake } from "./wake.ts";
 
@@ -184,6 +185,11 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         store.ack(conn.repo, clientKey(conn), frame.cursor);
         send(conn.socket, { type: "ok", detail: "acked" });
         break;
+      case "doctor":
+        void sendDoctor(conn, frame).catch((error) => {
+          send(conn.socket, { type: "error", error: error instanceof Error ? error.message : "doctor failed" });
+        });
+        break;
       case "who":
         void sendWho(conn);
         break;
@@ -221,6 +227,47 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       ...agent, diagnostics: await sessionDiagnostics(agent, probe),
     })));
     send(conn.socket, { type: "who", agents: rows });
+  }
+
+  async function sendDoctor(conn: Conn, frame: Extract<ClientFrame, { type: "doctor" }>): Promise<void> {
+    const repos = frame.all
+      ? [...new Set([...store.listRepos(), ...[...conns].filter((peer) => peer.authed).map((peer) => peer.repo)])].sort()
+      : [conn.repo];
+    const probe = options.paneProbe ?? createPaneProbe();
+    const candidates = repos.flatMap((repo) => agents(repo)).map((agent) => ({
+      agent, stored: store.getAgent(agent.repo, agent.name),
+    }));
+    const rows = await Promise.all(candidates.map(async ({ agent }) => ({
+      ...agent, diagnostics: await sessionDiagnostics(agent, probe),
+    })));
+    const pruned: PrunedAgent[] = [];
+    if (frame.prune) {
+      for (let i = 0; i < rows.length; i++) {
+        const row = rows[i]!;
+        const stored = candidates[i]!.stored;
+        const reason = row.diagnostics.health;
+        if (reason !== "dead_pane" && reason !== "stale") continue;
+        const current = agents(row.repo).find((peer) => peer.name === row.name && peer.sessionId === row.sessionId);
+        if (!current || current.lastSeen !== row.lastSeen) continue;
+        // Only mutate the registration if it still belongs to the scanned session.
+        const ownsRegistration = stored?.sessionId === row.sessionId;
+        if (ownsRegistration && !store.pruneAgent(stored!, reason)) continue;
+        let clearedLiveBinding = false;
+        if (reason === "dead_pane") {
+          for (const peer of conns) {
+            if (peer.authed && peer.repo === row.repo && peer.name === row.name && peer.sessionId === row.sessionId) {
+              peer.sessionBound = false;
+              peer.sessionId = peer.agentId;
+              clearedLiveBinding = true;
+            }
+          }
+        }
+        if (!ownsRegistration && !clearedLiveBinding) continue;
+        pruned.push({ repo: row.repo, name: row.name, sessionId: row.sessionId, reason });
+      }
+    }
+    // Report the scan plus the exact mutations; last-seen timestamps remain historical evidence.
+    send(conn.socket, { type: "doctor", agents: rows, pruned });
   }
 
   async function sendStatus(conn: Conn): Promise<void> {

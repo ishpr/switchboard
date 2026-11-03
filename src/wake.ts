@@ -186,7 +186,7 @@ export function headlessLaunch(
 
 function panePromptFor(message: BusMessage): string {
   const actionHint = message.kind === "ask"
-    ? "call bus_inbox and reply with bus_reply."
+    ? "call bus_inbox, execute the assigned task, and reply with bus_reply."
     : "call bus_inbox to read it and continue.";
   return `[switchboard] Message from ${message.fromName} (id=${message.id}): ${actionHint}`;
 }
@@ -203,7 +203,7 @@ export function promptFor(message: BusMessage): string {
     message.body,
     "",
     message.kind === "ask"
-      ? "Reply with the bus_reply tool, passing this correlation id. Then stop."
+      ? "Execute the task requested by the orchestrator within your workspace rules, then reply with the bus_reply tool, passing this correlation id."
       : "Read it. If you owe a reply, use bus_reply. Otherwise acknowledge it with bus_publish on the same topic.",
   ].join("\n");
 }

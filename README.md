@@ -297,3 +297,35 @@ a report. `doctor` also warns about stale sessions, injection targeting a missin
 pane, and `wake=off` on an active agent. The wake policy controls offline headless
 launches; bound-session injection still applies when wake is off. Diagnostics report
 problems without silently changing that policy or rebinding sessions.
+
+`switchboard doctor --prune` applies cleanup after its health scan: it clears dead
+pane bindings (including live shim bindings) and marks stale registrations offline.
+It keeps message history, wake policy, and last-seen timestamps. A live shim stays
+connected after its dead binding is cleared. Healthy and unverified panes are left
+alone. Registrations that change during the scan are skipped; a healthy same-name
+session's binding is preserved when an older session is cleaned up.
+
+By default, doctor uses the current repository and `SWITCHBOARD_SCOPE`. Use
+`--share` (or `--scope share`) to explicitly select the board shared by linked
+worktrees, and `--scope split` to select the current checkout's separate board.
+`--all` scans all repository boards in the local daemon, including registrations
+for worktrees that no longer exist. It cannot be combined with `--share` or
+`--scope`. All-board text output includes each row's repository key.
+
+```sh
+switchboard doctor --share
+switchboard doctor --all --json
+switchboard doctor --all --prune --json
+```
+
+With `--prune --json`, the output is `{ "agents": [...], "pruned": [...] }`;
+without pruning it remains an array. The agents are the pre-cleanup scan and each
+pruned entry identifies the repository, name, old session binding, and reason.
+Exit status still reflects warnings in that scan, so a successful cleanup can exit
+1. A stale registration keeps its historical timestamp and may still warn on a later
+scan; repeated pruning reports no mutation once it is already offline. Pruning and
+`--all` require the updated daemon; restart it after upgrading.
+
+Orchestrator asks are task dispatches: the wake hint asks agents to read the inbox,
+execute the assigned task within workspace/repository rules, and reply with the
+correlation id. This does not grant new permissions or override those rules.

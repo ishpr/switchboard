@@ -241,6 +241,21 @@ export class Store {
       .run(Date.now(), status, repo, name);
   }
 
+  listRepos(): string[] {
+    const rows = this.db.prepare("SELECT DISTINCT repo FROM agents ORDER BY repo").all() as { repo: string }[];
+    return rows.map((row) => row.repo);
+  }
+
+  /** Compare the scanned registration before changing it; preserve concurrent reconnects. */
+  pruneAgent(expected: AgentRecord, reason: "dead_pane" | "stale"): boolean {
+    const result = this.db.prepare(
+      `UPDATE agents SET status = 'offline', session_id = CASE WHEN ? = 'dead_pane' THEN NULL ELSE session_id END
+       WHERE repo = ? AND name = ? AND session_id IS ? AND last_seen = ? AND status = ?
+         AND (status != 'offline' OR (? = 'dead_pane' AND session_id IS NOT NULL))`,
+    ).run(reason, expected.repo, expected.name, expected.sessionId, expected.lastSeen, expected.status, reason);
+    return result.changes > 0;
+  }
+
   getOrchestrator(repo: string): string | null {
     const row = this.db
       .prepare("SELECT orchestrator FROM roles WHERE repo = ?")

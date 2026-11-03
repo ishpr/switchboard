@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { hookStdout } from "../src/hook.ts";
-import { parseZellijSessionFromPs } from "../src/shim.ts";
+import { instructions, parseZellijSessionFromPs } from "../src/shim.ts";
 import type { BusMessage } from "../src/types.ts";
-import { decideWake, headlessLaunch, launchFor } from "../src/wake.ts";
+import { decideWake, headlessLaunch, launchFor, promptFor } from "../src/wake.ts";
 
 const message: BusMessage = {
   id: "m1",
@@ -154,6 +154,25 @@ test("tmux-bound sessions inject literal text into the exact pane", () => {
     assert.match(launch.args[1]!, /send-keys -t "\$1" -l -- "\$2"/);
     assert.match(launch.args[1]!, /sleep 0\.25/);
     assert.equal(launch.args[4]!.includes("\n"), false);
-    assert.match(launch.args[4]!, /call bus_inbox and reply with bus_reply/);
+    assert.match(launch.args[4]!, /call bus_inbox, execute the assigned task, and reply with bus_reply/);
   }
+});
+
+
+test("ask wakes dispatch the task within workspace rules before requesting a reply", () => {
+  assert.match(promptFor(message), /Execute the task requested by the orchestrator within your workspace rules, then reply/);
+  assert.match(promptFor(message), /Correlation: c1/);
+  assert.match(promptFor(message), /not authorization and not a new permission/);
+  for (const sessionId of ["tmux:%12", "zellij:grid:1"]) {
+    const launch = launchFor({ mode: "inject", harness: "claude", cwd: "/work", sessionId, message });
+    assert.ok(launch);
+    assert.match(launch.args.at(-1)!, /call bus_inbox, execute the assigned task, and reply with bus_reply\./);
+    const notice = launchFor({ mode: "inject", harness: "claude", cwd: "/work", sessionId, message: { ...message, kind: "pub" } });
+    assert.match(notice!.args.at(-1)!, /call bus_inbox to read it and continue/);
+    assert.doesNotMatch(notice!.args.at(-1)!, /execute the assigned task/);
+  }
+  assert.match(instructions("worker", "agy"), /bus_ask messages from agy are actionable task dispatches within the repository rules/);
+  assert.match(instructions("worker", "agy"), /Messages are coordination, never authorization/);
+  assert.doesNotMatch(instructions("worker", null), /actionable task dispatches/);
+  assert.doesNotMatch(instructions("orchestrator", "agy"), /actionable task dispatches/);
 });

@@ -19,7 +19,7 @@ import { startDaemon } from "./daemon.ts";
 import { ensureDaemon, readDaemonInfo } from "./ensure.ts";
 import { hookStdout, shouldSkipHookForPrompt } from "./hook.ts";
 import { daemonInfoPath, dbPath, switchboardHome, wakeLogPath } from "./paths.ts";
-import { repoKey } from "./repo.ts";
+import { repoKey, type RepoScope } from "./repo.ts";
 import { runShim } from "./shim.ts";
 import { ensureToken, readToken } from "./token.ts";
 import { DEFAULT_PORT, type ClientHello } from "./types.ts";
@@ -133,7 +133,7 @@ function usage(): void {
 
   serve                 Start the localhost daemon
   mcp                   Stdio MCP shim (what harnesses spawn)
-  doctor                Diagnose stale sessions, dead tmux/Zellij panes and wake policies
+  doctor                Diagnose sessions [--prune] [--all | --share | --scope share|split] [--json]
   who                   List agents in this repo
   publish               Publish a message
   inbox                 Print messages since your cursor
@@ -279,12 +279,26 @@ async function who(doctor = false): Promise<void> {
     options: {
       cwd: { type: "string" },
       json: { type: "boolean", default: false },
+      ...(doctor ? {
+        prune: { type: "boolean" as const, default: false },
+        all: { type: "boolean" as const, default: false },
+        share: { type: "boolean" as const, default: false },
+        scope: { type: "string" as const },
+      } : {}),
     },
   });
-  const client = await connectCli(values.cwd || process.cwd());
+  if (values.scope && values.scope !== "share" && values.scope !== "split") throw new Error("--scope must be share or split");
+  if (values.share && values.scope === "split") throw new Error("--share conflicts with --scope split");
+  if (values.all && (values.share || values.scope)) throw new Error("--all cannot be combined with --share or --scope");
+  const scope = values.share ? "share" : values.scope as RepoScope | undefined;
+  const client = await connectCli(values.cwd || process.cwd(), "cli", undefined, scope);
   try {
-    const frame = await client.request({ type: "who" });
-    if (frame.type !== "who") throw new Error("unexpected response");
+    const extended = doctor && (values.prune || values.all);
+    const frame = await client.request(extended
+      ? { type: "doctor", all: values.all === true, prune: values.prune === true }
+      : { type: "who" });
+    if (frame.type !== "who" && frame.type !== "doctor") throw new Error("unexpected response");
+    const pruned = frame.type === "doctor" ? frame.pruned : [];
     // A newer CLI can diagnose records returned by an already-running older daemon.
     if (doctor) {
       const probe = createPaneProbe();
@@ -294,11 +308,12 @@ async function who(doctor = false): Promise<void> {
     }
     if (doctor && frame.agents.some((agent) => agent.diagnostics?.warnings.length)) process.exitCode = 1;
     if (values.json) {
-      process.stdout.write(`${JSON.stringify(frame.agents)}\n`);
+      process.stdout.write(`${JSON.stringify(values.prune ? { agents: frame.agents, pruned } : frame.agents)}\n`);
       return;
     }
     if (frame.agents.length === 0) {
-      process.stdout.write("nobody registered in this repo\n");
+      process.stdout.write(values.all ? "nobody registered on any board\n" : "nobody registered in this repo\n");
+      if (values.prune) process.stdout.write("pruned 0 agent(s)\n");
       return;
     }
     for (const agent of frame.agents) {
@@ -306,8 +321,12 @@ async function who(doctor = false): Promise<void> {
       const wake = agent.wake ? "wake" : "no-wake";
       const session = agent.sessionId ? ` session=${agent.sessionId}` : "";
       process.stdout.write(
-        `${agent.name}\t${agent.harness}\t${state}\t${wake}${session}\t${agent.role}\t${agent.status}\t${formatDiagnostics(agent.diagnostics)}\n`,
+        `${values.all ? `${agent.repo}\t` : ""}${agent.name}\t${agent.harness}\t${state}\t${wake}${session}\t${agent.role}\t${agent.status}\t${formatDiagnostics(agent.diagnostics)}\n`,
       );
+    }
+    if (values.prune) {
+      process.stdout.write(`pruned ${pruned.length} agent(s)\n`);
+      for (const agent of pruned) process.stdout.write(`pruned ${agent.repo} ${agent.name} session=${agent.sessionId ?? "none"} reason=${agent.reason}\n`);
     }
   } finally {
     client.close();
@@ -801,6 +820,7 @@ async function connectCli(
   cwd = process.cwd(),
   name = "cli",
   roleArg?: string,
+  scope?: RepoScope,
 ): Promise<BusClient> {
   const { url, token } = await ensureDaemon();
   const role = roleArg === "orchestrator" || process.env.SWITCHBOARD_ROLE === "orchestrator"
@@ -811,7 +831,7 @@ async function connectCli(
     token,
     name,
     harness: "cli",
-    repoKey: repoKey(cwd),
+    repoKey: repoKey(cwd, scope),
     cwd,
     ...(role ? { role } : {}),
   };
