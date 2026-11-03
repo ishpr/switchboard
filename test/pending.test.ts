@@ -29,7 +29,7 @@ test("pending asks use reply correlations, preserve workspace isolation, and for
     insert(store, { id: "wrong-reply", kind: "reply", correlationId: "ask-id" });
     insert(store, { id: "progress", kind: "pub", fromName: "eg", topic: "reports" });
     assert.equal(store.pendingAsks("board").length, 1);
-    insert(store, { id: "right-reply", kind: "reply" });
+    insert(store, { id: "right-reply", kind: "reply", fromName: "eg", to: "agy" });
     assert.deepEqual(store.pendingAsks("board"), []);
     insert(store, { id: "long", correlationId: "long-correlation", body: "x".repeat(500), ts: Date.now() + 10000 });
     const pending = store.pendingAsks("board");

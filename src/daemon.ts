@@ -4,7 +4,8 @@ import { WebSocketServer, type WebSocket } from "ws";
 import { resolveShimCwd } from "./init.ts";
 import { repoKey } from "./repo.ts";
 import { createPaneProbe, formatDiagnostics, sessionDiagnostics, type PaneProbe } from "./health.ts";
-import { Store } from "./store.ts";
+import { BUILD, buildWarning, runtimeInfo } from "./build.ts";
+import { Store, inboxCursorKey } from "./store.ts";
 import {
   BODY_MAX,
   NAME_RE,
@@ -12,6 +13,8 @@ import {
   TOPIC_RE,
   WAKE_COOLDOWN_MS,
   type BusMessage,
+  type BuildInfo,
+  type AgentRecord,
   type ClientFrame,
   type Role,
   type ServerFrame,
@@ -30,6 +33,7 @@ export type DaemonOptions = {
   presenceTtlMs?: number;
   sweepMs?: number;
   paneProbe?: PaneProbe;
+  presenceDebounceMs?: number;
 };
 
 export type DaemonHandle = {
@@ -40,6 +44,7 @@ export type DaemonHandle = {
 
 type Conn = {
   socket: WebSocket;
+  build?: BuildInfo;
   authed: boolean;
   agentId: string;
   name: string;
@@ -57,6 +62,8 @@ type Conn = {
   lastSeen: number;
 };
 
+type Respond = (frame: ServerFrame) => void;
+
 export function isLoopback(addr: string | undefined): boolean {
   if (!addr) return false;
   return addr === "127.0.0.1" || addr === "::1" || addr === "::ffff:127.0.0.1";
@@ -71,6 +78,10 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
   const wss = new WebSocketServer({ server: http });
   const conns = new Set<Conn>();
   const lastWake = new Map<string, number>();
+  const waking = new Set<string>();
+  const daemonInfo = runtimeInfo();
+  const onlineGroups = new Set<string>();
+  const pendingOffline = new Map<string, ReturnType<typeof setTimeout>>();
 
   await new Promise<void>((resolve, reject) => {
     http.once("error", reject);
@@ -111,27 +122,33 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       if (!conn.authed) socket.close(1008, "hello timeout");
     }, 5_000);
 
+    let legacyQueue: Promise<void> = Promise.resolve();
     socket.on("message", (data) => {
       let frame: ClientFrame;
       try {
         frame = JSON.parse(data.toString()) as ClientFrame;
+        if (!frame || typeof frame !== "object" || typeof frame.type !== "string") throw new Error("invalid frame");
+        if (frame.reqId !== undefined && (typeof frame.reqId !== "string" || !frame.reqId || frame.reqId.length > 128)) throw new Error("invalid reqId");
       } catch {
-        send(socket, { type: "error", error: "invalid json" });
+        send(socket, { type: "error", error: "invalid frame or JSON" });
         return;
       }
-      try {
-        handle(conn, frame);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : "request failed";
-        send(socket, { type: "error", error: message });
-      }
+      const reqId = frame.reqId;
+      const respond: Respond = (response) => send(socket, { ...response, ...(reqId ? { reqId } : {}) });
+      const dispatch = async () => {
+        try { await handle(conn, frame, respond); }
+        catch (error) { respond({ type: "error", error: error instanceof Error ? error.message : "request failed" }); }
+      };
+      // Old clients have no request IDs: serialize their dispatches to preserve their FIFO contract.
+      if (reqId) void dispatch();
+      else legacyQueue = legacyQueue.then(dispatch);
     });
 
     socket.on("close", () => {
       clearTimeout(helloTimer);
       const gone = conn.authed;
       conns.delete(conn);
-      if (gone && !stopping) announce(conn, "offline");
+      if (gone && !stopping) presence(conn, "offline");
     });
     socket.on("error", () => {
       socket.close();
@@ -150,57 +167,55 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
   }, options.sweepMs ?? 5_000);
   sweep.unref?.();
 
-  function handle(conn: Conn, frame: ClientFrame): void {
+  async function handle(conn: Conn, frame: ClientFrame, respond: Respond): Promise<void> {
     conn.lastSeen = Date.now();
     if (!conn.authed) {
       if (frame.type !== "hello") {
-        send(conn.socket, { type: "error", error: "hello required" });
+        respond({ type: "error", error: "hello required" });
         conn.socket.close(1008, "hello required");
         return;
       }
-      hello(conn, frame);
+      hello(conn, frame, respond);
       return;
     }
     if (frame.type === "hello") {
-      send(conn.socket, { type: "error", error: "already joined" });
+      respond({ type: "error", error: "already joined" });
       return;
     }
     switch (frame.type) {
       case "publish":
-        void publish(conn, frame);
+        await publish(conn, frame, respond);
         break;
       case "subscribe":
         for (const topic of frame.topics) requireTopic(topic);
         for (const topic of frame.topics) conn.topics.add(topic);
-        send(conn.socket, { type: "ok", detail: `subscribed ${[...frame.topics].join(",")}` });
+        respond({ type: "ok", detail: `subscribed ${[...frame.topics].join(",")}` });
         break;
       case "unsubscribe":
         for (const topic of frame.topics) conn.topics.delete(topic);
-        send(conn.socket, { type: "ok", detail: "unsubscribed" });
+        respond({ type: "ok", detail: "unsubscribed" });
         break;
       case "inbox":
-        inbox(conn, frame.since, frame.topic, frame.limit);
+        inbox(conn, frame.since, frame.topic, frame.limit, respond);
         break;
       case "ack":
         store.ack(conn.repo, clientKey(conn), frame.cursor);
-        send(conn.socket, { type: "ok", detail: "acked" });
+        respond({ type: "ok", detail: "acked" });
         break;
       case "doctor":
-        void sendDoctor(conn, frame).catch((error) => {
-          send(conn.socket, { type: "error", error: error instanceof Error ? error.message : "doctor failed" });
-        });
+        await sendDoctor(conn, frame, respond);
         break;
       case "who":
-        void sendWho(conn);
+        await sendWho(conn, respond);
         break;
       case "ask":
-        void ask(conn, frame.to, frame.body, frame.topic);
+        await ask(conn, frame.to, frame.body, frame.topic, respond);
         break;
       case "reply":
-        void reply(conn, frame.correlationId, frame.body);
+        await reply(conn, frame.correlationId, frame.body, respond);
         break;
       case "report":
-        void report(conn, frame.body);
+        await report(conn, frame.body, respond);
         break;
       case "status":
         if (frame.limit !== undefined && (!Number.isInteger(frame.limit) || frame.limit < 1 || frame.limit > 200)) {
@@ -209,35 +224,48 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         if (frame.status !== undefined) {
           if (typeof frame.status !== "string") throw new Error("status must be a string");
           conn.status = frame.status;
+          for (const peer of conns) {
+            if (peer.authed && peer.repo === conn.repo && peer.name === conn.name
+              && (conn.harness === "cli" || groupKey(peer) === groupKey(conn))) peer.status = frame.status;
+          }
           store.touchAgent(conn.repo, conn.name, frame.status);
         }
-        void sendStatus(conn, frame).catch((error) => {
-          send(conn.socket, { type: "error", error: error instanceof Error ? error.message : "status failed" });
-        });
+        await sendStatus(conn, frame, respond);
         break;
       case "orchestrator":
-        setOrchestrator(conn, frame.name);
+        setOrchestrator(conn, frame.name, respond);
         break;
       case "register":
-        register(conn, frame);
+        register(conn, frame, respond);
         break;
       case "heartbeat":
         store.touchAgent(conn.repo, conn.name);
         break;
       default:
-        send(conn.socket, { type: "error", error: "unknown frame" });
+        respond({ type: "error", error: "unknown frame" });
     }
   }
 
-  async function sendWho(conn: Conn): Promise<void> {
-    const probe = options.paneProbe ?? createPaneProbe();
-    const rows = await Promise.all(agents(conn.repo).map(async (agent) => ({
-      ...agent, diagnostics: await sessionDiagnostics(agent, probe),
-    })));
-    send(conn.socket, { type: "who", agents: rows });
+  async function diagnostics(agent: AgentRecord, probe: PaneProbe) {
+    const result = await sessionDiagnostics(agent, probe);
+    for (const build of agent.builds ?? []) {
+      const warning = buildWarning(BUILD, build);
+      if (warning && !result.warnings.includes(warning)) result.warnings.push(`MCP ${warning}`);
+    }
+    const unknownBuilds = (agent.connectionCount ?? 0) - (agent.builds?.length ?? 0);
+    if (agent.online && unknownBuilds > 0) result.warnings.push(`${unknownBuilds} client connection(s) missing build metadata; reconnect MCP after upgrading`);
+    return result;
   }
 
-  async function sendDoctor(conn: Conn, frame: Extract<ClientFrame, { type: "doctor" }>): Promise<void> {
+  async function sendWho(conn: Conn, respond: Respond): Promise<void> {
+    const probe = options.paneProbe ?? createPaneProbe();
+    const rows = await Promise.all(agents(conn.repo).map(async (agent) => ({
+      ...agent, diagnostics: await diagnostics(agent, probe),
+    })));
+    respond({ type: "who", agents: rows, daemon: daemonInfo });
+  }
+
+  async function sendDoctor(conn: Conn, frame: Extract<ClientFrame, { type: "doctor" }>, respond: Respond): Promise<void> {
     const repos = frame.all
       ? [...new Set([...store.listRepos(), ...[...conns].filter((peer) => peer.authed).map((peer) => peer.repo)])].sort()
       : [conn.repo];
@@ -246,7 +274,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       agent, stored: store.getAgent(agent.repo, agent.name),
     }));
     const rows = await Promise.all(candidates.map(async ({ agent }) => ({
-      ...agent, diagnostics: await sessionDiagnostics(agent, probe),
+      ...agent, diagnostics: await diagnostics(agent, probe),
     })));
     const pruned: PrunedAgent[] = [];
     if (frame.prune) {
@@ -258,34 +286,36 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         const current = agents(row.repo).find((peer) => peer.name === row.name && peer.sessionId === row.sessionId);
         if (!current || current.lastSeen !== row.lastSeen) continue;
         // Only mutate the registration if it still belongs to the scanned session.
-        const ownsRegistration = stored?.sessionId === row.sessionId;
+        const targetId = row.sessionId ?? row.wakeSessionId ?? null;
+        const ownsRegistration = stored?.sessionId === targetId;
         if (ownsRegistration && !store.pruneAgent(stored!, reason)) continue;
         let clearedLiveBinding = false;
         if (reason === "dead_pane") {
           for (const peer of conns) {
-            if (peer.authed && peer.repo === row.repo && peer.name === row.name && peer.sessionId === row.sessionId) {
+            if (peer.authed && peer.repo === row.repo && peer.name === row.name && peer.sessionId === targetId) {
               peer.sessionBound = false;
-              peer.sessionId = peer.agentId;
+              peer.sessionId = null;
               clearedLiveBinding = true;
             }
           }
         }
         if (!ownsRegistration && !clearedLiveBinding) continue;
-        pruned.push({ repo: row.repo, name: row.name, sessionId: row.sessionId, reason });
+        pruned.push({ repo: row.repo, name: row.name, sessionId: targetId, reason });
       }
     }
     // Report the scan plus the exact mutations; last-seen timestamps remain historical evidence.
-    send(conn.socket, { type: "doctor", agents: rows, pruned });
+    respond({ type: "doctor", agents: rows, pruned, daemon: daemonInfo });
   }
 
-  async function sendStatus(conn: Conn, frame: Extract<ClientFrame, { type: "status" }>): Promise<void> {
+  async function sendStatus(conn: Conn, frame: Extract<ClientFrame, { type: "status" }>, respond: Respond): Promise<void> {
     // A CLI status update must diagnose the registered/live agent, not its ephemeral CLI socket.
     const rows = agents(conn.repo);
     const row = rows.find((row) => row.name === conn.name && row.sessionId === conn.sessionId)
       ?? rows.find((row) => row.name === conn.name);
     const detail = row && !frame.pending ? formatDiagnostics(await sessionDiagnostics(row, options.paneProbe ?? createPaneProbe())) : "";
-    send(conn.socket, {
+    respond({
       type: "ok",
+      daemon: daemonInfo,
       detail: `${frame.status === undefined ? "status" : "status updated"}${detail ? `; ${detail}` : ""}`,
       pending_asks: store.pendingAsks(conn.repo, frame.limit, Date.now(),
         conn.role === "orchestrator" || conn.harness === "cli" ? undefined : conn.name),
@@ -294,9 +324,9 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     });
   }
 
-  function hello(conn: Conn, frame: Extract<ClientFrame, { type: "hello" }>): void {
+  function hello(conn: Conn, frame: Extract<ClientFrame, { type: "hello" }>, respond: Respond): void {
     if (frame.token !== options.token) {
-      send(conn.socket, { type: "error", error: "bad token" });
+      respond({ type: "error", error: "bad token" });
       conn.socket.close(1008, "bad token");
       return;
     }
@@ -314,14 +344,16 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     conn.cwd = effectiveCwd;
     conn.declaredSession = frame.sessionId || null;
     conn.sessionBound = Boolean(frame.boundSession && frame.sessionId);
-    conn.sessionId = conn.declaredSession || existing?.sessionId || conn.agentId;
+    conn.sessionId = conn.declaredSession;
+    conn.build = frame.build;
     conn.wake = frame.wake === undefined ? (existing?.wake ?? false) : frame.wake;
-    conn.status = frame.status || "online";
+    conn.status = [...conns].find((peer) => peer !== conn && peer.authed && groupKey(peer) === groupKey(conn))?.status
+      || frame.status || existing?.status || "online";
     conn.role = elect(conn.repo, conn.name, frame.role === "orchestrator");
     conn.topics.add("repo");
     conn.topics.add("presence");
     if (conn.role === "orchestrator") conn.topics.add("reports");
-    if (conn.harness !== "cli") {
+    if (conn.harness !== "cli" && (!existing || conn.sessionBound)) {
       store.upsertAgent({
         repo: conn.repo,
         name: conn.name,
@@ -329,18 +361,21 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         sessionId: conn.sessionBound ? conn.declaredSession : (existing?.sessionId ?? null),
         cwd: conn.cwd,
         wake: conn.wake,
-        status: frame.status || existing?.status || "online",
+        status: conn.status,
       });
+    } else if (conn.harness !== "cli") {
+      store.touchAgent(conn.repo, conn.name);
     }
-    send(conn.socket, {
+    respond({
       type: "welcome",
+      daemon: daemonInfo,
       agentId: conn.agentId,
       repoKey: conn.repo,
       cursor: store.cursor(conn.repo, clientKey(conn)),
       role: conn.role,
       orchestrator: store.getOrchestrator(conn.repo),
     });
-    announce(conn, "online");
+    presence(conn, "online");
   }
 
   function elect(repo: string, name: string, wants: boolean): Role {
@@ -353,7 +388,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     return "orchestrator";
   }
 
-  function setOrchestrator(conn: Conn, name?: string): void {
+  function setOrchestrator(conn: Conn, name: string | undefined, respond: Respond): void {
     if (name !== undefined) {
       requireName(name);
       store.setOrchestrator(conn.repo, name);
@@ -368,10 +403,36 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         }
       }
     }
-    send(conn.socket, {
+    respond({
       type: "orchestrator",
       orchestrator: store.getOrchestrator(conn.repo),
     });
+  }
+
+  function groupKey(conn: Conn): string {
+    return JSON.stringify([conn.repo, conn.name, conn.declaredSession]);
+  }
+
+  function presence(conn: Conn, state: "online" | "offline"): void {
+    if (conn.harness === "cli" || stopping) return;
+    const key = groupKey(conn);
+    if (state === "online") {
+      const pending = pendingOffline.get(key);
+      if (pending) { clearTimeout(pending); pendingOffline.delete(key); }
+      if (!onlineGroups.has(key)) { onlineGroups.add(key); announce(conn, "online"); }
+      return;
+    }
+    if ([...conns].some((peer) => peer.authed && groupKey(peer) === key && peer.harness !== "cli")) return;
+    if (pendingOffline.has(key)) return;
+    const timer = setTimeout(() => {
+      pendingOffline.delete(key);
+      if (stopping) return;
+      if ([...conns].some((peer) => peer.authed && groupKey(peer) === key && peer.harness !== "cli")) return;
+      onlineGroups.delete(key);
+      announce(conn, "offline");
+    }, options.presenceDebounceMs ?? 250);
+    timer.unref?.();
+    pendingOffline.set(key, timer);
   }
 
   function announce(conn: Conn, state: "online" | "offline"): void {
@@ -389,7 +450,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       to: null,
     });
     fanout(message, conn);
-    if (state === "offline") store.touchAgent(conn.repo, conn.name, "offline");
+    if (state === "offline" && ![...conns].some((peer) => peer.authed && peer.repo === conn.repo && peer.name === conn.name && peer.harness !== "cli")) store.touchAgent(conn.repo, conn.name, "offline");
   }
 
   function clientKey(conn: Conn): string {
@@ -401,12 +462,13 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
   async function publish(
     conn: Conn,
     frame: { topic: string; body: string; id?: string; to?: string },
+    respond: Respond,
     kind: BusMessage["kind"] = "pub",
     correlationId: string | null = null,
   ): Promise<void> {
     requireTopic(frame.topic);
     requireBody(frame.body);
-    if (frame.to) requireName(frame.to);
+    if (frame.to !== undefined && frame.to !== "*") requireName(frame.to);
     const message = store.insert({
       repo: conn.repo,
       id: frame.id || randomUUID(),
@@ -417,12 +479,12 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       ts: Date.now(),
       kind,
       correlationId,
-      to: frame.to || null,
+      to: frame.to === "*" ? null : frame.to || null,
     });
     store.touchAgent(conn.repo, conn.name);
     fanout(message, conn);
     const wake = await wakeFor(conn.repo, message);
-    send(conn.socket, {
+    respond({
       type: "published",
       id: message.id,
       seq: message.seq,
@@ -431,7 +493,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     });
   }
 
-  async function ask(conn: Conn, to: string, body: string, topic?: string): Promise<void> {
+  async function ask(conn: Conn, to: string, body: string, topic: string | undefined, respond: Respond): Promise<void> {
     requireName(to);
     const others = [...conns].filter(
       (peer) => peer.authed && peer.repo === conn.repo && peer.name === to && peer.socket !== conn.socket,
@@ -440,28 +502,30 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     await publish(
       conn,
       { topic: topic || "dm", body, to, id: randomUUID() },
+      respond,
       "ask",
       randomUUID(),
     );
   }
 
-  async function report(conn: Conn, body: string): Promise<void> {
+  async function report(conn: Conn, body: string, respond: Respond): Promise<void> {
     try {
       requireBody(body);
       const name = store.getOrchestrator(conn.repo);
       if (!name) throw new Error("no orchestrator yet");
       if (conn.role === "orchestrator") throw new Error("the orchestrator reads reports in bus_inbox");
-      await publish(conn, { topic: "reports", body, to: name });
+      await publish(conn, { topic: "reports", body, to: name }, respond);
     } catch (error) {
       const message = error instanceof Error ? error.message : "request failed";
-      send(conn.socket, { type: "error", error: message });
+      respond({ type: "error", error: message });
     }
   }
 
-  async function reply(conn: Conn, correlationId: string, body: string): Promise<void> {
-    if (!correlationId) throw new Error("correlation id required");
+  async function reply(conn: Conn, correlationId: string, body: string, respond: Respond): Promise<void> {
+    if (typeof correlationId !== "string" || !correlationId) throw new Error("correlation id required");
     const askMessage = store.byCorrelation(conn.repo, correlationId);
     if (!askMessage) throw new Error("no ask with that correlation id");
+    if (conn.name !== askMessage.to && conn.name !== askMessage.fromName) throw new Error("only ask participants may reply");
     const target =
       conn.name === askMessage.fromName && askMessage.to ? askMessage.to : askMessage.fromName;
     await publish(
@@ -472,16 +536,20 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         to: target,
         id: randomUUID(),
       },
+      respond,
       "reply",
       correlationId,
     );
   }
 
-  function inbox(conn: Conn, since: number | undefined, topic: string | undefined, limit: number | undefined): void {
+  function inbox(conn: Conn, since: number | undefined, topic: string | undefined, limit: number | undefined, respond: Respond): void {
     if (topic) requireTopic(topic);
-    const key = clientKey(conn);
+    const baseKey = clientKey(conn);
+    const key = inboxCursorKey(baseKey, topic);
     const cursor = since ?? store.cursor(conn.repo, key);
+    if (since !== undefined && (!Number.isSafeInteger(since) || since < 0)) throw new Error("invalid inbox sequence");
     const pageSize = limit ?? 50;
+    if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 200) throw new Error("inbox limit must be 1..200");
     const messages = store.inbox(conn.repo, cursor, {
       topic,
       to: conn.name,
@@ -492,7 +560,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     store.touchAgent(conn.repo, conn.name);
     const updatedCursor = store.cursor(conn.repo, key);
     const pendingAsk = store.unansweredAsk(conn.repo, conn.name, updatedCursor);
-    send(conn.socket, {
+    respond({
       type: "inbox",
       messages,
       cursor: updatedCursor,
@@ -504,6 +572,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
   function register(
     conn: Conn,
     frame: Extract<ClientFrame, { type: "register" }>,
+    respond: Respond,
   ): void {
     requireName(frame.name);
     if (!frame.cwd) throw new Error("cwd required");
@@ -517,15 +586,14 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       wake: frame.wake,
       status: "registered",
     });
-    send(conn.socket, { type: "registered", name: frame.name });
+    respond({ type: "registered", name: frame.name });
   }
 
   function fanout(message: BusMessage, origin: Conn): void {
     for (const peer of conns) {
       if (!peer.authed || peer.repo !== message.repo || peer.socket === origin.socket) continue;
-      const directed = message.to === peer.name;
-      const subscribed = peer.topics.has(message.topic);
-      if (directed || subscribed) send(peer.socket, { type: "message", message });
+      const delivered = message.to && message.to !== "*" ? message.to === peer.name : peer.topics.has(message.topic);
+      if (delivered) send(peer.socket, { type: "message", message });
     }
   }
 
@@ -549,10 +617,10 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       wakeEnabled: target.wake,
     });
     if (info.mode !== "inject" && info.mode !== "headless") return info;
-    const key = `${repo}:${message.to}`;
+    const key = JSON.stringify([repo, message.to]);
     const last = lastWake.get(key) ?? 0;
-    if (Date.now() - last < WAKE_COOLDOWN_MS) {
-      return { mode: "skip", detail: "wake is on cooldown; the message is in the log" };
+    if (waking.has(key) || Date.now() - last < WAKE_COOLDOWN_MS) {
+      return { mode: "skip", detail: "wake is in flight or on cooldown; the message is in the log" };
     }
     const launch = launchFor({
       mode: info.mode,
@@ -564,6 +632,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     if (!launch || !options.spawnWake) {
       return { mode: "skip", detail: "wake command is not available" };
     }
+    waking.add(key);
     try {
       if (options.logFile) logWake(options.logFile, launch, message.id);
       await options.spawnWake(launch);
@@ -572,6 +641,8 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     } catch (error) {
       const messageText = error instanceof Error ? error.message : "spawn failed";
       return { mode: "skip", detail: `wake failed: ${messageText}` };
+    } finally {
+      waking.delete(key);
     }
   }
 
@@ -582,40 +653,46 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     wake: boolean;
     online: boolean;
   } | null {
-    const live = [...conns].find(
-      (conn) => conn.authed && conn.repo === repo && conn.name === name && conn.harness !== "cli",
-    );
+    const candidates = [...conns].filter((conn) => conn.authed && conn.repo === repo && conn.name === name && conn.harness !== "cli");
     const row = store.getAgent(repo, name);
+    const live = candidates.find((conn) => conn.sessionBound && conn.sessionId === row?.sessionId)
+      ?? candidates.find((conn) => conn.sessionBound) ?? candidates[0];
     if (!live && !row) return null;
     return {
-      harness: live?.harness || row!.harness,
+      harness: live?.sessionBound ? live.harness : row?.harness ?? live!.harness,
       sessionId: (live?.sessionBound ? live.sessionId : null) || row?.sessionId || null,
-      cwd: live?.cwd || row!.cwd,
-      wake: live?.wake || row?.wake || false,
+      cwd: live?.sessionBound ? live.cwd : row?.cwd ?? live!.cwd,
+      wake: row?.wake ?? live?.wake ?? false,
       online: Boolean(live),
     };
   }
 
-  function agents(repo: string) {
+  function agents(repo: string): AgentRecord[] {
     const orchestrator = store.getOrchestrator(repo);
-    const live = [...conns].filter((conn) => conn.authed && conn.repo === repo && conn.harness !== "cli");
-    const liveNames = new Set(live.map((conn) => conn.name));
-    const rows = live.map((conn) => ({
-      repo,
-      name: conn.name,
-      harness: conn.harness,
-      sessionId: conn.sessionId,
-      cwd: conn.cwd,
-      wake: conn.wake,
-      lastSeen: conn.lastSeen,
-      online: true,
-      status: conn.status || "online",
-      role: conn.role,
-    }));
+    const groups = new Map<string, Conn[]>();
+    for (const conn of conns) {
+      if (!conn.authed || conn.repo !== repo || conn.harness === "cli") continue;
+      const key = groupKey(conn);
+      const members = groups.get(key) ?? [];
+      members.push(conn);
+      groups.set(key, members);
+    }
+    const rows: AgentRecord[] = [...groups.values()].map((members) => {
+      const conn = members.reduce((a, b) => a.lastSeen >= b.lastSeen ? a : b);
+      const registered = store.getAgent(repo, conn.name);
+      return {
+        repo, name: conn.name, harness: conn.harness, sessionId: conn.sessionId,
+        wakeSessionId: conn.sessionBound ? conn.sessionId : registered?.sessionId ?? null,
+        cwd: conn.cwd, wake: registered?.wake ?? conn.wake,
+        lastSeen: Math.max(...members.map((member) => member.lastSeen)),
+        online: true, status: conn.status || "online", role: conn.role,
+        connectionCount: members.length, connectionIds: members.map((member) => member.agentId),
+        builds: members.flatMap((member) => member.build ? [member.build] : []),
+      };
+    });
+    const liveNames = new Set(rows.map((row) => row.name));
     for (const row of store.listAgents(repo, new Set())) {
-      if (!liveNames.has(row.name)) {
-        rows.push({ ...row, role: row.name === orchestrator ? "orchestrator" : "worker" });
-      }
+      if (!liveNames.has(row.name)) rows.push({ ...row, wakeSessionId: row.sessionId, connectionCount: 0, role: row.name === orchestrator ? "orchestrator" : "worker" });
     }
     rows.sort((a, b) => a.name.localeCompare(b.name) || (a.sessionId ?? "").localeCompare(b.sessionId ?? ""));
     return rows;
@@ -628,6 +705,8 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       new Promise((resolve) => {
         stopping = true;
         clearInterval(sweep);
+        for (const timer of pendingOffline.values()) clearTimeout(timer);
+        pendingOffline.clear();
         for (const conn of conns) conn.socket.close();
         wss.close(() => {
           http.close(() => {
@@ -644,14 +723,15 @@ function send(socket: WebSocket, frame: ServerFrame): void {
 }
 
 function requireTopic(topic: string): void {
-  if (!TOPIC_RE.test(topic)) throw new Error(`bad topic: ${topic}`);
+  if (typeof topic !== "string" || !TOPIC_RE.test(topic)) throw new Error(`bad topic: ${topic}`);
 }
 
 function requireName(name: string): void {
-  if (!NAME_RE.test(name)) throw new Error(`bad name: ${name}`);
+  if (typeof name !== "string" || !NAME_RE.test(name)) throw new Error(`bad name: ${name}`);
 }
 
 function requireBody(body: string): void {
+  if (typeof body !== "string") throw new Error("message body must be a string");
   if (!body.trim()) throw new Error("empty message");
   if (body.length > BODY_MAX) throw new Error(`message is longer than ${BODY_MAX} bytes`);
 }

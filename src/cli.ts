@@ -13,6 +13,7 @@ import {
   runClaudePane,
   writeSavedAccounts,
 } from "./accounts.ts";
+import { BUILD, buildWarning, formatBuild } from "./build.ts";
 import { createPaneProbe, formatDiagnostics, sessionDiagnostics } from "./health.ts";
 import { Store } from "./store.ts";
 import { formatWaitResult, waitForMessages } from "./wait.ts";
@@ -20,7 +21,7 @@ import { formatAgentMetrics, formatPendingAsks } from "./status.ts";
 import { BusClient } from "./busClient.ts";
 import { startDaemon } from "./daemon.ts";
 import { ensureDaemon, readDaemonInfo } from "./ensure.ts";
-import { hookStdout, shouldSkipHookForPrompt } from "./hook.ts";
+import { hookStdout, shouldSkipHookForPrompt, supportsHookOutput } from "./hook.ts";
 import { daemonInfoPath, dbPath, switchboardHome, wakeLogPath } from "./paths.ts";
 import { repoKey, type RepoScope } from "./repo.ts";
 import { runShim } from "./shim.ts";
@@ -269,6 +270,7 @@ async function serve(): Promise<void> {
     pid: process.pid,
     url: handle.url,
     startedAt: Date.now(),
+    build: BUILD,
   };
   writeFileSync(daemonInfoPath(home), `${JSON.stringify(info)}\n`);
   process.stdout.write(`switchboard listening on ${handle.url}\n`);
@@ -291,6 +293,7 @@ async function who(doctor = false): Promise<void> {
         all: { type: "boolean" as const, default: false },
         share: { type: "boolean" as const, default: false },
         scope: { type: "string" as const },
+        metadata: { type: "boolean" as const, default: false },
       } : {}),
     },
   });
@@ -313,10 +316,15 @@ async function who(doctor = false): Promise<void> {
         agent.diagnostics ??= await sessionDiagnostics(agent, probe);
       }));
     }
-    if (doctor && frame.agents.some((agent) => agent.diagnostics?.warnings.length)) process.exitCode = 1;
+    const versionWarning = doctor ? buildWarning(BUILD, frame.daemon) : null;
+    if (doctor && (versionWarning || frame.agents.some((agent) => agent.diagnostics?.warnings.length))) process.exitCode = 1;
     if (values.json) {
-      process.stdout.write(`${JSON.stringify(values.prune ? { agents: frame.agents, pruned } : frame.agents)}\n`);
+      process.stdout.write(`${JSON.stringify(values.metadata ? { daemon: frame.daemon ?? null, client: BUILD, warnings: versionWarning ? [versionWarning] : [], agents: frame.agents, pruned } : values.prune ? { agents: frame.agents, pruned } : frame.agents)}\n`);
       return;
+    }
+    if (doctor) {
+      process.stdout.write(`${formatBuild("daemon", frame.daemon)}\n${formatBuild("client", BUILD)}\n`);
+      if (versionWarning) process.stdout.write(`WARNING: ${versionWarning}\n`);
     }
     if (frame.agents.length === 0) {
       process.stdout.write(values.all ? "nobody registered on any board\n" : "nobody registered in this repo\n");
@@ -326,7 +334,7 @@ async function who(doctor = false): Promise<void> {
     for (const agent of frame.agents) {
       const state = agent.online ? "online" : "offline";
       const wake = agent.wake ? "wake" : "no-wake";
-      const session = agent.sessionId ? ` session=${agent.sessionId}` : "";
+      const session = `${agent.sessionId ? ` session=${agent.sessionId}` : ""}${agent.wakeSessionId && agent.wakeSessionId !== agent.sessionId ? ` wake_session=${agent.wakeSessionId}` : ""} connections=${agent.connectionCount ?? (agent.online ? 1 : 0)}`;
       process.stdout.write(
         `${values.all ? `${agent.repo}\t` : ""}${agent.name}\t${agent.harness}\t${state}\t${wake}${session}\t${agent.role}\t${agent.status}\t${formatDiagnostics(agent.diagnostics)}\n`,
       );
@@ -350,6 +358,7 @@ async function waitCmd(): Promise<void> {
       "interval-ms": { type: "string", default: "1500" },
       "since-seq": { type: "string" },
       "wake-existing": { type: "boolean", default: false },
+      topic: { type: "string" },
       session: { type: "string" },
       json: { type: "boolean", default: false },
     },
@@ -363,7 +372,7 @@ async function waitCmd(): Promise<void> {
   try {
     const result = await waitForMessages(store, {
       repo: repoKey(values.cwd || process.cwd()), to, timeoutMs, intervalMs, sinceSeq,
-      wakeExisting: values["wake-existing"], cursorKey,
+      wakeExisting: values["wake-existing"], cursorKey, topic: values.topic,
     }, {
       onReady: (baseline) => process.stderr.write(`waiting to=${to} since_seq=${baseline} timeout_seconds=${timeoutMs / 1000}\n`),
     });
@@ -574,9 +583,9 @@ async function setStatus(): Promise<void> {
     if (frame.type !== "ok") throw new Error("unexpected response");
     if (!frame.pending_asks) throw new Error("pending-ask tracking unavailable; restart the daemon after upgrading");
     if (values.json) {
-      process.stdout.write(`${JSON.stringify({ ...(values.pending ? {} : { detail: frame.detail, agent_metrics: frame.agent_metrics ?? [] }), pending_asks: frame.pending_asks })}\n`);
+      process.stdout.write(`${JSON.stringify({ ...(values.pending ? {} : { detail: frame.detail, daemon: frame.daemon ?? null, client: BUILD, agent_metrics: frame.agent_metrics ?? [] }), pending_asks: frame.pending_asks })}\n`);
     } else {
-      if (!values.pending) process.stdout.write(`${frame.detail}\n`);
+      if (!values.pending) process.stdout.write(`${frame.detail}\n${formatBuild("daemon", frame.daemon)}\n${formatBuild("client", BUILD)}${buildWarning(BUILD, frame.daemon) ? `\nWARNING: ${buildWarning(BUILD, frame.daemon)}` : ""}\n`);
       process.stdout.write(`${formatPendingAsks(frame.pending_asks)}\n`);
       if (!values.pending) process.stdout.write(`${formatAgentMetrics(frame.agent_metrics ?? [])}\n`);
     }
@@ -839,7 +848,7 @@ async function hook(): Promise<void> {
   const stdinEvent = stdinJson && typeof stdinJson.hook_event_name === "string" ? stdinJson.hook_event_name : "";
   const event = values.event || stdinEvent || "";
   if (!harness || !event) throw new Error("hook requires --harness and --event");
-  if (shouldSkipHookForPrompt(event, stdinJson)) return;
+  if (!supportsHookOutput(harness, event) || shouldSkipHookForPrompt(event, stdinJson)) return;
   const home = switchboardHome();
   const info = readDaemonInfo(home);
   if (!info) return;

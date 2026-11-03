@@ -59,7 +59,8 @@ export async function sessionDiagnostics(
   probe: PaneProbe,
   now = Date.now(),
 ): Promise<SessionDiagnostics> {
-  const target = paneTarget(agent.sessionId);
+  const sessionId = agent.sessionId ?? agent.wakeSessionId ?? null;
+  const target = paneTarget(sessionId);
   let pane: boolean | null | undefined;
   if (target) {
     try {
@@ -71,10 +72,10 @@ export async function sessionDiagnostics(
   const stale = now - agent.lastSeen > SESSION_STALE_MS;
   const health = pane === false ? "dead_pane" : stale ? "stale" : agent.online ? "online" : "offline";
   const wakeMode = decideWake({ directed: true, online: agent.online, harness: agent.harness,
-    sessionId: agent.sessionId, wakeEnabled: agent.wake }).mode;
+    sessionId, wakeEnabled: agent.wake }).mode;
   const warnings: string[] = [];
-  if (pane === false) warnings.push(`${wakeMode === "inject" ? "wake=inject targets" : "session targets"} missing or exited ${target!.kind} pane ${agent.sessionId}; rebind the session`);
-  if (pane === null) warnings.push(`could not verify ${target!.kind} pane ${agent.sessionId}; check multiplexer availability and permissions`);
+  if (pane === false) warnings.push(`${wakeMode === "inject" ? "wake=inject targets" : "session targets"} missing or exited ${target!.kind} pane ${sessionId}; rebind the session`);
+  if (pane === null) warnings.push(`could not verify ${target!.kind} pane ${sessionId}; check multiplexer availability and permissions`);
   if (stale) warnings.push("last seen more than 10 minutes ago; check the agent connection");
   if (agent.online && !agent.wake) warnings.push("wake=off on an active agent; offline headless wake is disabled (bound-session injection still applies)");
   return { health, wakeMode, warnings };

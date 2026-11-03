@@ -1,5 +1,6 @@
 /** Wire types shared by the daemon, the MCP shim, and the CLI. */
 
+export const PROTOCOL_VERSION = 2;
 export const TOPIC_RE = /^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,127}$/;
 export const NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,63}$/;
 export const BODY_MAX = 32 * 1024;
@@ -31,7 +32,21 @@ export type SessionDiagnostics = {
   warnings: string[];
 };
 
+export type BuildInfo = {
+  version: string;
+  protocol_version: number;
+  commit_sha: string | null;
+  dirty: boolean;
+  built_at: string | null;
+  source: "source" | "built";
+};
+export type RuntimeInfo = BuildInfo & { pid: number; started_at: number };
+
 export type AgentRecord = {
+  connectionCount?: number;
+  connectionIds?: string[];
+  wakeSessionId?: string | null;
+  builds?: BuildInfo[];
   diagnostics?: SessionDiagnostics;
   repo: string;
   name: string;
@@ -75,6 +90,7 @@ export type PrunedAgent = {
 export type WakeMode = "push" | "inject" | "headless" | "skip";
 
 export type ClientHello = {
+  build?: BuildInfo;
   type: "hello";
   token: string;
   name: string;
@@ -90,7 +106,7 @@ export type ClientHello = {
   role?: Role;
 };
 
-export type ClientFrame =
+export type ClientFrame = (
   | ClientHello
   | { type: "publish"; topic: string; body: string; id?: string; to?: string }
   | { type: "subscribe"; topics: string[] }
@@ -105,16 +121,18 @@ export type ClientFrame =
   | { type: "status"; status?: string; pending?: boolean; limit?: number }
   | { type: "orchestrator"; name?: string }
   | { type: "register"; name: string; harness: string; cwd: string; sessionId?: string; wake: boolean }
-  | { type: "heartbeat" };
+  | { type: "heartbeat" }
+) & { reqId?: string };
 
 export type WakeInfo = {
   mode: WakeMode;
   detail: string;
 };
 
-export type ServerFrame =
+export type ServerFrame = (
   | {
       type: "welcome";
+      daemon?: RuntimeInfo;
       agentId: string;
       repoKey: string;
       cursor: number;
@@ -122,16 +140,18 @@ export type ServerFrame =
       orchestrator: string | null;
     }
   | { type: "published"; id: string; seq: number; wake: WakeInfo; correlationId?: string | null }
-  | { type: "ok"; detail: string; pending_asks?: PendingAsk[]; agent_metrics?: AgentMetrics[] }
+  | { type: "ok"; detail: string; pending_asks?: PendingAsk[]; agent_metrics?: AgentMetrics[]; daemon?: RuntimeInfo }
   | { type: "message"; message: BusMessage }
   | { type: "inbox"; messages: BusMessage[]; cursor: number; more: boolean; pendingAsk?: BusMessage | null }
-  | { type: "who"; agents: AgentRecord[] }
-  | { type: "doctor"; agents: AgentRecord[]; pruned: PrunedAgent[] }
+  | { type: "who"; agents: AgentRecord[]; daemon?: RuntimeInfo }
+  | { type: "doctor"; agents: AgentRecord[]; pruned: PrunedAgent[]; daemon?: RuntimeInfo }
   | { type: "orchestrator"; orchestrator: string | null }
   | { type: "registered"; name: string }
-  | { type: "error"; error: string };
+  | { type: "error"; error: string }
+) & { reqId?: string };
 
 export type WakeLaunch = {
+  completion?: "spawn" | "exit";
   cmd: string;
   args: string[];
   cwd: string;
