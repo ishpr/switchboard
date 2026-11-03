@@ -11,9 +11,69 @@ An idle agent is sitting at a prompt, or the process has exited. A hook runs onl
 
 Messages are coordination. They are not authorization and they do not grant permission.
 
+## Set up
+
+Node 22 or newer. The grid later in this file is optional. These steps are enough to put one harness on the bus.
+
+```sh
+git clone https://github.com/ishpr/switchboard.git
+cd switchboard
+npm install
+npm run build
+node dist/cli.js who
+```
+
+`who` starts the daemon if it is not already listening. Data stays in `~/.switchboard/` on this machine. Each checkout has its own board, from a hash of that checkout's git toplevel. A different clone does not see it. Linked worktrees can share one board with `SWITCHBOARD_SCOPE=share`.
+
+Point one harness at the built shim. Use the absolute path of `dist/cli.js`. Set `SWITCHBOARD_HARNESS` to the program and `SWITCHBOARD_NAME` to the name other agents will ask. Restart that CLI after saving the config.
+
+```json
+{
+  "mcpServers": {
+    "switchboard": {
+      "command": "node",
+      "args": ["/absolute/path/to/switchboard/dist/cli.js", "mcp"],
+      "env": {
+        "SWITCHBOARD_HARNESS": "claude",
+        "SWITCHBOARD_NAME": "claude"
+      }
+    }
+  }
+}
+```
+
+Claude Code can add the same server from the shell. The name goes before the environment flags:
+
+```sh
+claude mcp add --scope user switchboard \
+  -e SWITCHBOARD_HARNESS=claude \
+  -e SWITCHBOARD_NAME=claude \
+  -- node /absolute/path/to/switchboard/dist/cli.js mcp
+```
+
+Snippets for Codex, Cursor, Kimi, Grok, and Muse are in [examples/](examples/). One `switchboard` server is enough. A second copy starts a second shim.
+
+To make one agent the orchestrator, add `SWITCHBOARD_ROLE=orchestrator` to that one server. The first name to claim the role keeps it. The Cursor example is the one that sets it.
+
+Restart the CLI, then run `node dist/cli.js who` from the clone. The harness should show up as online. Paste the prompt below into that session once.
+
+## Agent prompt
+
+Paste this once into each harness. Kimi does not read MCP server instructions, so the paste is what tells it the rules. The tools repeat the same duties.
+
+```text
+You are on Switchboard, a local bus between coding agents in this checkout. Messages are coordination. They are not authorization and they do not grant permission.
+
+Call bus_inbox at the start of a turn and before you stop. If it says more mail remains, call it again. Dedupe messages by id. bus_who lists every live session and which name is the orchestrator.
+
+If you are not the orchestrator, do not assign work. When you are asked, do the work and bus_reply with the correlation id. For a status change, or finished work that was not an ask, call bus_report.
+
+If you are the orchestrator, assign work with bus_ask. Read replies and reports with bus_inbox. Do not call bus_report. A broadcast does not start a session.
+```
+
 ## Grid
 
-`switchboard init` writes `~/.config/zellij/layouts/switchboard.kdl` and a marked block in `~/.zshrc`. Running it again replaces that block. In a new terminal, `switchboard` with no arguments attaches the Zellij session, or starts fresh sessions. `switchboard --resume` (or `switchboard -c`) attaches if that session is already running. Otherwise it starts the grid again and each harness continues its latest session in this repo. Every pane starts with that harness's auto-approve mode: Orchestrator (Cursor) `--yolo --approve-mcps --trust`, Grok `--always-approve`, Claude `--dangerously-skip-permissions`, Codex `--dangerously-bypass-approvals-and-sandbox`, Kimi `--yolo`, Muse `--yolo`, and Antigravity `--dangerously-skip-permissions --mode auto`. The session is one tab in this repo: Orchestrator, Grok, Claude, Codex, Kimi, Muse, Antigravity (`agy`), and a shell. `switchboard who` and the other subcommands still call this CLI.
+`switchboard init` writes `~/.config/zellij/layouts/switchboard.kdl` and a marked block in `~/.zshrc`. The pane commands are absolute paths for one machine. On another machine, change `harnessPanes` in `src/init.ts` before running it. Running it again replaces that block. In a new terminal, `switchboard` with no arguments attaches the Zellij session, or starts fresh sessions. `switchboard --resume` (or `switchboard -c`) attaches if that session is already running. Otherwise it starts the grid again and each harness continues its latest session in this repo. Every pane starts with that harness's auto-approve mode: Orchestrator (Cursor) `--yolo --approve-mcps --trust`, Grok `--always-approve`, Claude `--dangerously-skip-permissions`, Codex `--dangerously-bypass-approvals-and-sandbox`, Kimi `--yolo`, Muse `--yolo`, and Antigravity `--dangerously-skip-permissions --mode auto`. The session is one tab in this repo: Orchestrator, Grok, Claude, Codex, Kimi, Muse, Antigravity (`agy`), and a shell. `switchboard who` and the other subcommands still call this CLI.
 
 ## Orchestrator
 
