@@ -4,7 +4,15 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { hookStdout } from "../src/hook.ts";
-import { instructions, parseZellijSessionFromPs } from "../src/shim.ts";
+import {
+  discoverCodexThread,
+  discoverHarnessSession,
+  instructions,
+  missingSessionSource,
+  parseTerminalTtyFromPs,
+  parseZellijSessionFromPs,
+} from "../src/shim.ts";
+import { DatabaseSync } from "node:sqlite";
 import type { BusMessage } from "../src/types.ts";
 import { decideWake, headlessLaunch, launchFor, promptFor, spawnWake } from "../src/wake.ts";
 
@@ -33,12 +41,13 @@ test("a broadcast does not wake anyone", () => {
   assert.equal(info.mode, "skip");
 });
 
-test("a bound Codex session is injected even while that session is open", () => {
+test("a bound Codex session with a valid UUID is injected even while that session is open, and non-UUIDs are rejected", () => {
+  const validUuid = "01a175cd-251c-7571-abb3-21ea77b5d73d";
   const info = decideWake({
     directed: true,
     online: true,
     harness: "codex",
-    sessionId: "thread-1",
+    sessionId: validUuid,
     wakeEnabled: false,
   });
   assert.equal(info.mode, "inject");
@@ -46,12 +55,34 @@ test("a bound Codex session is injected even while that session is open", () => 
     mode: "inject",
     harness: "codex",
     cwd: "/work",
-    sessionId: "thread-1",
+    sessionId: validUuid,
     message,
   });
   assert.ok(launch);
-  assert.deepEqual(launch.args.slice(0, 4), ["queue", "--thread", "thread-1", "--message"]);
+  assert.deepEqual(launch.args.slice(0, 4), ["queue", "--thread", validUuid, "--message"]);
   assert.ok(launch.args.includes("--resume"));
+
+  // A random non-UUID string must not be passed to codex queue --thread
+  assert.equal(
+    decideWake({
+      directed: true,
+      online: true,
+      harness: "codex",
+      sessionId: "thread-1",
+      wakeEnabled: false,
+    }).mode,
+    "push",
+  );
+  assert.equal(
+    launchFor({
+      mode: "inject",
+      harness: "codex",
+      cwd: "/work",
+      sessionId: "thread-1",
+      message,
+    }),
+    null,
+  );
 });
 
 test("a plain Muse UUID session is not treated as injectable unless bound to a pane or explicitly enabled", () => {
@@ -229,6 +260,134 @@ test("pane injections still spawn after the agent's registered worktree is remov
       await spawn({ ...launch, env: { PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}`, WAKE_CAPTURE: capture } });
     }
     assert.equal(readFileSync(capture, "utf8").trim().split("\n").length, 6);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("recorded Terminal.app tty injects via osascript do script, and offline Muse resumes known session UUID", () => {
+  const museUuid = "01a1957b-b088-76e1-b08b-ad1ac5ed8594";
+  const parsed = parseTerminalTtyFromPs(
+    "2536 ttys007 /Users/test/.local/bin/muse-bin resume 01a1957b TERM_PROGRAM=Apple_Terminal __CFBundleIdentifier=com.apple.Terminal",
+  );
+  assert.equal(parsed.ppid, 2536);
+  assert.equal(parsed.tty, "tty:/dev/ttys007");
+  assert.equal(parsed.appleTerminal, true);
+
+  assert.equal(
+    decideWake({ directed: true, online: true, harness: "muse", sessionId: "tty:/dev/ttys007", wakeEnabled: false }).mode,
+    "inject",
+  );
+  const ttyLaunch = launchFor({
+    mode: "inject",
+    harness: "muse",
+    cwd: "/work",
+    sessionId: "tty:/dev/ttys007",
+    message,
+  });
+  assert.ok(ttyLaunch);
+  assert.equal(ttyLaunch.cmd, "osascript");
+  assert.ok(ttyLaunch.args.includes("/dev/ttys007"));
+  assert.match(ttyLaunch.args[1]!, /tell application "Terminal"/);
+
+  // Offline Muse with a known UUID resumes that session via muse exec --session-id
+  const resumeLaunch = headlessLaunch("muse", "/work", museUuid, "hello");
+  assert.deepEqual(resumeLaunch, {
+    cmd: "muse",
+    args: ["exec", "--session-id", museUuid, "hello"],
+    cwd: "/work",
+  });
+  // Offline Muse without a UUID starts fresh
+  assert.deepEqual(headlessLaunch("muse", "/work", null, "hello"), {
+    cmd: "muse",
+    args: ["exec", "hello"],
+    cwd: "/work",
+  });
+});
+
+test("discoverHarnessSession reads MUSE_SESSION_ID, CLAUDE_CODE_SESSION_ID, CODEX_THREAD_ID, and ~/.codex/state_5.sqlite when cwd is a real repo", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "sb-codex-sqlite-"));
+  const repoDir = path.join(dir, "repo");
+  const otherDir = path.join(dir, "other");
+  mkdirSync(repoDir, { recursive: true });
+  mkdirSync(otherDir, { recursive: true });
+  const db = new DatabaseSync(path.join(dir, "state_5.sqlite"));
+  db.exec(`
+    CREATE TABLE threads (
+      id TEXT PRIMARY KEY,
+      cwd TEXT NOT NULL,
+      thread_source TEXT NOT NULL,
+      archived INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL
+    );
+  `);
+  const oldUserThread = "01a10000-0000-7000-8000-000000000001";
+  const newestUserThread = "01a175cd-251c-7571-abb3-21ea77b5d73d";
+  const newerSubagentThread = "01a19999-9999-7999-8999-999999999999";
+  const otherRepoThread = "01a18888-8888-7888-8888-888888888888";
+  db.prepare("INSERT INTO threads (id, cwd, thread_source, archived, updated_at) VALUES (?, ?, ?, ?, ?)").run(
+    oldUserThread,
+    repoDir,
+    "user",
+    0,
+    100,
+  );
+  db.prepare("INSERT INTO threads (id, cwd, thread_source, archived, updated_at) VALUES (?, ?, ?, ?, ?)").run(
+    newestUserThread,
+    repoDir,
+    "user",
+    0,
+    200,
+  );
+  db.prepare("INSERT INTO threads (id, cwd, thread_source, archived, updated_at) VALUES (?, ?, ?, ?, ?)").run(
+    newerSubagentThread,
+    repoDir,
+    "subagent",
+    0,
+    300,
+  );
+  db.prepare("INSERT INTO threads (id, cwd, thread_source, archived, updated_at) VALUES (?, ?, ?, ?, ?)").run(
+    otherRepoThread,
+    otherDir,
+    "user",
+    0,
+    400,
+  );
+  db.close();
+
+  try {
+    // Picks newest thread_source='user' for repoDir, ignoring newer subagent and other repos
+    assert.equal(discoverCodexThread(repoDir, dir), newestUserThread);
+    // A shim started at "/" must NEVER take the newest thread on the machine
+    assert.equal(discoverCodexThread("/", dir), undefined);
+    assert.equal(
+      discoverHarnessSession({ cwd: "/", harness: "codex", env: {}, codexHome: dir }).sessionId,
+      undefined,
+    );
+    assert.equal(
+      discoverHarnessSession({ cwd: repoDir, harness: "codex", env: {}, codexHome: dir }).sessionId,
+      newestUserThread,
+    );
+    assert.equal(
+      discoverHarnessSession({
+        cwd: repoDir,
+        harness: "muse",
+        env: { MUSE_SESSION_ID: "01a1957b-b088-76e1-b08b-ad1ac5ed8594" },
+      }).sessionId,
+      "01a1957b-b088-76e1-b08b-ad1ac5ed8594",
+    );
+    assert.equal(
+      discoverHarnessSession({
+        cwd: repoDir,
+        harness: "claude",
+        env: { CLAUDE_CODE_SESSION_ID: "01a11111-2222-7333-8444-555555555555" },
+      }).sessionId,
+      "01a11111-2222-7333-8444-555555555555",
+    );
+    assert.match(missingSessionSource("muse", repoDir), /MUSE_SESSION_ID/);
+    assert.match(missingSessionSource("claude", repoDir), /CLAUDE_CODE_SESSION_ID/);
+    assert.match(missingSessionSource("codex", repoDir), /CODEX_THREAD_ID.*state_5\.sqlite/);
+    assert.match(missingSessionSource("codex", "/"), /cwd="\/"/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

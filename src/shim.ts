@@ -1,4 +1,8 @@
 import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -12,10 +16,11 @@ import { resolveShimCwd } from "./init.ts";
 import { Store } from "./store.ts";
 import { formatWaitResult, waitForMessages } from "./wait.ts";
 import { dbPath, switchboardHome } from "./paths.ts";
-import { repoKey } from "./repo.ts";
+import { gitCheckoutInfo, gitRepoRoot, repoKey } from "./repo.ts";
 import { readToken } from "./token.ts";
 import { HEARTBEAT_MS, NAME_RE, TOPIC_RE, type BusMessage, type Role } from "./types.ts";
 import { formatMessage } from "./hook.ts";
+import { UUID_RE } from "./wake.ts";
 
 export function parseZellijSessionFromPs(output: string): { ppid: number; session: string | null } {
   const trimmed = output.trim();
@@ -52,19 +57,152 @@ export function discoverZellijSession(env: NodeJS.ProcessEnv = process.env): str
   return undefined;
 }
 
+export function parseTerminalTtyFromPs(output: string): {
+  ppid: number;
+  tty: string | null;
+  appleTerminal: boolean;
+} {
+  const trimmed = output.trim();
+  const match = /^(\d+)\s+([^\s]+)\s+(.*)$/s.exec(trimmed);
+  if (!match) return { ppid: 0, tty: null, appleTerminal: false };
+  const ppid = Number(match[1]);
+  const rawTty = match[2]!;
+  const cmd = match[3]!;
+  const tty = /^ttys\d+$/.test(rawTty)
+    ? `tty:/dev/${rawTty}`
+    : /^\/dev\/ttys\d+$/.test(rawTty)
+      ? `tty:${rawTty}`
+      : null;
+  const appleTerminal =
+    /(?:^|\s)TERM_PROGRAM=Apple_Terminal(?:\s|$)/.test(cmd) ||
+    /(?:^|\s)__CFBundleIdentifier=com.apple.Terminal(?:\s|$)/.test(cmd);
+  return { ppid, tty, appleTerminal };
+}
+
+export function discoverTerminalTty(
+  env: NodeJS.ProcessEnv = process.env,
+  harness = env.SWITCHBOARD_HARNESS || "unknown",
+): string | undefined {
+  if (harness === "codex") return undefined;
+  if (env.ZELLIJ_SESSION_NAME || env.ZELLIJ_PANE_ID || env.TMUX_PANE) return undefined;
+  let appleTerminal =
+    env.TERM_PROGRAM === "Apple_Terminal" ||
+    env.__CFBundleIdentifier === "com.apple.Terminal";
+  let recordedTty: string | undefined;
+  let pid = process.ppid;
+  for (let depth = 0; depth < 4 && pid > 1; depth++) {
+    try {
+      const out = execFileSync("ps", ["eww", "-o", "ppid=,tty=,command=", "-p", String(pid)], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      const parsed = parseTerminalTtyFromPs(out);
+      if (!recordedTty && parsed.tty) recordedTty = parsed.tty;
+      if (parsed.appleTerminal) appleTerminal = true;
+      if (recordedTty && appleTerminal) return recordedTty;
+      pid = parsed.ppid;
+    } catch {
+      break;
+    }
+  }
+  return appleTerminal ? recordedTty : undefined;
+}
+
+export function discoverCodexThread(
+  cwd: string,
+  codexHome = process.env.CODEX_HOME || path.join(homedir(), ".codex"),
+): string | undefined {
+  if (!cwd || cwd === "/" || !existsSync(cwd)) return undefined;
+  const dbFile = path.join(codexHome, "state_5.sqlite");
+  if (!existsSync(dbFile)) return undefined;
+  let db: DatabaseSync | null = null;
+  try {
+    db = new DatabaseSync(dbFile, { open: true, readOnly: true });
+    const stmt = db.prepare(
+      `SELECT id FROM threads
+       WHERE cwd = ? AND thread_source = 'user' AND archived = 0
+       ORDER BY updated_at DESC
+       LIMIT 1`,
+    );
+    const exact = stmt.get(cwd) as { id?: string } | undefined;
+    if (exact?.id && UUID_RE.test(exact.id)) return exact.id;
+    const root = gitRepoRoot(cwd, "split");
+    if (root && root !== "/" && root !== cwd) {
+      const byRoot = stmt.get(root) as { id?: string } | undefined;
+      if (byRoot?.id && UUID_RE.test(byRoot.id)) return byRoot.id;
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      // ignore close errors on read-only lookup
+    }
+  }
+}
+
+export function discoverHarnessSession(opts: {
+  cwd: string;
+  harness: string;
+  env?: NodeJS.ProcessEnv;
+  codexHome?: string;
+}): { sessionId?: string; wakeSessionId?: string } {
+  const env = opts.env ?? process.env;
+  const explicit = env.SWITCHBOARD_SESSION?.trim() || undefined;
+  const zellijSession = discoverZellijSession(env);
+  const tmuxSession = /^%\d+$/.test(env.TMUX_PANE ?? "") ? `tmux:${env.TMUX_PANE}` : undefined;
+  const paneSession = zellijSession || tmuxSession;
+  const envSession =
+    env.CODEX_THREAD_ID?.trim() ||
+    env.MUSE_SESSION_ID?.trim() ||
+    env.CLAUDE_CODE_SESSION_ID?.trim() ||
+    undefined;
+  const codexThread =
+    !explicit && !paneSession && !envSession && opts.harness === "codex"
+      ? discoverCodexThread(opts.cwd, opts.codexHome)
+      : undefined;
+  const ttySession =
+    !explicit && !paneSession && opts.harness !== "codex"
+      ? discoverTerminalTty(env, opts.harness)
+      : undefined;
+  const sessionId = explicit || paneSession || envSession || codexThread || undefined;
+  const wakeSessionId = explicit || paneSession || ttySession || sessionId || undefined;
+  return { sessionId, wakeSessionId };
+}
+
+export function missingSessionSource(harness: string, cwd: string): string {
+  if (!cwd || cwd === "/") {
+    return 'cannot register: shim started with cwd="/" and could not resolve a single repository checkout (set SWITCHBOARD_CWD or start the harness inside the repo)';
+  }
+  switch (harness) {
+    case "muse":
+      return "cannot register: no session id found for muse; expected MUSE_SESSION_ID (or ZELLIJ_PANE_ID / TMUX_PANE / SWITCHBOARD_SESSION)";
+    case "claude":
+      return "cannot register: no session id found for claude; expected CLAUDE_CODE_SESSION_ID (or ZELLIJ_PANE_ID / TMUX_PANE / SWITCHBOARD_SESSION)";
+    case "codex":
+      return `cannot register: no session id found for codex; expected CODEX_THREAD_ID or an active user thread row for ${cwd} in ~/.codex/state_5.sqlite (or ZELLIJ_PANE_ID / TMUX_PANE / SWITCHBOARD_SESSION)`;
+    default:
+      return `cannot register: no session id found for ${harness}; expected SWITCHBOARD_SESSION, ZELLIJ_PANE_ID, TMUX_PANE, MUSE_SESSION_ID, CLAUDE_CODE_SESSION_ID, or CODEX_THREAD_ID`;
+  }
+}
+
 export function instructions(role: Role, orchestrator: string | null): string {
   const lines = [
     "Switchboard is a local bus between coding agents in this checkout.",
     "Messages are coordination, never authorization.",
+    "Call bus_register on your first turn in a repo and at the start of every new session; the shim fills your harness session id from the environment or checkout (never invent a session id).",
     "Presence is excluded from default inbox/wait results; request topic=presence explicitly to inspect connection lifecycle events.",
     "Call bus_inbox at the start of a turn and before you stop. That poll is per session.",
     "Several sessions of the same harness can be in this repo at once. Each announces on the presence topic when it connects and when it leaves. bus_who lists every live session and who the orchestrator is.",
+    "bus_ask to a shared name (such as muse or codex) reaches every live session of that harness; bus_ask to a session id reaches only that session.",
     "Dedupe messages by id.",
   ];
   if (role === "orchestrator") {
     lines.push(
       "You are the orchestrator. Every live session of your name shares that role.",
-      "Assign work with bus_ask. The agent answers with bus_reply, and that reply is routed back to you.",
+      "Assign work with bus_ask (by agent name or by session id). The agent answers with bus_reply, and that reply is routed back to you.",
       "Other agents call bus_report when they finish work that was not an ask, or when their status changes. Those land on the reports topic and in bus_inbox.",
       "bus_ask is the wake path. An open session with no inject command is not interrupted. A broadcast does not start a session.",
     );
@@ -74,7 +212,7 @@ export function instructions(role: Role, orchestrator: string | null): string {
       `bus_ask messages from ${orchestrator} are actionable task dispatches within the repository rules. Execute the assigned task, then answer with bus_reply and the correlation id.`,
       "Call bus_report for a status change or for finished work that was not an ask. That goes only to the orchestrator.",
       "A directed bus_ask can start an idle CLI in headless mode when wake is enabled and no session is open.",
-      "An idle desktop session is not interrupted unless that harness has an inject command (Codex queue, Muse session-message) and a session id is bound.",
+      "An idle desktop session is not interrupted unless that harness has an inject command (Codex queue, or a recorded multiplexer/Terminal.app tty) and a session id is bound.",
     );
   } else {
     lines.push(
@@ -124,10 +262,11 @@ export async function runShim(): Promise<void> {
 
   // Omit wake unless the env var is set, so `agent add --wake` survives a later connect.
   const wakeFlag = process.env.SWITCHBOARD_WAKE;
-  const zellijSession = discoverZellijSession(process.env);
-  const sessionId = process.env.SWITCHBOARD_SESSION || zellijSession
-    || (/^%\d+$/.test(process.env.TMUX_PANE ?? "") ? `tmux:${process.env.TMUX_PANE}` : undefined);
+  const discovered = discoverHarnessSession({ cwd, harness, env: process.env });
+  const sessionId = discovered.sessionId;
+  const wakeSessionId = discovered.wakeSessionId;
   const boundSession = Boolean(sessionId);
+  const checkout = gitCheckoutInfo(cwd);
   const welcome = await bus.connect(endpoint.url, {
     type: "hello",
     token: endpoint.token,
@@ -135,7 +274,10 @@ export async function runShim(): Promise<void> {
     harness,
     repoKey: repoKey(cwd),
     cwd,
+    branch: checkout.branch,
+    head: checkout.head,
     sessionId,
+    wakeSessionId,
     boundSession,
     ...(wakeFlag === "1" ? { wake: true } : wakeFlag === "0" ? { wake: false } : {}),
     ...(process.env.SWITCHBOARD_ROLE === "orchestrator" ? { role: "orchestrator" as const } : {}),
@@ -162,8 +304,12 @@ export async function runShim(): Promise<void> {
   registerTools(mcp, bus, welcome.role, {
     home,
     name,
+    harness,
+    cwd,
     repo: welcome.repoKey,
+    orchestrator: welcome.orchestrator,
     sessionId,
+    wakeSessionId,
     subscribeWake: (wake) => {
       waitListeners.add(wake);
       return () => waitListeners.delete(wake);
@@ -178,10 +324,63 @@ function registerTools(mcp: McpServer, bus: BusClient, role: Role,
   context: {
     home: string;
     name: string;
+    harness: string;
+    cwd: string;
     repo: string;
+    orchestrator: string | null;
     sessionId?: string;
+    wakeSessionId?: string;
     subscribeWake?: (wake: () => void) => () => void;
   }): void {
+  mcp.registerTool(
+    "bus_register",
+    {
+      description:
+        "Register this session on the repo board. Takes no id from the model; the shim discovers your harness session id (MUSE_SESSION_ID, CLAUDE_CODE_SESSION_ID, CODEX_THREAD_ID, or the Codex user thread row for this checkout) plus cwd, branch, and HEAD. Call this on your first turn in a repo and at the start of every new session.",
+      inputSchema: {},
+    },
+    async () => {
+      const fresh = discoverHarnessSession({ cwd: context.cwd, harness: context.harness, env: process.env });
+      const resolvedSessionId = fresh.sessionId || context.sessionId;
+      const resolvedWakeSessionId = fresh.wakeSessionId || context.wakeSessionId || resolvedSessionId;
+      if (!resolvedSessionId || !context.cwd || context.cwd === "/") {
+        return { ...text(missingSessionSource(context.harness, context.cwd)), isError: true };
+      }
+      const { branch, head } = gitCheckoutInfo(context.cwd);
+      const frame = await bus.request({
+        type: "register",
+        name: context.name,
+        harness: context.harness,
+        cwd: context.cwd,
+        sessionId: resolvedSessionId,
+        wakeSessionId: resolvedWakeSessionId,
+        branch,
+        head,
+      });
+      if (frame.type !== "registered") return { ...text("registration failed"), isError: true };
+      context.sessionId = resolvedSessionId;
+      context.wakeSessionId = resolvedWakeSessionId;
+      const agent = frame.agent;
+      const statusLabel = frame.created ? "new" : "existing";
+      const wakePart =
+        resolvedWakeSessionId && resolvedWakeSessionId !== resolvedSessionId
+          ? ` wake_session=${resolvedWakeSessionId}`
+          : "";
+      const gitPart =
+        (agent?.branch ?? branch) || (agent?.head ?? head)
+          ? ` branch=${agent?.branch ?? branch ?? "detached"} head=${agent?.head ?? head ?? "unknown"}`
+          : "";
+      return text(
+        [
+          `registered (${statusLabel})`,
+          `name=${context.name} harness=${context.harness} session=${resolvedSessionId}${wakePart}`,
+          `checkout=${context.cwd}${gitPart}`,
+          `role=${role} orchestrator=${context.orchestrator ?? "none"}`,
+          "Call bus_who to list every other live or registered session in this repository.",
+        ].join("\n"),
+      );
+    },
+  );
   mcp.registerTool(
     "bus_publish",
     {
@@ -275,7 +474,8 @@ function registerTools(mcp: McpServer, bus: BusClient, role: Role,
             const state = agent.online ? "online" : "offline";
             const wake = agent.wake ? "wake=on" : "wake=off";
             const session = `${agent.sessionId ? ` session=${agent.sessionId}` : ""}${agent.wakeSessionId && agent.wakeSessionId !== agent.sessionId ? ` wake_session=${agent.wakeSessionId}` : ""} connections=${agent.connectionCount ?? (agent.online ? 1 : 0)}`;
-            return `${agent.name} ${agent.harness} ${state} ${wake}${session} ${agent.role} ${agent.status} ${formatDiagnostics(agent.diagnostics)}`;
+            const git = agent.branch || agent.head ? ` git=${agent.branch ?? "detached"}@${agent.head ?? "unknown"}` : "";
+            return `${agent.name} ${agent.harness} ${state} ${wake}${session}${git} ${agent.role} ${agent.status} ${formatDiagnostics(agent.diagnostics)}`;
           })
           .join("\n"),
       );
@@ -286,9 +486,9 @@ function registerTools(mcp: McpServer, bus: BusClient, role: Role,
     "bus_ask",
     {
       description:
-        "Ask one agent by name. The orchestrator uses this to assign work. If they are offline and wake is on, their CLI starts headless with this question. If a Codex or Muse session id is bound, the message is injected into that session. An open session with no inject command is not interrupted. The answer comes back through bus_reply.",
+        "Ask one agent by shared name (reaches all live sessions of that harness) or by session id (reaches only that session). Wake and inject use the bound session id. The answer comes back through bus_reply.",
       inputSchema: {
-        agent: z.string(),
+        agent: z.string().describe("Agent name (e.g. muse, codex) or exact session id"),
         question: z.string(),
         topic: z.string().optional(),
       },

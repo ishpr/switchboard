@@ -90,17 +90,15 @@ export function resolveShimCwd(cwd = process.cwd(), home = switchboardHome()): s
   const reposDir = path.join(home, "repos");
   if (existsSync(reposDir)) {
     try {
-      let best: RepoConfig | null = null;
+      const valid: RepoConfig[] = [];
       for (const name of readdirSync(reposDir)) {
         if (!name.endsWith(".json")) continue;
         const cfg = JSON.parse(readFileSync(path.join(reposDir, name), "utf8")) as RepoConfig;
         if (cfg?.repoRoot && existsSync(cfg.repoRoot)) {
-          if (!best || (cfg.updatedAt ?? 0) > (best.updatedAt ?? 0)) {
-            best = cfg;
-          }
+          valid.push(cfg);
         }
       }
-      if (best) return best.repoRoot;
+      if (valid.length === 1) return valid[0]!.repoRoot;
     } catch {
       // Fall back to cwd
     }

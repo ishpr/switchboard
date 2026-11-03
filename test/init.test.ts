@@ -118,17 +118,19 @@ test("per-repo config persists different orchestrators for different repos", () 
   assert.equal(resolveOrchestratorName("", "agy"), "agy");
 
   writeRepoConfig(dirA, { orchestrator: "agy", panes: ["antigravity", "claude"] }, home);
-  writeRepoConfig(dirB, { orchestrator: "cursor", panes: ["orchestrator", "codex"] }, home);
-
   const cfgA = readRepoConfig(dirA, home);
+  // Desktop GUI shims started with cwd="/" fall back when exactly one repo is configured
+  assert.equal(resolveShimCwd("/", home), cfgA?.repoRoot);
+
+  writeRepoConfig(dirB, { orchestrator: "cursor", panes: ["orchestrator", "codex"] }, home);
   const cfgB = readRepoConfig(dirB, home);
   assert.equal(cfgA?.orchestrator, "agy");
   assert.deepEqual(cfgA?.panes, ["antigravity", "claude"]);
   assert.equal(cfgB?.orchestrator, "cursor");
   assert.deepEqual(cfgB?.panes, ["orchestrator", "codex"]);
 
-  // Desktop GUI shims started with cwd="/" fall back to a configured repoRoot
-  assert.ok([cfgA?.repoRoot, cfgB?.repoRoot].includes(resolveShimCwd("/", home)));
+  // When more than one repo is configured, a shim started at "/" stays unbound on "/"
+  assert.equal(resolveShimCwd("/", home), "/");
 });
 
 test("multi-account Claude resolution and isolated environment provisioning are completely generic", () => {
