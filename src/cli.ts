@@ -14,6 +14,8 @@ import {
   writeSavedAccounts,
 } from "./accounts.ts";
 import { createPaneProbe, formatDiagnostics, sessionDiagnostics } from "./health.ts";
+import { Store } from "./store.ts";
+import { formatWaitResult, waitForMessages } from "./wait.ts";
 import { formatPendingAsks } from "./status.ts";
 import { BusClient } from "./busClient.ts";
 import { startDaemon } from "./daemon.ts";
@@ -45,6 +47,9 @@ try {
       break;
     case "publish":
       await publish();
+      break;
+    case "wait":
+      await waitCmd();
       break;
     case "inbox":
       await inbox();
@@ -138,6 +143,7 @@ function usage(): void {
   who                   List agents in this repo
   publish               Publish a message
   inbox                 Print messages since your cursor
+  wait                  Wait for new unread messages [--to agent] [--timeout seconds] [--wake-existing] [--json]
   ask                   Ask one agent (may wake a headless CLI)
   reply                 Reply to an ask
   report                Report a result or status to the repo's orchestrator
@@ -331,6 +337,39 @@ async function who(doctor = false): Promise<void> {
     }
   } finally {
     client.close();
+  }
+}
+
+async function waitCmd(): Promise<void> {
+  const { values } = parseArgs({
+    args: process.argv.slice(3),
+    options: {
+      to: { type: "string" },
+      cwd: { type: "string" },
+      timeout: { type: "string", default: "240" },
+      "interval-ms": { type: "string", default: "1500" },
+      "since-seq": { type: "string" },
+      "wake-existing": { type: "boolean", default: false },
+      session: { type: "string" },
+      json: { type: "boolean", default: false },
+    },
+  });
+  const to = values.to ?? process.env.SWITCHBOARD_AGENT ?? "agy";
+  const timeoutMs = Number(values.timeout) * 1000;
+  const intervalMs = Number(values["interval-ms"]);
+  const sinceSeq = values["since-seq"] === undefined ? undefined : Number(values["since-seq"]);
+  const cursorKey = values.session && !values.session.startsWith("zellij:") ? `${to}:${values.session}` : to;
+  const store = new Store(dbPath());
+  try {
+    const result = await waitForMessages(store, {
+      repo: repoKey(values.cwd || process.cwd()), to, timeoutMs, intervalMs, sinceSeq,
+      wakeExisting: values["wake-existing"], cursorKey,
+    }, {
+      onReady: (baseline) => process.stderr.write(`waiting to=${to} since_seq=${baseline} timeout_seconds=${timeoutMs / 1000}\n`),
+    });
+    process.stdout.write(`${values.json ? JSON.stringify(result) : formatWaitResult(result)}\n`);
+  } finally {
+    store.close();
   }
 }
 
