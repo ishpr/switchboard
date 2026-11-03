@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { stdin, stdout } from "node:process";
@@ -72,6 +72,40 @@ export function resolveOrchestratorName(input: string, fallback = "cursor"): str
   if (raw === "orchestrator" || raw === "cursor-agent") return "cursor";
   if (raw === "kimi-cli") return "kimi";
   return raw;
+}
+
+/**
+ * Resolves the effective repo working directory for an MCP shim process.
+ * macOS GUI apps (Antigravity Desktop, Codex Desktop) launch child processes with cwd="/".
+ * When cwd is not inside a git repository, falls back to SWITCHBOARD_CWD or the most recently
+ * configured repository in ~/.switchboard/repos/*.json.
+ */
+export function resolveShimCwd(cwd = process.cwd(), home = switchboardHome()): string {
+  const envCwd = process.env.SWITCHBOARD_CWD?.trim();
+  if (envCwd && existsSync(envCwd)) return envCwd;
+  const root = gitRepoRoot(cwd);
+  if (cwd !== "/" && existsSync(path.join(root, ".git"))) {
+    return cwd;
+  }
+  const reposDir = path.join(home, "repos");
+  if (existsSync(reposDir)) {
+    try {
+      let best: RepoConfig | null = null;
+      for (const name of readdirSync(reposDir)) {
+        if (!name.endsWith(".json")) continue;
+        const cfg = JSON.parse(readFileSync(path.join(reposDir, name), "utf8")) as RepoConfig;
+        if (cfg?.repoRoot && existsSync(cfg.repoRoot)) {
+          if (!best || (cfg.updatedAt ?? 0) > (best.updatedAt ?? 0)) {
+            best = cfg;
+          }
+        }
+      }
+      if (best) return best.repoRoot;
+    } catch {
+      // Fall back to cwd
+    }
+  }
+  return cwd;
 }
 
 export const GRID_SESSION = "switchboard";
@@ -285,10 +319,12 @@ export function resolveAccountProfiles(
     }
     return profiles;
   }
-  return raw
-    .split(/[\s,]+/)
-    .filter(Boolean)
-    .map((token) => buildAccountProfile(token, discovered, home));
+  const tokens = raw.split(/[\s,]+/).filter(Boolean);
+  const picked = tokens.map((token) => discovered[Number(token) - 1]).filter((profile) => profile !== undefined);
+  if (tokens.length > 0 && tokens.every((token) => /^\d+$/.test(token)) && picked.length === tokens.length) {
+    return picked;
+  }
+  return tokens.map((token) => buildAccountProfile(token, discovered, home));
 }
 
 export function claudeAccountPanes(
@@ -499,6 +535,8 @@ export function installSwitchboard(
         "SWITCHBOARD_NAME=agy",
         "--env",
         "SWITCHBOARD_SCOPE=share",
+        "--env",
+        `SWITCHBOARD_CWD=${targetRepo}`,
         "switchboard",
         "--",
         process.execPath,
@@ -579,11 +617,18 @@ export async function init(
     const defaultAccts =
       existingCfg?.accounts?.join(",") ||
       (existingCfg?.claude4 && discovered.length > 0 ? discovered.map((a) => a.id).join(",") : "");
-    const hint = discovered.length > 0 ? `discovered: ${discovered.map((a) => a.id).join(",")}` : "e.g. acct1,acct2 or 4";
+    stdout.write("\nClaude can be one pane, or one isolated pane per account.\n");
+    stdout.write("Each account gets its own ~/.claude-<id> directory, Switchboard name, and Zellij pane.\n");
+    if (discovered.length > 0) {
+      for (const [index, account] of discovered.entries()) {
+        stdout.write(`  ${String(index + 1).padStart(2)}  ${account.id.padEnd(12)} ${account.pane}\n`);
+      }
+    }
+    const hint = discovered.length > 0 ? "names, numbers, or a count" : "a count, or names such as acct1,acct2";
     const rl = createInterface({ input: stdin, output: stdout });
     try {
       accountsRaw = (
-        await rl.question(`Isolated Claude accounts (blank=single Claude, or enter names/count [${defaultAccts || hint}]): `)
+        await rl.question(`Claude accounts [${defaultAccts || hint}] (blank = one shared Claude pane): `)
       ).trim();
       if (!accountsRaw && defaultAccts) accountsRaw = defaultAccts;
     } finally {

@@ -4,6 +4,7 @@ import { z } from "zod";
 import { inferClaudeAgentName } from "./accounts.ts";
 import { BusClient } from "./busClient.ts";
 import { ensureDaemon } from "./ensure.ts";
+import { resolveShimCwd } from "./init.ts";
 import { switchboardHome } from "./paths.ts";
 import { repoKey } from "./repo.ts";
 import { readToken } from "./token.ts";
@@ -43,10 +44,10 @@ function instructions(role: Role, orchestrator: string | null): string {
 }
 
 export async function runShim(): Promise<void> {
-  const cwd = process.cwd();
+  const home = switchboardHome();
+  const cwd = resolveShimCwd(process.cwd(), home);
   const harness = process.env.SWITCHBOARD_HARNESS || "unknown";
   const name = process.env.SWITCHBOARD_NAME || inferClaudeAgentName() || harness;
-  const home = switchboardHome();
   const resolveEndpoint = async () =>
     process.env.SWITCHBOARD_URL
       ? { url: process.env.SWITCHBOARD_URL, token: readToken(home) }
