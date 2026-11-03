@@ -26,8 +26,8 @@ import { daemonInfoPath, dbPath, switchboardHome, wakeLogPath } from "./paths.ts
 import { repoKey, type RepoScope } from "./repo.ts";
 import { runShim } from "./shim.ts";
 import { ensureToken, readToken } from "./token.ts";
-import { DEFAULT_PORT, HEARTBEAT_MS, NAME_RE, type ClientHello, type ReplyState } from "./types.ts";
-import { gridPlan, init, resolveOrchestratorName, writeRepoConfig } from "./init.ts";
+import { DEFAULT_PORT, HEARTBEAT_MS, NAME_RE, type ClientHello, type InviteMode, type ReplyState } from "./types.ts";
+import { GRID_SESSION, gridPlan, gridSessionName, init, resolveOrchestratorName, writeRepoConfig } from "./init.ts";
 import { spawnWake } from "./wake.ts";
 
 const command = process.argv[2];
@@ -75,6 +75,12 @@ try {
       break;
     case "agent":
       await agent();
+      break;
+    case "register":
+      await registerCmd();
+      break;
+    case "invite":
+      await inviteCmd();
       break;
     case "hook":
       await hook();
@@ -154,6 +160,8 @@ function usage(): void {
   status                Show status and pending asks [--pending] [--json] [--limit 1..200] [--status text]
   state                 Read or write shared per-repo key-value state (get | set | list | delete)
   orchestrator          Get or set the orchestrator for this repo
+  invite                Invite agent harnesses onto this repo board [--mode terminal|headless]
+  register              Register or bind an agent session on this repo board
   agent add             Register an agent and its wake policy
   account               List or add isolated Claude accounts (list | add)
   hook                  Print hook JSON for a turn already in progress
@@ -172,7 +180,7 @@ delivered only to the orchestrator.
 `);
 }
 
-function switchboardSessionLine(): string | null {
+function switchboardSessionLine(session = GRID_SESSION): string | null {
   let out = "";
   try {
     out = execFileSync("zellij", ["list-sessions", "--no-formatting"], {
@@ -184,7 +192,12 @@ function switchboardSessionLine(): string | null {
       error && typeof error === "object" && "stdout" in error ? String(error.stdout ?? "") : "";
     out = stdout;
   }
-  return out.split("\n").find((line) => line.startsWith("switchboard ")) ?? null;
+  const lines = out.split("\n");
+  return (
+    lines.find((line) => line.startsWith(`${session} `)) ??
+    lines.find((line) => line.startsWith(`${GRID_SESSION} `)) ??
+    null
+  );
 }
 
 function runZellij(args: string[]): Promise<void> {
@@ -222,10 +235,15 @@ async function openGrid(resume: boolean, restart = false): Promise<void> {
   });
   const rawCwd = values.cwd || positionals[0];
   const targetCwd = rawCwd ? path.resolve(rawCwd) : process.cwd();
-  const plan = gridPlan(resume, switchboardSessionLine(), path.join(homedir(), ".config/zellij/layouts"), {
-    cwd: targetCwd,
-    restart,
-  });
+  const plan = gridPlan(
+    resume,
+    switchboardSessionLine(gridSessionName(targetCwd)),
+    path.join(homedir(), ".config/zellij/layouts"),
+    {
+      cwd: targetCwd,
+      restart,
+    },
+  );
   if (plan.action === "start") {
     clearZellijSession(plan.session);
   }
@@ -790,6 +808,96 @@ async function agent(): Promise<void> {
     });
     if (frame.type !== "registered") throw new Error("unexpected response");
     process.stdout.write(`registered ${frame.name}\n`);
+  } finally {
+    client.close();
+  }
+}
+
+async function registerCmd(): Promise<void> {
+  const { values } = parseArgs({
+    args: process.argv.slice(3),
+    allowNegative: true,
+    options: {
+      name: { type: "string" },
+      harness: { type: "string" },
+      session: { type: "string" },
+      "wake-session": { type: "string" },
+      cwd: { type: "string" },
+      wake: { type: "boolean", default: true },
+    },
+  });
+  const name = values.name || process.env.SWITCHBOARD_NAME;
+  const harness = values.harness || process.env.SWITCHBOARD_HARNESS || name;
+  if (!name || !harness) {
+    throw new Error(
+      "usage: switchboard register --name <name> [--harness <harness>] [--session <id>] [--wake-session <id>] [--cwd <dir>]",
+    );
+  }
+  const cwd = values.cwd ? path.resolve(values.cwd) : process.cwd();
+  const client = await connectCli(cwd, name);
+  try {
+    const frame = await client.request({
+      type: "register",
+      name,
+      harness,
+      cwd,
+      sessionId: values.session,
+      wakeSessionId: values["wake-session"],
+      wake: values.wake ?? true,
+    });
+    if (frame.type !== "registered") throw new Error("unexpected response");
+    process.stdout.write(
+      `registered ${frame.name}${frame.agent?.sessionId ? ` session=${frame.agent.sessionId}` : ""}${frame.agent?.wakeSessionId ? ` wake_session=${frame.agent.wakeSessionId}` : ""}\n`,
+    );
+  } finally {
+    client.close();
+  }
+}
+
+async function inviteCmd(): Promise<void> {
+  const { values, positionals } = parseArgs({
+    args: process.argv.slice(3),
+    allowPositionals: true,
+    options: {
+      mode: { type: "string" },
+      orchestrator: { type: "string" },
+      cwd: { type: "string" },
+      json: { type: "boolean", default: false },
+    },
+  });
+  const agents = positionals.flatMap((item) => item.split(",")).map((s) => s.trim()).filter(Boolean);
+  if (agents.length === 0) {
+    throw new Error(
+      "usage: switchboard invite <agent...> [--mode terminal|headless] [--orchestrator <name>] [--cwd <dir>] [--json]",
+    );
+  }
+  const mode = (values.mode ?? "terminal") as InviteMode;
+  if (mode !== "terminal" && mode !== "headless") {
+    throw new Error("invite --mode must be terminal or headless");
+  }
+  const cwd = values.cwd ? path.resolve(values.cwd) : process.cwd();
+  const client = await connectCli(cwd);
+  try {
+    const frame = await client.request({
+      type: "invite",
+      agents,
+      mode,
+      orchestrator: values.orchestrator,
+    });
+    if (frame.type !== "invited") throw new Error("unexpected response");
+    if (values.orchestrator) {
+      writeRepoConfig(cwd, { orchestrator: frame.orchestrator ?? values.orchestrator });
+    }
+    if (values.json) {
+      process.stdout.write(`${JSON.stringify(frame, null, 2)}\n`);
+      return;
+    }
+    process.stdout.write(`repo=${frame.repoKey} cwd=${frame.cwd} orchestrator=${frame.orchestrator ?? "none"}\n`);
+    for (const item of frame.invited) {
+      process.stdout.write(
+        `${item.name}\t${item.harness}\t${item.action}\twake=${item.wakeMode}${item.wakeSessionId ? ` wake_session=${item.wakeSessionId}` : ""}\t${item.detail}\n`,
+      );
+    }
   } finally {
     client.close();
   }

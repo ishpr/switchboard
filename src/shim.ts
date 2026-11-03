@@ -721,6 +721,53 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
       };
     },
   );
+
+  mcp.registerTool(
+    "bus_invite",
+    {
+      description:
+        "Invite one or more agent harnesses (grok, muse, claude, codex, kimi, cursor, agy) onto this repository's Switchboard board. If an invited agent is already online in this repo, returns its live session without spawning a duplicate. In 'terminal' mode (default), opens a macOS Terminal tab in this repo's checkout and registers its tty:/dev/ttysNNN for instant injection. In 'headless' mode, registers wake=true so the next bus_ask runs a headless subscription CLI turn in this repo without opening a window.",
+      inputSchema: {
+        agents: z
+          .array(z.string().min(1))
+          .min(1)
+          .describe("Agent or harness names to invite onto this repo board (e.g. ['grok', 'muse'])"),
+        mode: z
+          .enum(["terminal", "headless"])
+          .optional()
+          .describe("'terminal' opens an interactive Terminal.app tab bound to tty:/dev/ttysNNN; 'headless' registers wake=true for on-demand CLI turns"),
+        orchestrator: z
+          .string()
+          .optional()
+          .describe("Optional orchestrator name to set for this repo board"),
+      },
+    },
+    async ({ agents, mode, orchestrator }) => {
+      const frame = await bus.request({
+        type: "invite",
+        agents,
+        mode,
+        orchestrator,
+      });
+      if (frame.type !== "invited") return { ...text("invite unavailable"), isError: true };
+      const lines = [
+        `repo=${frame.repoKey} cwd=${frame.cwd} orchestrator=${frame.orchestrator ?? "none"}`,
+        ...frame.invited.map(
+          (item) =>
+            `${item.name}\t${item.harness}\t${item.action}\twake=${item.wakeMode}${item.wakeSessionId ? ` wake_session=${item.wakeSessionId}` : ""}\t${item.detail}`,
+        ),
+      ];
+      return {
+        ...text(lines.join("\n")),
+        structuredContent: {
+          repo_key: frame.repoKey,
+          cwd: frame.cwd,
+          orchestrator: frame.orchestrator,
+          invited: frame.invited,
+        },
+      };
+    },
+  );
 }
 
 function text(value: string) {

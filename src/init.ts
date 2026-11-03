@@ -108,6 +108,24 @@ export function resolveShimCwd(cwd = process.cwd(), home = switchboardHome()): s
 
 export const GRID_SESSION = "switchboard";
 
+/**
+ * Computes a deterministic, human-readable Zellij session name per repository checkout
+ * so working across 3-4 projects concurrently never collides on a single global grid.
+ */
+export function gridSessionName(cwd?: string): string {
+  if (!cwd || cwd === "/") return GRID_SESSION;
+  const root = gitRepoRoot(cwd);
+  const slug =
+    path
+      .basename(root)
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 24) || "repo";
+  const shortHash = repoKey(cwd).slice(0, 6);
+  return `switchboard-${slug}-${shortHash}`;
+}
+
 export type GridPlan =
   | { action: "attach"; session: string }
   | { action: "start"; session: string; layout: string; deleteFirst: boolean };
@@ -119,6 +137,7 @@ export function gridPlan(
   layoutDir: string,
   opts: { cwd?: string; restart?: boolean } = {},
 ): GridPlan {
+  const session = opts.cwd ? gridSessionName(opts.cwd) : GRID_SESSION;
   let layoutName = resume || opts.restart ? "switchboard-resume.kdl" : "switchboard.kdl";
   if (opts.cwd) {
     const key = repoKey(opts.cwd);
@@ -132,11 +151,11 @@ export function gridPlan(
   }
   const layout = path.join(layoutDir, layoutName);
   if (!opts.restart && sessionLine && !sessionLine.includes("EXITED")) {
-    return { action: "attach", session: GRID_SESSION };
+    return { action: "attach", session };
   }
   return {
     action: "start",
-    session: GRID_SESSION,
+    session,
     layout,
     deleteFirst: Boolean(sessionLine),
   };
@@ -276,6 +295,99 @@ export function gridChoices(): PaneChoice[] {
     return { index: index + 1, id: def.id, pane: def.pane, found: Boolean(def.shell || command), command };
   });
 }
+
+export type InvitedAgentSpec = {
+  name: string;
+  harness: string;
+  command: string | null;
+  args: string[];
+};
+
+export function resolveInvitedAgentSpec(rawName: string, home = homedir()): InvitedAgentSpec | null {
+  const token = rawName.trim().toLowerCase();
+  if (!token || token === "bus" || token === "shell") return null;
+  const canonicalName =
+    token === "antigravity" || token === "argon" || token === "argon4"
+      ? "agy"
+      : token === "cursor-agent" || token === "orchestrator"
+        ? "cursor"
+        : token === "kimi-cli"
+          ? "kimi"
+          : token;
+  const defId =
+    canonicalName === "agy"
+      ? "antigravity"
+      : canonicalName === "cursor"
+        ? "orchestrator"
+        : canonicalName;
+  let def = HARNESSES.find((item) => item.id === defId || item.aliases.includes(token));
+  let harness =
+    canonicalName === "agy"
+      ? "antigravity"
+      : canonicalName === "cursor"
+        ? "cursor"
+        : def?.id ?? canonicalName;
+  if (!def && existsSync(path.join(home, `.claude-${canonicalName}`))) {
+    def = HARNESSES.find((item) => item.id === "claude");
+    harness = "claude";
+  }
+  if (!def || def.shell) return null;
+  const command = locate(def) ?? def.candidates[0] ?? null;
+  return {
+    name: canonicalName,
+    harness,
+    command,
+    args: def.args,
+  };
+}
+
+export type SpawnTerminalTab = (spec: {
+  cwd: string;
+  name: string;
+  harness: string;
+  cmd: string;
+  args: string[];
+}) => Promise<string>;
+
+export const defaultSpawnTerminalTab: SpawnTerminalTab = async (spec) => {
+  const envExports = [
+    `SWITCHBOARD_CWD=${shellQuote(spec.cwd)}`,
+    `SWITCHBOARD_NAME=${shellQuote(spec.name)}`,
+    `SWITCHBOARD_HARNESS=${shellQuote(spec.harness)}`,
+    "SWITCHBOARD_SCOPE=share",
+  ];
+  const claudeDir = path.join(homedir(), `.claude-${spec.name}`);
+  if (spec.harness === "claude" && existsSync(claudeDir)) {
+    envExports.push(`CLAUDE_CONFIG_DIR=${shellQuote(claudeDir)}`);
+  }
+  const cmdString = [spec.cmd, ...spec.args].map(shellQuote).join(" ");
+  const shellLine = `cd ${shellQuote(spec.cwd)} && export ${envExports.join(" ")} && exec ${cmdString}`;
+  const script = [
+    "on run argv",
+    "  set launchCmd to item 1 of argv",
+    '  tell application "Terminal"',
+    "    activate",
+    "    set newTab to do script launchCmd",
+    "    repeat 25 times",
+    "      try",
+    "        set tabTty to tty of newTab",
+    '        if tabTty is not "" then return "tty:" & tabTty',
+    "      end try",
+    "      delay 0.1",
+    "    end repeat",
+    '    return "tty:" & (tty of newTab)',
+    "  end tell",
+    "end run",
+  ].join("\n");
+  const out = execFileSync("osascript", ["-e", script, shellLine], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
+  if (!out.startsWith("tty:/dev/ttys")) {
+    throw new Error(`Terminal.app did not return a valid tty (got: ${out || "empty"})`);
+  }
+  return out;
+};
 
 /** Blank keeps the panes found here. "all" selects every pane, including ones that are not installed. */
 export function chosenIds(answer: string, choices: PaneChoice[]): string[] {

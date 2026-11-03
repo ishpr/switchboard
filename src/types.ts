@@ -11,6 +11,17 @@ export const WAKE_COOLDOWN_MS = 3_000;
 
 export type Kind = "pub" | "ask" | "reply";
 export type ReplyState = "done" | "progress" | "blocked";
+export type InviteMode = "terminal" | "headless";
+
+export type InvitedAgent = {
+  name: string;
+  harness: string;
+  action: "already_online" | "launched_terminal" | "registered_headless";
+  sessionId: string | null;
+  wakeSessionId: string | null;
+  wakeMode: WakeMode;
+  detail: string;
+};
 export type Role = "orchestrator" | "worker";
 
 export type StateEntry = {
@@ -162,6 +173,12 @@ export type ClientFrame = (
       prefix?: string;
       ifRev?: number;
     }
+  | {
+      type: "invite";
+      agents: string[];
+      mode?: InviteMode;
+      orchestrator?: string;
+    }
   | { type: "heartbeat" }
 ) & { reqId?: string };
 
@@ -188,6 +205,13 @@ export type ServerFrame = (
   | { type: "doctor"; agents: AgentRecord[]; pruned: PrunedAgent[]; daemon?: RuntimeInfo }
   | { type: "orchestrator"; orchestrator: string | null }
   | { type: "registered"; name: string; agent?: AgentRecord; created?: boolean }
+  | {
+      type: "invited";
+      repoKey: string;
+      cwd: string;
+      orchestrator: string | null;
+      invited: InvitedAgent[];
+    }
   | {
       type: "state";
       action: "get" | "set" | "list" | "delete";
