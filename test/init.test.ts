@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { gridPlan, harnessPanes, switchboardLayout, upsertZshBlock, zshLauncher } from "../src/init.ts";
+import { chosenIds, gridPlan, harnessPanes, panesFor, switchboardLayout, upsertZshBlock, zshLauncher, type PaneChoice } from "../src/init.ts";
 
 test("the grid layout opens every harness in the repo", () => {
   const layout = switchboardLayout("/Users/ishprasad/Switchboard");
@@ -24,6 +24,31 @@ test("resume layout continues the latest session of each harness", () => {
   assert.match(layout, /args "--yolo" "--approve-mcps" "--trust" "--continue"/);
   assert.match(layout, /args "--yolo" "--continue"/);
   assert.match(layout, /args "--dangerously-skip-permissions" "--mode" "auto" "--continue"/);
+});
+
+test("init keeps the panes found here and skips a CLI that is not installed", () => {
+  const choices: PaneChoice[] = [
+    { index: 1, id: "orchestrator", pane: "Orchestrator", found: true, command: "/bin/cursor-agent" },
+    { index: 2, id: "claude", pane: "Claude", found: false, command: null },
+    { index: 3, id: "antigravity", pane: "Antigravity", found: true, command: "/bin/agy" },
+    { index: 4, id: "bus", pane: "Bus", found: true, command: null },
+  ];
+  assert.deepEqual(chosenIds("", choices), ["orchestrator", "antigravity", "bus"]);
+  assert.deepEqual(chosenIds("all", choices), ["orchestrator", "claude", "antigravity", "bus"]);
+  assert.deepEqual(chosenIds("2, cursor agy", choices), ["claude", "orchestrator", "antigravity"]);
+
+  const panes = panesFor(["orchestrator", "claude", "bus"], true, choices);
+  assert.deepEqual(
+    panes.map((pane) => pane.name),
+    ["Orchestrator", "Bus"],
+  );
+  assert.equal(panes[0]?.command, "/bin/cursor-agent");
+  assert.deepEqual(panes[0]?.args?.slice(-1), ["--continue"]);
+
+  const layout = switchboardLayout("/work", panesFor(["claude"], false, choices));
+  assert.match(layout, /pane name="Bus"/);
+  assert.doesNotMatch(layout, /pane name="Claude"/);
+  assert.equal(layout.match(/split_direction="vertical"/g)?.length, 1);
 });
 
 test("an open grid is attached, and a dead one is replaced by the resume layout", () => {
