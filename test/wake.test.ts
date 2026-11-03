@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { hookStdout } from "../src/hook.ts";
+import { parseZellijSessionFromPs } from "../src/shim.ts";
 import type { BusMessage } from "../src/types.ts";
 import { decideWake, headlessLaunch, launchFor } from "../src/wake.ts";
 
@@ -130,6 +131,15 @@ test("a zellij-bound session is injected directly into its zellij pane", () => {
   });
   assert.ok(launch);
   assert.equal(launch.cmd, "sh");
+  assert.match(launch.args[1], /sleep 0\.25/);
   assert.ok(launch.args.includes("claude4"));
   assert.ok(launch.args.includes("2"));
+});
+
+test("parseZellijSessionFromPs extracts ZELLIJ_SESSION_NAME and ZELLIJ_PANE_ID from ancestor ps output", () => {
+  const parsed = parseZellijSessionFromPs(
+    "93851 /usr/local/bin/node /Users/test/Switchboard/dist/cli.js harness-pane ZELLIJ=0 ZELLIJ_PANE_ID=6 ZELLIJ_SESSION_NAME=switchboard HOME=/Users/test",
+  );
+  assert.equal(parsed.ppid, 93851);
+  assert.equal(parsed.session, "zellij:switchboard:6");
 });

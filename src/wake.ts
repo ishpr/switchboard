@@ -76,7 +76,7 @@ export function launchFor(input: {
           cmd: "sh",
           args: [
             "-c",
-            'zellij -s "$1" action write-chars -p "$2" "$3" && zellij -s "$1" action write -p "$2" 13',
+            'zellij -s "$1" action write -p "$2" 21 && zellij -s "$1" action write-chars -p "$2" "$3" && sleep 0.25 && zellij -s "$1" action write -p "$2" 13',
             "switchboard-zellij-wake",
             zSession,
             zPane,
