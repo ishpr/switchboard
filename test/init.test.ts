@@ -13,10 +13,12 @@ import {
   chosenIds,
   claudeAccountPanes,
   gridPlan,
+  gridSessionName,
   harnessPanes,
   panesFor,
   readRepoConfig,
   resolveAccountProfiles,
+  resolveInvitedAgentSpec,
   resolveOrchestratorName,
   resolveShimCwd,
   switchboardLayout,
@@ -260,4 +262,23 @@ test("upsertCodexHooks installs and merges SessionStart, UserPromptSubmit, PostT
   assert.equal(parsed.hooks.Stop.length, 2);
   assert.match(parsed.hooks.PostToolUse[0].hooks[0].command, /hook --harness codex --event PostToolUse/);
   assert.match(parsed.hooks.Stop[1].hooks[0].command, /hook --harness codex --event Stop/);
+});
+
+test("per-repo gridSessionName isolates concurrent project Zellij grids and resolveInvitedAgentSpec normalizes harnesses", () => {
+  const sA = gridSessionName("/Users/ishprasad/dunkbot");
+  const sB = gridSessionName("/Users/ishprasad/Switchboard");
+  assert.match(sA, /^switchboard-dunkbot-[0-9a-f]{6}$/);
+  assert.match(sB, /^switchboard-switchboard-[0-9a-f]{6}$/);
+  assert.notEqual(sA, sB);
+  assert.equal(gridSessionName("/"), "switchboard");
+
+  const dir = "/Users/ishprasad/.config/zellij/layouts";
+  const planA = gridPlan(true, `${sA} [Created 1m ago]`, dir, { cwd: "/Users/ishprasad/dunkbot" });
+  assert.equal(planA.action, "attach");
+  assert.equal(planA.session, sA);
+
+  assert.equal(resolveInvitedAgentSpec("grok")?.harness, "grok");
+  assert.equal(resolveInvitedAgentSpec("muse")?.harness, "muse");
+  assert.equal(resolveInvitedAgentSpec("argon4")?.name, "agy");
+  assert.equal(resolveInvitedAgentSpec("cursor-agent")?.name, "cursor");
 });

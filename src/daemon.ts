@@ -2,7 +2,13 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { createServer } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
-import { resolveShimCwd } from "./init.ts";
+import {
+  defaultSpawnTerminalTab,
+  resolveInvitedAgentSpec,
+  resolveOrchestratorName,
+  resolveShimCwd,
+  type SpawnTerminalTab,
+} from "./init.ts";
 import { gitCheckoutInfo, gitRepoRoot, repoKey } from "./repo.ts";
 import { createPaneProbe, formatDiagnostics, sessionDiagnostics, type PaneProbe } from "./health.ts";
 import { BUILD, buildWarning, runtimeInfo } from "./build.ts";
@@ -17,6 +23,8 @@ import {
   type BuildInfo,
   type AgentRecord,
   type ClientFrame,
+  type InviteMode,
+  type InvitedAgent,
   type ReplyState,
   type Role,
   type ServerFrame,
@@ -31,6 +39,7 @@ export type DaemonOptions = {
   dbFile: string;
   token: string;
   spawnWake?: SpawnWake;
+  spawnTerminal?: SpawnTerminalTab;
   logFile?: string;
   presenceTtlMs?: number;
   sweepMs?: number;
@@ -288,6 +297,9 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         break;
       case "register":
         register(conn, frame, respond);
+        break;
+      case "invite":
+        await invite(conn, frame, respond);
         break;
       case "heartbeat":
         store.touchAgent(conn.repo, conn.name, undefined, conn.sessionId);
@@ -955,6 +967,139 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       }
     }
     respond({ type: "registered", name: frame.name, agent: saved, created: !existing });
+  }
+
+  async function invite(
+    conn: Conn,
+    frame: Extract<ClientFrame, { type: "invite" }>,
+    respond: Respond,
+  ): Promise<void> {
+    requireBoundRepo(conn);
+    if (!Array.isArray(frame.agents) || frame.agents.length === 0) {
+      throw new Error("invite requires at least one agent or harness name");
+    }
+    const mode: InviteMode = frame.mode ?? "terminal";
+    if (mode !== "terminal" && mode !== "headless") {
+      throw new Error("invite mode must be terminal or headless");
+    }
+    if (frame.orchestrator !== undefined && frame.orchestrator.trim()) {
+      const nextOrch = resolveOrchestratorName(frame.orchestrator.trim());
+      requireName(nextOrch);
+      store.setOrchestrator(conn.repo, nextOrch);
+      for (const peer of conns) {
+        if (peer.authed && peer.repo === conn.repo) {
+          peer.role = peer.name === nextOrch ? "orchestrator" : "worker";
+        }
+      }
+    }
+    const repoRootDir = gitRepoRoot(conn.cwd);
+    const checkout = gitCheckoutInfo(repoRootDir);
+    const currentRows = agents(conn.repo);
+    const invited: InvitedAgent[] = [];
+    const seen = new Set<string>();
+
+    for (const rawName of frame.agents) {
+      if (typeof rawName !== "string" || !rawName.trim()) continue;
+      const spec = resolveInvitedAgentSpec(rawName);
+      if (!spec) {
+        throw new Error(`unknown agent or harness: ${rawName}`);
+      }
+      if (seen.has(spec.name)) continue;
+      seen.add(spec.name);
+
+      const live = currentRows.find(
+        (row) => row.online && (row.name === spec.name || (spec.name === spec.harness && row.harness === spec.harness)),
+      );
+      if (live) {
+        const wakeId = live.wakeSessionId ?? live.sessionId ?? null;
+        const wakeInfo = decideWake({
+          directed: true,
+          online: true,
+          harness: live.harness,
+          sessionId: wakeId,
+          wakeEnabled: true,
+        });
+        invited.push({
+          name: live.name,
+          harness: live.harness,
+          action: "already_online",
+          sessionId: live.sessionId,
+          wakeSessionId: wakeId,
+          wakeMode: wakeInfo.mode,
+          detail: `already online on this repository board (${wakeInfo.mode})`,
+        });
+        continue;
+      }
+
+      if (mode === "headless") {
+        store.upsertAgent({
+          repo: conn.repo,
+          name: spec.name,
+          harness: spec.harness,
+          sessionId: null,
+          wakeSessionId: null,
+          cwd: repoRootDir,
+          branch: checkout.branch,
+          head: checkout.head,
+          wake: true,
+          status: "registered",
+          bySession: false,
+        });
+        invited.push({
+          name: spec.name,
+          harness: spec.harness,
+          action: "registered_headless",
+          sessionId: null,
+          wakeSessionId: null,
+          wakeMode: "headless",
+          detail: `registered for headless subscription CLI wake in ${repoRootDir}`,
+        });
+        continue;
+      }
+
+      if (!spec.command) {
+        throw new Error(`CLI binary not found for ${spec.name} (${spec.harness})`);
+      }
+      const spawnTab = options.spawnTerminal ?? defaultSpawnTerminalTab;
+      const ttySession = await spawnTab({
+        cwd: repoRootDir,
+        name: spec.name,
+        harness: spec.harness,
+        cmd: spec.command,
+        args: spec.args,
+      });
+      store.evictCrossRepoBinding(conn.repo, undefined, ttySession);
+      store.upsertAgent({
+        repo: conn.repo,
+        name: spec.name,
+        harness: spec.harness,
+        sessionId: null,
+        wakeSessionId: ttySession,
+        cwd: repoRootDir,
+        branch: checkout.branch,
+        head: checkout.head,
+        wake: true,
+        status: "invited",
+        bySession: false,
+      });
+      invited.push({
+        name: spec.name,
+        harness: spec.harness,
+        action: "launched_terminal",
+        sessionId: null,
+        wakeSessionId: ttySession,
+        wakeMode: "inject",
+        detail: `opened Terminal tab (${ttySession}) in ${repoRootDir}`,
+      });
+    }
+
+    respond({
+      type: "invited",
+      repoKey: conn.repo,
+      cwd: repoRootDir,
+      orchestrator: store.getOrchestrator(conn.repo),
+      invited,
+    });
   }
 
   function fanout(message: BusMessage, origin: Conn): void {

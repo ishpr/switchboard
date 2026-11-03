@@ -1419,3 +1419,108 @@ test("deferred wakes survive daemon restarts, non-acking compaction hooks preser
     await daemon.close();
   }
 });
+
+test("invite reuses live sessions, registers headless CLI wakes without spending turns, and spawns terminal tabs per repo", async () => {
+  const home = mkdtempSync(path.join(tmpdir(), "switchboard-invite-"));
+  const token = ensureToken(home);
+  const dbFile = path.join(home, "switchboard.db");
+  const wakeLaunches: WakeLaunch[] = [];
+  const terminalSpawns: Array<{ cwd: string; name: string; harness: string; cmd: string; args: string[] }> = [];
+
+  const daemon = await startDaemon({
+    port: 0,
+    dbFile,
+    token,
+    spawnWake: async (launch) => {
+      wakeLaunches.push(launch);
+    },
+    spawnTerminal: async (spec) => {
+      terminalSpawns.push(spec);
+      return `tty:/dev/ttys01${terminalSpawns.length}`;
+    },
+    isTurnInProgress: () => false,
+    wakeCooldownMs: 50,
+  });
+
+  const agy = new BusClient();
+  const grok = new BusClient();
+  const otherRepoClient = new BusClient();
+
+  try {
+    await agy.connect(daemon.url, hello(token, "agy", "repo-alpha", { harness: "antigravity", cwd: "/work/repo-alpha", role: "orchestrator" }));
+    await grok.connect(
+      daemon.url,
+      hello(token, "grok", "repo-alpha", {
+        harness: "grok",
+        cwd: "/work/repo-alpha",
+        sessionId: "01a19edf-a7b1-7720-b9fb-77e45edc7b47",
+        wakeSessionId: "tty:/dev/ttys000",
+        boundSession: true,
+        wake: true,
+      }),
+    );
+    await otherRepoClient.connect(daemon.url, hello(token, "agy", "repo-beta", { harness: "antigravity", cwd: "/work/repo-beta" }));
+
+    // 1. Inviting grok (already online) + muse (offline, terminal mode)
+    const invited1 = await agy.request({
+      type: "invite",
+      agents: ["grok", "muse"],
+      mode: "terminal",
+    });
+    assert.equal(invited1.type, "invited");
+    if (invited1.type === "invited") {
+      assert.equal(invited1.orchestrator, "agy");
+      assert.equal(invited1.invited.length, 2);
+      assert.equal(invited1.invited[0]?.name, "grok");
+      assert.equal(invited1.invited[0]?.action, "already_online");
+      assert.equal(invited1.invited[1]?.name, "muse");
+      assert.equal(invited1.invited[1]?.action, "launched_terminal");
+      assert.equal(invited1.invited[1]?.wakeSessionId, "tty:/dev/ttys011");
+      assert.equal(invited1.invited[1]?.wakeMode, "inject");
+    }
+    assert.equal(terminalSpawns.length, 1);
+    assert.equal(terminalSpawns[0]?.name, "muse");
+    assert.equal(wakeLaunches.length, 0); // zero wake turns wasted on invite itself
+
+    // 2. Inviting claude in headless mode registers wake=true without opening a terminal tab
+    const invited2 = await agy.request({
+      type: "invite",
+      agents: ["claude"],
+      mode: "headless",
+    });
+    assert.equal(invited2.type, "invited");
+    if (invited2.type === "invited") {
+      assert.equal(invited2.invited[0]?.name, "claude");
+      assert.equal(invited2.invited[0]?.action, "registered_headless");
+      assert.equal(invited2.invited[0]?.wakeMode, "headless");
+    }
+    assert.equal(terminalSpawns.length, 1);
+
+    // 3. Subsequent bus_ask to muse injects into tty:/dev/ttys011, and bus_ask to claude runs headless CLI
+    const askMuse = await agy.request({ type: "ask", to: "muse", body: "review module A" });
+    assert.equal(askMuse.type, "published");
+    if (askMuse.type === "published") {
+      assert.equal(askMuse.wake.mode, "inject");
+    }
+    const askClaude = await agy.request({ type: "ask", to: "claude", body: "review module B" });
+    assert.equal(askClaude.type, "published");
+    if (askClaude.type === "published") {
+      assert.equal(askClaude.wake.mode, "headless");
+    }
+
+    // 4. repo-beta board does not see repo-alpha's invited agents
+    const whoBeta = await otherRepoClient.request({ type: "who" });
+    assert.equal(whoBeta.type, "who");
+    if (whoBeta.type === "who") {
+      assert.deepEqual(
+        whoBeta.agents.map((a) => a.name),
+        ["agy"],
+      );
+    }
+  } finally {
+    agy.close();
+    grok.close();
+    otherRepoClient.close();
+    await daemon.close();
+  }
+});
