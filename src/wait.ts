@@ -12,6 +12,7 @@ export type WaitOptions = {
   sinceSeq?: number;
   wakeExisting?: boolean;
   cursorKey?: string;
+  signal?: AbortSignal;
 };
 
 export type WaitSummary = {
@@ -50,11 +51,13 @@ export async function waitForMessages(store: Store, options: WaitOptions, clock:
     throw new Error("--since-seq must be a non-negative safe integer");
   }
   const now = clock.now ?? (() => performance.now());
-  const pause = clock.sleep ?? sleep;
+  options.signal?.throwIfAborted();
+  const pause = clock.sleep ?? ((ms: number) => sleep(ms, undefined, { signal: options.signal }));
   const deadline = now() + timeoutMs;
   const baseline = options.sinceSeq ?? (options.wakeExisting ? 0 : store.latestUnreadSeq(options.repo, options.to, options.cursorKey));
   clock.onReady?.(baseline);
   while (true) {
+    options.signal?.throwIfAborted();
     const messages = store.unreadForWait(options.repo, options.to, baseline, options.cursorKey);
     if (messages.length) {
       return { status: "MESSAGES", since_seq: baseline, messages: messages.map((message) => ({

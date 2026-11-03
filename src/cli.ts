@@ -16,7 +16,7 @@ import {
 import { createPaneProbe, formatDiagnostics, sessionDiagnostics } from "./health.ts";
 import { Store } from "./store.ts";
 import { formatWaitResult, waitForMessages } from "./wait.ts";
-import { formatPendingAsks } from "./status.ts";
+import { formatAgentMetrics, formatPendingAsks } from "./status.ts";
 import { BusClient } from "./busClient.ts";
 import { startDaemon } from "./daemon.ts";
 import { ensureDaemon, readDaemonInfo } from "./ensure.ts";
@@ -574,10 +574,11 @@ async function setStatus(): Promise<void> {
     if (frame.type !== "ok") throw new Error("unexpected response");
     if (!frame.pending_asks) throw new Error("pending-ask tracking unavailable; restart the daemon after upgrading");
     if (values.json) {
-      process.stdout.write(`${JSON.stringify({ ...(values.pending ? {} : { detail: frame.detail }), pending_asks: frame.pending_asks })}\n`);
+      process.stdout.write(`${JSON.stringify({ ...(values.pending ? {} : { detail: frame.detail, agent_metrics: frame.agent_metrics ?? [] }), pending_asks: frame.pending_asks })}\n`);
     } else {
       if (!values.pending) process.stdout.write(`${frame.detail}\n`);
       process.stdout.write(`${formatPendingAsks(frame.pending_asks)}\n`);
+      if (!values.pending) process.stdout.write(`${formatAgentMetrics(frame.agent_metrics ?? [])}\n`);
     }
   } finally {
     client.close();

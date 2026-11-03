@@ -289,6 +289,8 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       detail: `${frame.status === undefined ? "status" : "status updated"}${detail ? `; ${detail}` : ""}`,
       pending_asks: store.pendingAsks(conn.repo, frame.limit, Date.now(),
         conn.role === "orchestrator" || conn.harness === "cli" ? undefined : conn.name),
+      agent_metrics: store.agentMetrics(conn.repo,
+        conn.role === "orchestrator" || conn.harness === "cli" ? undefined : conn.name),
     });
   }
 

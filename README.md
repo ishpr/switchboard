@@ -151,9 +151,10 @@ The shim registers these MCP tools. Call `bus_inbox` at the start of a turn and 
 | `bus_ask` | Directed message with a correlation id. This is the wake path. |
 | `bus_reply` | Answer an ask. Routed back to the asker. |
 | `bus_report` | Send a result or a status change to the orchestrator only. Hidden from the orchestrator's own tool list. |
-| `bus_status` | Show status and unanswered asks; optionally set the status string shown by `bus_who`. |
+| `bus_wait` | Wait for unread mail without advancing the inbox cursor. |
+| `bus_status` | Show status, per-agent metrics, and unanswered asks; optionally set the status string shown by `bus_who`. |
 
-The same verbs exist on the CLI: `who`, `publish`, `inbox`, `ask`, `reply`, `report`, `status`, `orchestrator`, `agent add`, `account`, `hook`, `token`, `init`, `--resume` (`-c`), and `--restart` (`-r`).
+The same verbs exist on the CLI: `who`, `publish`, `inbox`, `wait`, `ask`, `reply`, `report`, `status`, `orchestrator`, `agent add`, `account`, `hook`, `token`, `init`, `--resume` (`-c`), and `--restart` (`-r`).
 
 Delivery is at least once. Each row has an id. Dedupe on that id. Bodies are capped at 32 KB.
 
@@ -404,3 +405,50 @@ Both a message wake and timeout exit 0. Text timeout output is `TIMEOUT`. JSON h
 `status` (`MESSAGES` or `TIMEOUT`), `since_seq`, and `messages` (empty on timeout).
 A single readiness line goes to stderr with the effective recipient and baseline;
 stdout contains only the final result. Invalid arguments or store failures exit 1.
+
+
+## Native MCP waiting
+
+`bus_wait` exposes the same non-consuming wait loop to MCP clients. Its inputs are
+`to` (default your agent name), `timeout_seconds` (integer 1–120, default 30),
+`interval_ms` (integer 1–60000, default 1500), `since_seq`, and `wake_existing`.
+It returns the same `status`, `since_seq`, and `messages` fields as `wait --json`,
+plus readable text. Use `bus_inbox` after a wake to consume the messages.
+
+Your own inbox automatically uses your declared native session cursor, or your
+name cursor for Zellij/unbound sessions. The orchestrator may also select another
+recipient's name cursor. Workers may select their own inbox or broadcast-only `*`.
+The board is the shim's connected repository scope. Cancelling the MCP request
+interrupts the polling sleep and closes its store connection. Other tool calls
+remain responsive while a wait is pending.
+
+Configure the MCP client's request timeout to exceed the requested wait, including
+transport overhead; some clients default to 60 seconds. Reconnect the MCP shim
+after upgrading to discover `bus_wait`.
+
+## Per-agent orchestration metrics
+
+`bus_status` and `switchboard status` now include an `agent_metrics` array in JSON
+and structured MCP content, with readable rows in text. Registered idle agents
+appear with zero counts, and historical ask/reply participants remain represented.
+Metrics are cumulative across the current board's stored history and follow its
+shared/split scope. CLI/orchestrator views include all agents; worker MCP views show
+only their own row. `--pending` / `pending: true` preserves the pending-only view.
+
+Each row contains:
+
+- `agent`: the registered or historical agent name.
+- `asks_received`: all directed asks addressed to that agent.
+- `replies_sent`: all reply messages sent by that agent, including follow-ups.
+- `pending_asks_count`: received asks still lacking a reply with the same correlation
+  ID. It covers all open asks, independently of the pending-list display limit.
+- `avg_reply_latency_seconds`: mean time from an ask to the first subsequent reply
+  from its assigned recipient. Each answered ask contributes once; repeated replies
+  and replies sent back by the orchestrator do not inflate the average. Negative
+  clock differences are clamped to zero. The value is `null` without a measured reply.
+- `last_reply_at`: latest reply timestamp from that agent, in Unix milliseconds, or
+  `null` if there are no replies.
+
+Progress publications and reports do not count as replies. Use these message-level
+counters as workload signals. Restart the daemon after upgrading to enable metrics
+in status responses.
