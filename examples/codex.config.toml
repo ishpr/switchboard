@@ -1,14 +1,13 @@
 # Merge into ~/.codex/config.toml. Desktop and CLI share this file.
-# The Codex binary on this Mac is not on PATH. Wake finds it at
-# /Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex
-# unless SWITCHBOARD_CODEX_BIN is set.
+# Replace the path below with your Switchboard clone.
+# If codex is not on PATH, wake looks inside ChatGPT.app, or use SWITCHBOARD_CODEX_BIN.
 # Bind a thread before expecting inject into an open session:
 #   switchboard agent add --name codex --harness codex --session <thread-id>
 # Leave agent_message_board and wake_on_agent_messages alone. They are unfinished.
 
 [mcp_servers.switchboard]
 command = "node"
-args = ["/Users/ishprasad/Switchboard/dist/cli.js", "mcp"]
+args = ["/absolute/path/to/switchboard/dist/cli.js", "mcp"]
 
 [mcp_servers.switchboard.env]
 SWITCHBOARD_HARNESS = "codex"

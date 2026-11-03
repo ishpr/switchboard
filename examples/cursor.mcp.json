@@ -2,7 +2,7 @@
   "mcpServers": {
     "switchboard": {
       "command": "node",
-      "args": ["/Users/ishprasad/Switchboard/dist/cli.js", "mcp"],
+      "args": ["/absolute/path/to/switchboard/dist/cli.js", "mcp"],
       "env": {
         "SWITCHBOARD_HARNESS": "cursor",
         "SWITCHBOARD_NAME": "cursor",
