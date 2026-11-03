@@ -93,6 +93,9 @@ try {
     case "claude-pane":
       await claudePaneCmd();
       break;
+    case "harness-pane":
+      await harnessPaneCmd();
+      break;
     case "--resume":
     case "-c":
     case "--continue":
@@ -654,6 +657,53 @@ async function claudePaneCmd(): Promise<void> {
     model: values.model,
     resume: Boolean(values.resume),
   });
+}
+
+function spawnInteractive(cmd: string, args: string[]): Promise<number> {
+  return new Promise((resolve) => {
+    const child = spawn(cmd, args, {
+      stdio: "inherit",
+      env: process.env,
+    });
+    child.on("exit", (code) => resolve(code ?? 0));
+    child.on("error", () => resolve(1));
+  });
+}
+
+async function harnessPaneCmd(): Promise<void> {
+  const { values } = parseArgs({
+    args: process.argv.slice(3),
+    options: {
+      command: { type: "string" },
+      args: { type: "string" },
+      "resume-args": { type: "string" },
+      cwd: { type: "string" },
+    },
+  });
+  if (!values.command) throw new Error("harness-pane requires --command");
+  if (values.cwd) {
+    process.chdir(values.cwd);
+  }
+  const nodeDir = path.dirname(process.execPath);
+  const localBin = path.join(homedir(), ".local/bin");
+  const pathParts = (process.env.PATH ?? "").split(path.delimiter);
+  for (const extraDir of [localBin, nodeDir]) {
+    if (!pathParts.includes(extraDir)) pathParts.unshift(extraDir);
+  }
+  process.env.PATH = pathParts.join(path.delimiter);
+
+  const baseArgs = values.args ? (JSON.parse(values.args) as string[]) : [];
+  const resumeArgs = values["resume-args"] ? (JSON.parse(values["resume-args"]) as string[]) : [];
+  if (resumeArgs.length > 0) {
+    const startedAt = Date.now();
+    const code = await spawnInteractive(values.command, [...baseArgs, ...resumeArgs]);
+    if (code !== 0 && Date.now() - startedAt < 5000) {
+      process.stdout.write("[switchboard] No existing session to resume; starting a new session...\n");
+      await spawnInteractive(values.command, baseArgs);
+    }
+    return;
+  }
+  await spawnInteractive(values.command, baseArgs);
 }
 
 async function readStdinJson(): Promise<Record<string, unknown> | null> {
