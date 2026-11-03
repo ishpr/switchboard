@@ -72,7 +72,14 @@ try {
     case "--resume":
     case "-c":
     case "--continue":
-      await openGrid(true);
+      await openGrid(true, false);
+      break;
+    case "--restart":
+    case "-r":
+      await openGrid(true, true);
+      break;
+    case "start":
+      await openGrid(false, false);
       break;
     case undefined:
     case "help":
@@ -108,6 +115,7 @@ function usage(): void {
   token                 Print the machine token path's contents
   init                  Install the Zellij grid. Asks which panes to include
   --resume, -c          Attach the grid, or continue each harness's latest session
+  --restart, -r         Recreate the grid session and resume each harness's session
 
 An idle agent is not inside a hook. ask wakes it by injecting into a bound
 Codex or Muse session, or by starting that harness headless when it is offline
@@ -145,10 +153,13 @@ function runZellij(args: string[]): Promise<void> {
   });
 }
 
-async function openGrid(resume: boolean): Promise<void> {
-  const plan = gridPlan(resume, switchboardSessionLine(), path.join(homedir(), ".config/zellij/layouts"));
+async function openGrid(resume: boolean, restart = false): Promise<void> {
+  const plan = gridPlan(resume, switchboardSessionLine(), path.join(homedir(), ".config/zellij/layouts"), {
+    cwd: process.cwd(),
+    restart,
+  });
   if (plan.action === "start" && plan.deleteFirst) {
-    execFileSync("zellij", ["delete-session", plan.session], { stdio: "ignore" });
+    execFileSync("zellij", ["delete-session", "--force", plan.session], { stdio: "ignore" });
   }
   const args =
     plan.action === "attach"
