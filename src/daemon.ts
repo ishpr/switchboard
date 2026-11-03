@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
+import { resolveShimCwd } from "./init.ts";
+import { repoKey } from "./repo.ts";
 import { Store } from "./store.ts";
 import {
   BODY_MAX,
@@ -220,13 +222,15 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     requireName(frame.name);
     if (!frame.repoKey || frame.repoKey.length > 64) throw new Error("repo key required");
     if (!frame.cwd) throw new Error("cwd required");
-    const existing = store.getAgent(frame.repoKey, frame.name);
+    const effectiveCwd = frame.cwd === "/" ? resolveShimCwd("/") : frame.cwd;
+    const effectiveRepo = frame.cwd === "/" && effectiveCwd !== "/" ? repoKey(effectiveCwd) : frame.repoKey;
+    const existing = store.getAgent(effectiveRepo, frame.name);
     conn.authed = true;
     conn.agentId = randomUUID();
     conn.name = frame.name;
     conn.harness = frame.harness || "unknown";
-    conn.repo = frame.repoKey;
-    conn.cwd = frame.cwd;
+    conn.repo = effectiveRepo;
+    conn.cwd = effectiveCwd;
     conn.declaredSession = frame.sessionId || null;
     conn.sessionBound = Boolean(frame.boundSession && frame.sessionId);
     conn.sessionId = conn.declaredSession || conn.agentId;
