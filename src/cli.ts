@@ -179,8 +179,17 @@ function runZellij(args: string[]): Promise<void> {
 }
 
 async function openGrid(resume: boolean, restart = false): Promise<void> {
+  const { values, positionals } = parseArgs({
+    args: process.argv.slice(3),
+    allowPositionals: true,
+    options: {
+      cwd: { type: "string" },
+    },
+  });
+  const rawCwd = values.cwd || positionals[0];
+  const targetCwd = rawCwd ? path.resolve(rawCwd) : process.cwd();
   const plan = gridPlan(resume, switchboardSessionLine(), path.join(homedir(), ".config/zellij/layouts"), {
-    cwd: process.cwd(),
+    cwd: targetCwd,
     restart,
   });
   if (plan.action === "start" && plan.deleteFirst) {

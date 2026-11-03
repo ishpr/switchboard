@@ -416,6 +416,10 @@ export function zshLauncher(cli: string): string {
 switchboard() {
   local resume=0
   if [[ \$1 == --resume || \$1 == -c || \$1 == --continue ]]; then
+    if (( \$# > 1 )); then
+      command node ${shellQuote(cli)} --resume "\${@:2}"
+      return
+    fi
     resume=1
     shift
   fi
