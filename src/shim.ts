@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -10,6 +11,41 @@ import { repoKey } from "./repo.ts";
 import { readToken } from "./token.ts";
 import { HEARTBEAT_MS, type BusMessage, type Role } from "./types.ts";
 import { formatMessage } from "./hook.ts";
+
+export function parseZellijSessionFromPs(output: string): { ppid: number; session: string | null } {
+  const trimmed = output.trim();
+  const match = /^(\d+)\s+(.*)$/s.exec(trimmed);
+  if (!match) return { ppid: 0, session: null };
+  const ppid = Number(match[1]);
+  const cmd = match[2];
+  const sMatch = /(?:^|\s)ZELLIJ_SESSION_NAME=([^\s]+)/.exec(cmd);
+  const pMatch = /(?:^|\s)ZELLIJ_PANE_ID=(\d+)/.exec(cmd);
+  if (sMatch && pMatch) {
+    return { ppid, session: `zellij:${sMatch[1]}:${pMatch[1]}` };
+  }
+  return { ppid, session: null };
+}
+
+export function discoverZellijSession(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  if (env.ZELLIJ_SESSION_NAME && env.ZELLIJ_PANE_ID) {
+    return `zellij:${env.ZELLIJ_SESSION_NAME}:${env.ZELLIJ_PANE_ID}`;
+  }
+  let pid = process.ppid;
+  for (let depth = 0; depth < 4 && pid > 1; depth++) {
+    try {
+      const out = execFileSync("ps", ["eww", "-o", "ppid=,command=", "-p", String(pid)], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      const parsed = parseZellijSessionFromPs(out);
+      if (parsed.session) return parsed.session;
+      pid = parsed.ppid;
+    } catch {
+      break;
+    }
+  }
+  return undefined;
+}
 
 function instructions(role: Role, orchestrator: string | null): string {
   const lines = [
@@ -80,10 +116,7 @@ export async function runShim(): Promise<void> {
 
   // Omit wake unless the env var is set, so `agent add --wake` survives a later connect.
   const wakeFlag = process.env.SWITCHBOARD_WAKE;
-  const zellijSession =
-    process.env.ZELLIJ_SESSION_NAME && process.env.ZELLIJ_PANE_ID
-      ? `zellij:${process.env.ZELLIJ_SESSION_NAME}:${process.env.ZELLIJ_PANE_ID}`
-      : undefined;
+  const zellijSession = discoverZellijSession(process.env);
   const sessionId = process.env.SWITCHBOARD_SESSION || zellijSession;
   const boundSession = Boolean(sessionId);
   const welcome = await bus.connect(endpoint.url, {

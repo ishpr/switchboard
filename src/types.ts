@@ -6,7 +6,7 @@ export const BODY_MAX = 32 * 1024;
 export const DEFAULT_PORT = 8787;
 export const HEARTBEAT_MS = 10_000;
 export const PRESENCE_TTL_MS = 30_000;
-export const WAKE_COOLDOWN_MS = 20_000;
+export const WAKE_COOLDOWN_MS = 3_000;
 
 export type Kind = "pub" | "ask" | "reply";
 export type Role = "orchestrator" | "worker";
