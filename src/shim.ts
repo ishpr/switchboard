@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { inferClaudeAgentName } from "./accounts.ts";
-import { BUILD, buildWarning, formatBuild } from "./build.ts";
+import { BUILD, buildWarning, formatBuild, loadBuild } from "./build.ts";
 import { formatDiagnostics } from "./health.ts";
 import { formatAgentMetrics, formatPendingAsks } from "./status.ts";
 import { BusClient } from "./busClient.ts";
@@ -99,8 +99,10 @@ export async function runShim(): Promise<void> {
   bus.endpointResolver = resolveEndpoint;
   const claudeChannel = harness === "claude";
   let mcp: McpServer | null = null;
+  const waitListeners = new Set<() => void>();
 
   bus.onMessage = (frame) => {
+    for (const wake of waitListeners) wake();
     if (!claudeChannel || !mcp) return;
     const text = formatMessage(frame.message);
     void mcp.server
@@ -157,14 +159,29 @@ export async function runShim(): Promise<void> {
   }, HEARTBEAT_MS);
   heartbeat.unref?.();
 
-  registerTools(mcp, bus, welcome.role, { home, name, repo: welcome.repoKey, sessionId });
+  registerTools(mcp, bus, welcome.role, {
+    home,
+    name,
+    repo: welcome.repoKey,
+    sessionId,
+    subscribeWake: (wake) => {
+      waitListeners.add(wake);
+      return () => waitListeners.delete(wake);
+    },
+  });
 
   const transport = new StdioServerTransport();
   await mcp.connect(transport);
 }
 
 function registerTools(mcp: McpServer, bus: BusClient, role: Role,
-  context: { home: string; name: string; repo: string; sessionId?: string }): void {
+  context: {
+    home: string;
+    name: string;
+    repo: string;
+    sessionId?: string;
+    subscribeWake?: (wake: () => void) => () => void;
+  }): void {
   mcp.registerTool(
     "bus_publish",
     {
@@ -337,6 +354,8 @@ function registerTools(mcp: McpServer, bus: BusClient, role: Role,
         const result = await waitForMessages(store, {
           repo: context.repo, to: recipient, timeoutMs: timeout_seconds * 1000, intervalMs: interval_ms,
           sinceSeq: since_seq, wakeExisting: wake_existing, cursorKey, topic, signal: extra.signal,
+        }, {
+          subscribeWake: context.subscribeWake,
         });
         return { ...text(formatWaitResult(result)), structuredContent: { ...result } };
       } finally {
@@ -358,9 +377,10 @@ function registerTools(mcp: McpServer, bus: BusClient, role: Role,
     async ({ status, pending, limit }) => {
       const frame = await bus.request({ type: "status", status, pending, limit });
       if (frame.type !== "ok" || !frame.pending_asks) return text("pending-ask tracking unavailable; restart the daemon after upgrading");
+      const currentBuild = loadBuild();
       return {
-        ...text(`${pending ? "" : `${frame.detail}\n${formatBuild("daemon", frame.daemon)}\n${formatBuild("MCP", BUILD)}${buildWarning(BUILD, frame.daemon) ? `\nWARNING: ${buildWarning(BUILD, frame.daemon)}` : ""}\n`}${formatPendingAsks(frame.pending_asks)}${pending ? "" : `\n${formatAgentMetrics(frame.agent_metrics ?? [])}`}`),
-        structuredContent: { ...(pending ? {} : { detail: frame.detail, daemon: frame.daemon ?? null, shim: BUILD, agent_metrics: frame.agent_metrics ?? [] }), pending_asks: frame.pending_asks },
+        ...text(`${pending ? "" : `${frame.detail}\n${formatBuild("daemon", frame.daemon)}\n${formatBuild("MCP", currentBuild)}${buildWarning(currentBuild, frame.daemon) ? `\nWARNING: ${buildWarning(currentBuild, frame.daemon)}` : ""}\n`}${formatPendingAsks(frame.pending_asks)}${pending ? "" : `\n${formatAgentMetrics(frame.agent_metrics ?? [])}`}`),
+        structuredContent: { ...(pending ? {} : { detail: frame.detail, daemon: frame.daemon ?? null, shim: currentBuild, agent_metrics: frame.agent_metrics ?? [] }), pending_asks: frame.pending_asks },
       };
     },
   );

@@ -36,6 +36,7 @@ type WaitClock = {
   now?: () => number;
   sleep?: (ms: number) => Promise<unknown>;
   onReady?: (baseline: number) => void;
+  subscribeWake?: (wake: () => void) => () => void;
 };
 
 export async function waitForMessages(store: Store, options: WaitOptions, clock: WaitClock = {}): Promise<WaitResult> {
@@ -54,7 +55,36 @@ export async function waitForMessages(store: Store, options: WaitOptions, clock:
   if (options.topic !== undefined && !TOPIC_RE.test(options.topic)) throw new Error("invalid wait topic");
   const now = clock.now ?? (() => performance.now());
   options.signal?.throwIfAborted();
-  const pause = clock.sleep ?? ((ms: number) => sleep(ms, undefined, { signal: options.signal }));
+  const pause = clock.sleep ?? ((ms: number) => {
+    if (!clock.subscribeWake) return sleep(ms, undefined, { signal: options.signal });
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const cleanup = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        unsubscribe();
+        options.signal?.removeEventListener("abort", onAbort);
+      };
+      const onWake = () => {
+        cleanup();
+        resolve();
+      };
+      const onAbort = () => {
+        cleanup();
+        reject(options.signal?.reason ?? new Error("aborted"));
+      };
+      const unsubscribe = clock.subscribeWake!(onWake);
+      const timer = setTimeout(onWake, ms);
+      if (options.signal) {
+        if (options.signal.aborted) {
+          onAbort();
+          return;
+        }
+        options.signal.addEventListener("abort", onAbort, { once: true });
+      }
+    });
+  });
   const deadline = now() + timeoutMs;
   const baseline = options.sinceSeq ?? (options.wakeExisting ? 0 : store.latestUnreadSeq(options.repo, options.to, options.cursorKey, options.topic));
   clock.onReady?.(baseline);

@@ -141,7 +141,7 @@ async function fixture() {
   const daemon = await startDaemon({ port: 0, dbFile, token, paneProbe: async () => true });
   const clients: BusClient[] = [];
   return {
-    home, store,
+    home, store, url: daemon.url,
     async join(name: string) {
       const client = new BusClient(); clients.push(client);
       await client.connect(daemon.url, { type: "hello", token, name, harness: "grok", cwd: "/work", repoKey: "board", wake: false });
@@ -222,4 +222,65 @@ test("CLI wait supports existing unread, explicit since-seq, recipient defaults 
     assert.equal(session.stdout, "TIMEOUT\n");
     await assert.rejects(exec(process.execPath, [...args, "--interval-ms", "0"], { env }), /--interval-ms/);
   } finally { await fx.close(); }
+});
+
+test("CLI wait holds an online WS presence without double-counting and wakes immediately on push", async () => {
+  const fx = await fixture();
+  let museWait: ReturnType<typeof launchWait> | undefined;
+  let agyWait: ReturnType<typeof launchWait> | undefined;
+  try {
+    const sender = await fx.join("eg");
+    const agy = await fx.join("agy");
+    await sender.request({
+      type: "register",
+      name: "muse",
+      harness: "muse",
+      cwd: "/work",
+      sessionId: "01a1957b-9e69-7b90-aa4b-d1f30c47dc47",
+      wake: false,
+    });
+
+    museWait = launchWait(
+      fx.home,
+      ["--to", "muse", "--interval-ms", "60000", "--json"],
+      { SWITCHBOARD_URL: fx.url },
+    );
+    agyWait = launchWait(
+      fx.home,
+      ["--to", "agy", "--interval-ms", "60000", "--json"],
+      { SWITCHBOARD_URL: fx.url },
+    );
+    await Promise.all([museWait.ready, agyWait.ready]);
+
+    const who = await sender.request({ type: "who" });
+    assert.equal(who.type, "who");
+    if (who.type === "who") {
+      const museRows = who.agents.filter((a) => a.name === "muse");
+      assert.equal(museRows.length, 1);
+      assert.equal(museRows[0]!.online, true);
+      assert.equal(museRows[0]!.harness, "muse");
+      assert.equal(museRows[0]!.connectionCount, 1);
+      assert.equal(museRows[0]!.wakeSessionId, "01a1957b-9e69-7b90-aa4b-d1f30c47dc47");
+
+      const agyRows = who.agents.filter((a) => a.name === "agy");
+      assert.equal(agyRows.length, 1);
+      assert.equal(agyRows[0]!.online, true);
+      assert.equal(agyRows[0]!.connectionCount, 1);
+    }
+
+    const start = Date.now();
+    await sender.request({ type: "publish", topic: "dm", body: "instant push wake", to: "muse" });
+    const museResult = await museWait.done;
+    assert.equal(museResult.code, 0);
+    assert.ok(Date.now() - start < 2000);
+    const parsed = JSON.parse(museResult.stdout);
+    assert.equal(parsed.status, "MESSAGES");
+    assert.equal(parsed.messages[0].preview, "instant push wake");
+    void agy;
+  } finally {
+    museWait?.child.kill();
+    agyWait?.child.kill();
+    await Promise.allSettled([museWait?.done, agyWait?.done]);
+    await fx.close();
+  }
 });

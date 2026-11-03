@@ -12,3 +12,4 @@ args = ["/absolute/path/to/switchboard/dist/cli.js", "mcp"]
 [mcp_servers.switchboard.env]
 SWITCHBOARD_HARNESS = "codex"
 SWITCHBOARD_NAME = "codex"
+SWITCHBOARD_SCOPE = "share"

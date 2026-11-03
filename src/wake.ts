@@ -53,7 +53,8 @@ export function decideWake(input: {
 
 function canInject(harness: string, sessionId?: string | null): boolean {
   if (sessionId?.startsWith("zellij:") || /^(?:tmux:)?%\d+$/.test(sessionId ?? "")) return true;
-  return harness === "codex" || harness === "muse";
+  if (harness === "muse") return process.env.SWITCHBOARD_MUSE_INJECT === "1";
+  return harness === "codex";
 }
 
 // Pane injection uses the multiplexer session, so a removed agent worktree is safe to bypass.
@@ -123,7 +124,7 @@ export function launchFor(input: {
         cwd: input.cwd,
       };
     }
-    if (input.harness === "muse" && input.sessionId) {
+    if (input.harness === "muse" && input.sessionId && process.env.SWITCHBOARD_MUSE_INJECT === "1") {
       return {
         completion: "exit",
         cmd: "muse",

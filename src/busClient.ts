@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import WebSocket from "ws";
-import { BUILD } from "./build.ts";
-import type { ClientFrame, ClientHello, ServerFrame } from "./types.ts";
+import { BUILD, loadBuild } from "./build.ts";
+import type { BuildInfo, ClientFrame, ClientHello, ServerFrame } from "./types.ts";
 
 type Waiter = { socket: WebSocket; done: (frame: ServerFrame) => void; fail: (err: Error) => void };
 
@@ -13,6 +13,7 @@ export class BusClient {
   private requestTimeoutMs: number;
   private lastUrl: string | null = null;
   private lastHello: ClientHello | null = null;
+  private customBuild: BuildInfo | undefined = undefined;
   private subscribedTopics = new Set<string>();
   private closed = false;
   private reconnecting: Promise<void> | null = null;
@@ -26,7 +27,8 @@ export class BusClient {
   async connect(url: string, hello: ClientHello): Promise<Extract<ServerFrame, { type: "welcome" }>> {
     this.closed = false;
     this.lastUrl = url;
-    this.lastHello = { ...hello, build: hello.build ?? BUILD };
+    this.customBuild = hello.build;
+    this.lastHello = { ...hello, build: hello.build ?? loadBuild() ?? BUILD };
     return this.openSocket(url, this.lastHello);
   }
 
@@ -64,7 +66,15 @@ export class BusClient {
         waiter.fail(new Error(reason));
       }
     };
-    socket.on("close", () => drop("socket closed"));
+    socket.on("close", () => {
+      drop("socket closed");
+      if (!this.closed && this.lastHello && this.endpointResolver) {
+        const timer = setTimeout(() => {
+          if (!this.closed && this.lastHello) void this.ensureConnected().catch(() => {});
+        }, 150);
+        timer.unref?.();
+      }
+    });
     socket.on("error", () => drop("socket error"));
     const welcome = await this.rawRequest(socket, hello);
     if (welcome.type !== "welcome") throw new Error("expected welcome");
@@ -81,7 +91,7 @@ export class BusClient {
         const target = this.endpointResolver ? await this.endpointResolver() : { url: this.lastUrl!, token: this.lastHello!.token };
         if (this.closed) throw new Error("client closed");
         this.lastUrl = target.url;
-        this.lastHello = { ...this.lastHello!, token: target.token };
+        this.lastHello = { ...this.lastHello!, token: target.token, build: this.customBuild ?? loadBuild() };
         await this.openSocket(this.lastUrl, this.lastHello);
       })().finally(() => { this.reconnecting = null; });
     }

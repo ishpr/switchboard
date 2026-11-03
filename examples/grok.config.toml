@@ -5,4 +5,4 @@
 [mcp_servers.switchboard]
 command = "node"
 args = ["/absolute/path/to/switchboard/dist/cli.js", "mcp"]
-env = { SWITCHBOARD_HARNESS = "grok", SWITCHBOARD_NAME = "grok" }
+env = { SWITCHBOARD_HARNESS = "grok", SWITCHBOARD_NAME = "grok", SWITCHBOARD_SCOPE = "share" }

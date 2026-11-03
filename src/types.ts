@@ -100,6 +100,8 @@ export type ClientHello = {
   sessionId?: string;
   /** Persist sessionId for inject. A generated id is this connection only. */
   boundSession?: boolean;
+  /** True when the connection is held by a `switchboard wait` monitor rather than an MCP shim. */
+  waitOnly?: boolean;
   status?: string;
   wake?: boolean;
   /** Claim the orchestrator role. A different name cannot take it once one is set. */
