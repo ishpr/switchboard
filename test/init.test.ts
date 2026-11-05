@@ -394,4 +394,55 @@ test("discoverRatioBinding resolves repo-local and home-level Ratio project/prof
   );
   const curLocal = discoverRatioBinding({ cwd: repoDir, harness: "cursor", name: "cursor", env: {}, home: fakeHome });
   assert.deepEqual(curLocal, { project: "p-repo-local", profile: null, source: "repo:.mcp.json" });
+
+  // 3. Linked git worktree inherits main checkout .mcp.json and allows worktree-local override
+  execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=t@e.com", "commit", "--allow-empty", "-m", "init"], {
+    cwd: repoDir,
+    stdio: "ignore",
+  });
+  const worktreeDir = path.join(mkdtempSync(path.join(tmpdir(), "switchboard-ratio-wt-")), "wt");
+  execFileSync("git", ["worktree", "add", "-b", "wt-branch", worktreeDir], { cwd: repoDir, stdio: "ignore" });
+  const wtInherited = discoverRatioBinding({
+    cwd: worktreeDir,
+    harness: "cursor",
+    name: "cursor",
+    env: {},
+    home: fakeHome,
+  });
+  assert.deepEqual(wtInherited, { project: "p-repo-local", profile: null, source: "repo:.mcp.json" });
+
+  writeFileSync(
+    path.join(worktreeDir, ".mcp.json"),
+    JSON.stringify({
+      mcpServers: {
+        ratio: { url: "https://ratio.servsys.com", headers: { "X-Ratio-Project": "p-wt-override" } },
+      },
+    }),
+  );
+  const wtOverridden = discoverRatioBinding({
+    cwd: worktreeDir,
+    harness: "cursor",
+    name: "cursor",
+    env: {},
+    home: fakeHome,
+  });
+  assert.deepEqual(wtOverridden, { project: "p-wt-override", profile: null, source: "repo:.mcp.json" });
+
+  // 4. parseZellijPaneForInvitedAgent matches single-quoted env values and filters ignorePids
+  const quotedPs = [
+    "101 zsh -lc cd '/tmp/a' && export SWITCHBOARD_NAME='grok' ZELLIJ_SESSION_NAME='switchboard-a' ZELLIJ_PANE_ID='3' && exec '/bin/grok'",
+    "202 /bin/grok --always-approve SWITCHBOARD_NAME='grok' ZELLIJ_SESSION_NAME='switchboard-a' ZELLIJ_PANE_ID='3'",
+    "303 /bin/grok --always-approve SWITCHBOARD_NAME='grok' ZELLIJ_SESSION_NAME='switchboard-a' ZELLIJ_PANE_ID='8'",
+  ].join("\n");
+  assert.equal(
+    parseZellijPaneForInvitedAgent(quotedPs, "switchboard-a", "grok", "/bin/grok", "grok", new Set([202])),
+    "zellij:switchboard-a:8",
+  );
+
+  // 5. switchboardLayout escapes quotes and backslashes in KDL strings
+  const layoutKdl = switchboardLayout('/tmp/my "repo"\\path', [
+    { name: 'Pane "A"', command: '/bin/my "cmd"', args: ["--flag"] },
+  ]);
+  assert.ok(layoutKdl.includes('cwd="/tmp/my \\"repo\\"\\\\path"'));
+  assert.ok(layoutKdl.includes('pane name="Pane \\"A\\"" command="/bin/my \\"cmd\\""'));
 });

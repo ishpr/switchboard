@@ -157,7 +157,7 @@ export type ClientFrame = (
   | { type: "ack"; cursor: number }
   | { type: "who" }
   | { type: "doctor"; all?: boolean; prune?: boolean }
-  | { type: "ask"; to: string; body: string; topic?: string; supersedes?: string }
+  | { type: "ask"; to: string; body: string; topic?: string; supersedes?: string; ratioProject?: string }
   | { type: "reply"; correlationId: string; body: string; state?: ReplyState }
   | { type: "report"; body: string }
   | { type: "status"; status?: string; pending?: boolean; limit?: number }
@@ -213,7 +213,7 @@ export type ServerFrame = (
   | { type: "who"; agents: AgentRecord[]; daemon?: RuntimeInfo }
   | { type: "doctor"; agents: AgentRecord[]; pruned: PrunedAgent[]; daemon?: RuntimeInfo }
   | { type: "orchestrator"; orchestrator: string | null }
-  | { type: "registered"; name: string; agent?: AgentRecord; created?: boolean }
+  | { type: "registered"; name: string; agent?: AgentRecord; created?: boolean; role?: Role; orchestrator?: string | null }
   | {
       type: "invited";
       repoKey: string;

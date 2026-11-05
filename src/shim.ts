@@ -414,32 +414,35 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
     },
     async ({ cwd }) => {
       let rebind = false;
+      let targetCwd = context.cwd;
+      let targetRepo = context.repo;
       if (cwd !== undefined) {
         const trimmed = cwd.trim();
         if (!trimmed || trimmed === "/" || !existsSync(trimmed)) {
           return { ...text(`cannot register: invalid cwd "${cwd}"`), isError: true };
         }
-        const root = gitRepoRoot(trimmed);
-        if (!existsSync(path.join(root, ".git"))) {
+        const sharedRoot = gitRepoRoot(trimmed, "share");
+        const splitRoot = gitRepoRoot(trimmed, "split");
+        if (!existsSync(path.join(sharedRoot, ".git")) && !existsSync(path.join(splitRoot, ".git"))) {
           return { ...text(`cannot register: "${cwd}" is not inside a git repository`), isError: true };
         }
-        rebind = root !== context.cwd || context.cwd === "/";
-        context.cwd = root;
-        context.repo = repoKey(root);
+        rebind = splitRoot !== context.cwd || context.cwd === "/";
+        targetCwd = splitRoot;
+        targetRepo = repoKey(trimmed);
       }
-      const fresh = discoverHarnessSession({ cwd: context.cwd, harness: context.harness, env: process.env });
+      const fresh = discoverHarnessSession({ cwd: targetCwd, harness: context.harness, env: process.env });
       const resolvedSessionId = fresh.sessionId || (rebind ? undefined : context.sessionId);
       const resolvedWakeSessionId =
         fresh.wakeSessionId || (rebind ? undefined : context.wakeSessionId) || resolvedSessionId;
-      if (!context.cwd || context.cwd === "/" || (!resolvedSessionId && !cwd)) {
-        return { ...text(missingSessionSource(context.harness, context.cwd)), isError: true };
+      if (!targetCwd || targetCwd === "/" || (!resolvedSessionId && !cwd)) {
+        return { ...text(missingSessionSource(context.harness, targetCwd)), isError: true };
       }
-      const { branch, head } = gitCheckoutInfo(context.cwd);
+      const { branch, head } = gitCheckoutInfo(targetCwd);
       const frame = await bus.request({
         type: "register",
         name: context.name,
         harness: context.harness,
-        cwd: context.cwd,
+        cwd: targetCwd,
         rebind: Boolean(cwd),
         sessionId: resolvedSessionId,
         wakeSessionId: resolvedWakeSessionId,
@@ -447,24 +450,31 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
         head,
       });
       if (frame.type !== "registered") return { ...text("registration failed"), isError: true };
-      context.sessionId = resolvedSessionId;
-      context.wakeSessionId = resolvedWakeSessionId;
+      const agent = frame.agent;
+      const effectiveSessionId = agent?.sessionId ?? resolvedSessionId;
+      const effectiveWakeSessionId = agent?.wakeSessionId ?? resolvedWakeSessionId;
+      context.cwd = targetCwd;
+      context.repo = targetRepo;
+      context.sessionId = effectiveSessionId ?? undefined;
+      context.wakeSessionId = effectiveWakeSessionId ?? undefined;
+      if (frame.role) role = frame.role;
+      if (frame.orchestrator !== undefined) context.orchestrator = frame.orchestrator;
       bus.updateHello({
         cwd: context.cwd,
         repoKey: context.repo,
+        role,
         branch,
         head,
-        sessionId: resolvedSessionId,
-        wakeSessionId: resolvedWakeSessionId,
-        boundSession: Boolean(resolvedSessionId),
+        sessionId: context.sessionId,
+        wakeSessionId: context.wakeSessionId,
+        boundSession: Boolean(context.sessionId),
       });
-      const agent = frame.agent;
       const statusLabel = frame.created ? "new" : "existing";
       const wakePart =
-        !resolvedSessionId && !resolvedWakeSessionId
+        !context.sessionId && !context.wakeSessionId
           ? " wake=push (no injectable session id discovered; messages arrive via hooks/bus_inbox while open)"
-          : resolvedWakeSessionId && resolvedWakeSessionId !== resolvedSessionId
-            ? ` wake_session=${resolvedWakeSessionId}`
+          : context.wakeSessionId && context.wakeSessionId !== context.sessionId
+            ? ` wake_session=${context.wakeSessionId}`
             : "";
       const gitPart =
         (agent?.branch ?? branch) || (agent?.head ?? head)
@@ -473,7 +483,7 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
       return text(
         [
           `registered (${statusLabel})`,
-          `name=${context.name} harness=${context.harness} session=${resolvedSessionId ?? "unbound"}${wakePart}`,
+          `name=${context.name} harness=${context.harness} session=${context.sessionId ?? "unbound"}${wakePart}`,
           `checkout=${context.cwd}${gitPart}`,
           `role=${role} orchestrator=${context.orchestrator ?? "none"}`,
           "Call bus_who to list every other live or registered session in this repository.",
@@ -596,10 +606,18 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
         question: z.string(),
         topic: z.string().optional(),
         supersedes: z.string().optional().describe("Correlation id of an earlier ask that this ask replaces and closes"),
+        ratio_project: z.string().optional().describe("Optional expected Ratio project id (e.g. 'p-serveone') that the target must match"),
       },
     },
-    async ({ agent, question, topic, supersedes }) => {
-      const frame = await bus.request({ type: "ask", to: agent, body: question, topic, supersedes });
+    async ({ agent, question, topic, supersedes, ratio_project }) => {
+      const frame = await bus.request({
+        type: "ask",
+        to: agent,
+        body: question,
+        topic,
+        supersedes,
+        ratioProject: ratio_project,
+      });
       return text(frame.type === "published" ? publishedText(frame) : "asked");
     },
   );
@@ -657,9 +675,13 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
         }
         const ownSession = recipient === context.name ? context.sessionId : undefined;
         const cursorKey = ownSession && !ownSession.startsWith("zellij:") ? `${recipient}:${ownSession}` : recipient;
+        const storedRecipient = recipient !== "*" ? store.getAgent(context.repo, ownSession || recipient) : undefined;
+        const subscriptionKey = ownSession || storedRecipient?.sessionId || `name:${recipient}`;
+        const isOrchestrator = store.getOrchestrator(context.repo) === recipient;
         const result = await waitForMessages(store, {
           repo: context.repo, to: recipient, timeoutMs: timeout_seconds * 1000, intervalMs: interval_ms,
-          sinceSeq: since_seq, wakeExisting: wake_existing, cursorKey, topic, signal: extra.signal,
+          sinceSeq: since_seq, wakeExisting: wake_existing, cursorKey, topic,
+          sessionId: ownSession, subscriptionKey, isOrchestrator, signal: extra.signal,
         }, {
           subscribeWake: context.subscribeWake,
         });
@@ -812,6 +834,9 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
         orchestrator,
       });
       if (frame.type !== "invited") return { ...text("invite unavailable"), isError: true };
+      context.orchestrator = frame.orchestrator;
+      role = frame.orchestrator === context.name ? "orchestrator" : "worker";
+      bus.updateHello({ role });
       const lines = [
         `repo=${frame.repoKey} cwd=${frame.cwd} orchestrator=${frame.orchestrator ?? "none"}`,
         ...frame.invited.map(

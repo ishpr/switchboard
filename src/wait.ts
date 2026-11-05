@@ -13,6 +13,9 @@ export type WaitOptions = {
   wakeExisting?: boolean;
   cursorKey?: string;
   topic?: string;
+  sessionId?: string | null;
+  subscriptionKey?: string;
+  isOrchestrator?: boolean;
   signal?: AbortSignal;
 };
 
@@ -86,11 +89,27 @@ export async function waitForMessages(store: Store, options: WaitOptions, clock:
     });
   });
   const deadline = now() + timeoutMs;
-  const baseline = options.sinceSeq ?? (options.wakeExisting ? 0 : store.latestUnreadSeq(options.repo, options.to, options.cursorKey, options.topic));
+  const waitOpts = {
+    subscriptionKey: options.subscriptionKey,
+    isOrchestrator: options.isOrchestrator,
+  };
+  const baseline =
+    options.sinceSeq ??
+    (options.wakeExisting
+      ? 0
+      : store.latestUnreadSeq(options.repo, options.to, options.cursorKey, options.topic, options.sessionId, waitOpts));
   clock.onReady?.(baseline);
   while (true) {
     options.signal?.throwIfAborted();
-    const messages = store.unreadForWait(options.repo, options.to, baseline, options.cursorKey, options.topic);
+    const messages = store.unreadForWait(
+      options.repo,
+      options.to,
+      baseline,
+      options.cursorKey,
+      options.topic,
+      options.sessionId,
+      waitOpts,
+    );
     if (messages.length) {
       return { status: "MESSAGES", since_seq: baseline, messages: messages.map((message) => ({
         seq: message.seq, from: message.fromName, to: message.to ?? "*", topic: message.topic,
