@@ -10,6 +10,7 @@ const CODEX_APP_BIN =
 
 export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export const TTY_RE = /^tty:\/dev\/ttys\d+$/;
+export const PTY_RE = /^pty:(\/.+\.sock)$/;
 
 /**
  * Checks whether a Codex session UUID currently has an active turn (`status = 'inProgress'`)
@@ -57,7 +58,8 @@ function isPaneOrTtySession(sessionId?: string | null): boolean {
   return (
     sessionId.startsWith("zellij:") ||
     /^(?:tmux:)?%\d+$/.test(sessionId) ||
-    TTY_RE.test(sessionId)
+    TTY_RE.test(sessionId) ||
+    PTY_RE.test(sessionId)
   );
 }
 
@@ -74,27 +76,39 @@ export function decideWake(input: {
   harness: string | null;
   sessionId: string | null;
   wakeEnabled: boolean;
+  recipient?: string | null;
+  hasActiveWaiter?: boolean;
 }): WakeInfo {
   if (!input.directed) {
     return { mode: "skip", detail: "broadcast is stored for subscribers; it does not start a session" };
   }
   const harness = input.harness ?? "";
+  const recipientPrefix = input.recipient ? `recipient ${input.recipient}` : "";
   if (input.sessionId && canInject(harness, input.sessionId)) {
-    return { mode: "inject", detail: `inject into the ${harness} session` };
+    return {
+      mode: "inject",
+      detail: recipientPrefix ? `inject into ${recipientPrefix} (${harness}) session` : `inject into the ${harness} session`,
+    };
+  }
+  if (input.hasActiveWaiter) {
+    return {
+      mode: "push",
+      detail: `${recipientPrefix || "recipient"} has an active wait listener; delivered live via WebSocket push and session inbox`,
+    };
   }
   if (input.online && harness === "claude") {
     return {
       mode: "push",
-      detail:
-        "claude session is open (no pane/tty inject target); delivered to session inbox and turn hooks (idle prompt wakes only if started with --channels)",
+      detail: `${recipientPrefix ? `${recipientPrefix} (claude)` : "claude session"} is open (no pane/tty/pty inject target); delivered to recipient's session inbox and turn hooks (idle prompt wakes if started inside switchboard/pty or with --channels)`,
     };
   }
   if (input.online) {
+    const label = recipientPrefix ? `${recipientPrefix}${harness ? ` (${harness})` : ""}` : "recipient session";
     return {
       mode: "push",
       detail: input.sessionId
-        ? "session is open; this harness has no inject command, so the message waits until the next turn"
-        : "session is open but no session id is bound, so an idle prompt cannot be started",
+        ? `${label} is open; delivered to recipient's session inbox for its next turn or bus_wait`
+        : `${label} is open (no pane/tty/pty inject target bound); delivered to recipient's session inbox for its next turn or bus_wait`,
     };
   }
   if (input.wakeEnabled) {
@@ -161,6 +175,20 @@ export function launchFor(input: {
           cwd: paneWakeCwd(input.cwd),
         };
       }
+    }
+    const ptyMatch = PTY_RE.exec(input.sessionId ?? "");
+    if (ptyMatch) {
+      return {
+        completion: "exit",
+        cmd: process.execPath,
+        args: [
+          "-e",
+          'const net = require("node:net"); const sock = process.argv[1]; const msg = process.argv[2]; const c = net.createConnection(sock, () => { c.write("\\x15" + msg); setTimeout(() => { c.end("\\r"); }, 250); }); c.on("error", (e) => { process.stderr.write(String(e.message || e) + "\\n"); process.exit(1); });',
+          ptyMatch[1]!,
+          panePromptFor(input.message),
+        ],
+        cwd: paneWakeCwd(input.cwd),
+      };
     }
     const tty = /^tty:(\/dev\/ttys\d+)$/.exec(input.sessionId ?? "");
     if (tty) {

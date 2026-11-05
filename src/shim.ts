@@ -174,6 +174,41 @@ export function discoverGrokSession(
   }
 }
 
+export function parsePtySessionFromPs(output: string): { ppid: number; session: string | null } {
+  const trimmed = output.trim();
+  const match = /^(\d+)\s+(.*)$/s.exec(trimmed);
+  if (!match) return { ppid: 0, session: null };
+  const ppid = Number(match[1]);
+  const cmd = match[2]!;
+  const wMatch = /(?:^|\s)SWITCHBOARD_WAKE_SESSION=(pty:[^\s]+\.sock)/.exec(cmd);
+  if (wMatch) {
+    return { ppid, session: wMatch[1]!.replace(/^['"]|['"]$/g, "") };
+  }
+  return { ppid, session: null };
+}
+
+export function discoverPtySession(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const fromEnv = env.SWITCHBOARD_WAKE_SESSION?.trim();
+  if (fromEnv && /^pty:\/.+\.sock$/.test(fromEnv)) {
+    return fromEnv;
+  }
+  let pid = process.ppid;
+  for (let depth = 0; depth < 4 && pid > 1; depth++) {
+    try {
+      const out = execFileSync("ps", ["eww", "-o", "ppid=,command=", "-p", String(pid)], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      const parsed = parsePtySessionFromPs(out);
+      if (parsed.session) return parsed.session;
+      pid = parsed.ppid;
+    } catch {
+      break;
+    }
+  }
+  return undefined;
+}
+
 export function discoverHarnessSession(opts: {
   cwd: string;
   harness: string;
@@ -186,6 +221,7 @@ export function discoverHarnessSession(opts: {
   const zellijSession = discoverZellijSession(env);
   const tmuxSession = /^%\d+$/.test(env.TMUX_PANE ?? "") ? `tmux:${env.TMUX_PANE}` : undefined;
   const paneSession = zellijSession || tmuxSession;
+  const ptySession = !explicit && !paneSession ? discoverPtySession(env) : undefined;
   const envSession =
     env.CODEX_THREAD_ID?.trim() ||
     env.MUSE_SESSION_ID?.trim() ||
@@ -201,11 +237,11 @@ export function discoverHarnessSession(opts: {
       ? discoverGrokSession(opts.cwd, opts.grokHome)
       : undefined;
   const ttySession =
-    !explicit && !paneSession && opts.harness !== "codex"
+    !explicit && !paneSession && !ptySession && opts.harness !== "codex"
       ? discoverTerminalTty(env, opts.harness)
       : undefined;
-  const sessionId = explicit || paneSession || envSession || codexThread || grokSession || undefined;
-  const wakeSessionId = explicit || paneSession || ttySession || sessionId || undefined;
+  const sessionId = explicit || paneSession || envSession || codexThread || grokSession || ptySession || undefined;
+  const wakeSessionId = explicit || paneSession || ptySession || ttySession || sessionId || undefined;
   return { sessionId, wakeSessionId };
 }
 

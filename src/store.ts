@@ -12,7 +12,12 @@ import { TTY_RE } from "./wake.ts";
 
 function isPaneOrTty(sessionId?: string | null): boolean {
   if (!sessionId) return false;
-  return sessionId.startsWith("zellij:") || /^(?:tmux:)?%\d+$/.test(sessionId) || TTY_RE.test(sessionId);
+  return (
+    sessionId.startsWith("zellij:") ||
+    sessionId.startsWith("pty:") ||
+    /^(?:tmux:)?%\d+$/.test(sessionId) ||
+    TTY_RE.test(sessionId)
+  );
 }
 
 export function sessionHandle(name: string, sessionId?: string | null, harness?: string): string {

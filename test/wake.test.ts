@@ -10,9 +10,12 @@ import {
   discoverHarnessSession,
   instructions,
   missingSessionSource,
+  parsePtySessionFromPs,
   parseTerminalTtyFromPs,
   parseZellijSessionFromPs,
 } from "../src/shim.ts";
+import { createPaneProbe, paneTarget } from "../src/health.ts";
+import { runPtyWrap } from "../src/pty.ts";
 import { DatabaseSync } from "node:sqlite";
 import type { BusMessage } from "../src/types.ts";
 import { decideWake, headlessLaunch, isCodexTurnInProgress, launchFor, promptFor, spawnWake } from "../src/wake.ts";
@@ -468,6 +471,125 @@ test("isCodexTurnInProgress reads latest rollout_ordinal status from ~/.codex/th
     );
     db2.close();
     assert.equal(isCodexTurnInProgress(threadId, codexDir), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("universal PTY relay wraps CLI processes, injects prompts over Unix socket, and cleans up on exit", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "sb-pty-wrap-"));
+  const outFile = path.join(dir, "received.txt");
+  const scriptFile = path.join(dir, "reader.mjs");
+  writeFileSync(
+    scriptFile,
+    [
+      'import { writeFileSync } from "node:fs";',
+      "let buf = '';",
+      "process.stdin.setEncoding('utf8');",
+      "process.stdin.on('data', (chunk) => {",
+      "  buf += chunk;",
+      "  if (buf.includes('\\r') || buf.includes('\\n')) {",
+      `    writeFileSync(${JSON.stringify(outFile)}, JSON.stringify({ line: buf, wakeEnv: process.env.SWITCHBOARD_WAKE_SESSION }));`,
+      "    process.exit(0);",
+      "  }",
+      "});",
+    ].join("\n"),
+  );
+
+  try {
+    // 1. Verify parsePtySessionFromPs and discoverHarnessSession preserve UUID sessionId while binding pty: wakeSessionId
+    const parsedPs = parsePtySessionFromPs("12345 SWITCHBOARD_WAKE_SESSION=pty:/tmp/sb-test.sock claude");
+    assert.equal(parsedPs.ppid, 12345);
+    assert.equal(parsedPs.session, "pty:/tmp/sb-test.sock");
+
+    const claudeUuid = "104c6460-a8d4-424a-9533-2640ba973657";
+    const discovered = discoverHarnessSession({
+      cwd: dir,
+      harness: "claude",
+      env: {
+        CLAUDE_CODE_SESSION_ID: claudeUuid,
+        SWITCHBOARD_WAKE_SESSION: "pty:/tmp/sb-test.sock",
+      },
+    });
+    assert.equal(discovered.sessionId, claudeUuid);
+    assert.equal(discovered.wakeSessionId, "pty:/tmp/sb-test.sock");
+
+    // 2. Verify decideWake names the recipient and recognizes active wait listeners
+    const waiterWake = decideWake({
+      directed: true,
+      online: true,
+      harness: "antigravity",
+      sessionId: null,
+      wakeEnabled: false,
+      recipient: "agy",
+      hasActiveWaiter: true,
+    });
+    assert.equal(waiterWake.mode, "push");
+    assert.match(waiterWake.detail, /recipient agy has an active wait listener/);
+
+    const openRecipientWake = decideWake({
+      directed: true,
+      online: true,
+      harness: "antigravity",
+      sessionId: null,
+      wakeEnabled: false,
+      recipient: "agy",
+      hasActiveWaiter: false,
+    });
+    assert.equal(openRecipientWake.mode, "push");
+    assert.match(openRecipientWake.detail, /recipient agy \(antigravity\) is open/);
+
+    // 3. Run real PTY relay and inject into it using launchFor + spawnWake
+    let activeWakeSession = "";
+    let activeSockPath = "";
+    const wrapPromise = runPtyWrap(process.execPath, [scriptFile], {
+      home: dir,
+      onSocketReady: (wakeSessionId, sockPath) => {
+        activeWakeSession = wakeSessionId;
+        activeSockPath = sockPath;
+      },
+    });
+
+    const deadline = Date.now() + 4000;
+    while (!activeWakeSession && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.match(activeWakeSession, /^pty:\/.+\.sock$/);
+
+    const probe = createPaneProbe();
+    const target = paneTarget(activeWakeSession);
+    assert.equal(target?.kind, "pty");
+    assert.equal(await probe(target!), true);
+
+    const wakeInfo = decideWake({
+      directed: true,
+      online: true,
+      harness: "claude",
+      sessionId: activeWakeSession,
+      wakeEnabled: true,
+      recipient: "dark-factory-mode",
+    });
+    assert.equal(wakeInfo.mode, "inject");
+    assert.match(wakeInfo.detail, /recipient dark-factory-mode \(claude\)/);
+
+    const launch = launchFor({
+      mode: "inject",
+      harness: "claude",
+      cwd: dir,
+      sessionId: activeWakeSession,
+      message,
+    });
+    assert.ok(launch);
+    await spawnWake(path.join(dir, "wake.log"))(launch);
+
+    const exitCode = await wrapPromise;
+    assert.equal(exitCode, 0);
+    assert.equal(existsSync(activeSockPath), false);
+    assert.equal(await probe(target!), false);
+
+    const received = JSON.parse(readFileSync(outFile, "utf8")) as { line: string; wakeEnv: string };
+    assert.equal(received.wakeEnv, activeWakeSession);
+    assert.match(received.line, /\[switchboard\] Message from claude \(id=m1\)/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

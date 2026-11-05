@@ -914,6 +914,7 @@ ${rows.map(row).join("\n")}
 }
 
 export function zshLauncher(cli: string): string {
+  const quotedCli = shellQuote(cli);
   return `# switchboard              attach the per-repo grid, or start fresh sessions (switchboard.kdl)
 # switchboard --resume    attach, or continue each harness's latest session in this repo (switchboard-resume.kdl)
 # switchboard -c          same as --resume
@@ -921,15 +922,44 @@ export function zshLauncher(cli: string): string {
 switchboard() {
   if [[ \$1 == --resume || \$1 == -c || \$1 == --continue ]]; then
     shift
-    command node ${shellQuote(cli)} --resume "\$@"
+    command node ${quotedCli} --resume "\$@"
     return
   fi
   if (( \$# )); then
-    command node ${shellQuote(cli)} "\$@"
+    command node ${quotedCli} "\$@"
     return
   fi
-  command node ${shellQuote(cli)} start
-}`;
+  command node ${quotedCli} start
+}
+_switchboard_wrap() {
+  local bin=\$1
+  shift
+  if [[ ! -t 0 || ! -t 1 || -n "\$ZELLIJ" || -n "\$ZELLIJ_SESSION_NAME" || -n "\$TMUX" || -n "\$TMUX_PANE" || -n "\$SWITCHBOARD_WAKE_SESSION" || "\$SWITCHBOARD_NO_WRAP" == "1" ]]; then
+    command "\$bin" "\$@"
+    return
+  fi
+  case "\$1" in
+    mcp|auth|login|logout|config|plugin|plugins|doctor|update|upgrade|install|agents|attach|logs|stop|rm|exec|queue|help|version|status)
+      command "\$bin" "\$@"
+      return
+      ;;
+  esac
+  local arg
+  for arg in "\$@"; do
+    case "\$arg" in
+      -p|--print|-h|--help|-v|--version|--output-format*|--input-format*)
+        command "\$bin" "\$@"
+        return
+        ;;
+    esac
+  done
+  command node ${quotedCli} wrap "\$bin" "\$@"
+}
+claude() { _switchboard_wrap claude "\$@"; }
+grok() { _switchboard_wrap grok "\$@"; }
+muse() { _switchboard_wrap muse "\$@"; }
+kimi() { _switchboard_wrap kimi "\$@"; }
+cursor-agent() { _switchboard_wrap cursor-agent "\$@"; }`;
 }
 
 function paneBlock(pane: PaneSpec): string {
