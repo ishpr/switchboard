@@ -6,7 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import { BusClient } from "../src/busClient.ts";
 import { startDaemon, type DaemonHandle, isLoopback } from "../src/daemon.ts";
-import { formatMessage, hookStdout, shouldSkipHookForPrompt } from "../src/hook.ts";
+import { filterHookMessages, formatMessage, hookStdout, shouldSkipHookForPrompt } from "../src/hook.ts";
 import { gitRepoRoot, repoKey } from "../src/repo.ts";
 import { formatBoardState } from "../src/status.ts";
 import { Store } from "../src/store.ts";
@@ -1925,5 +1925,205 @@ test("rebind validates before mutation, preserves linked worktree cwd, clears pr
     peerA.close();
     peerB.close();
     await daemon.close();
+  }
+});
+
+test("four same-name Claude sessions support directed custom-topic delivery, hook filtering by sessionId, session-routed replies, session-scoped orchestrator claims, and new-row wake defaults", async () => {
+  const fx = await fixture();
+  const repoDir = mkdtempSync(path.join(tmpdir(), "sb-lathe-"));
+  execFileSync("git", ["init"], { cwd: repoDir, stdio: "ignore" });
+  const rKey = repoKey(repoDir);
+
+  const s1Uuid = "dd09f9b0-41e0-40c8-b7c4-ecfd0407549a";
+  const s2Uuid = "104c6460-a8d4-424a-9533-2640ba973657";
+  const s3Uuid = "63906089-9835-4983-aa6f-22f436e6a107";
+  const s4Uuid = "2997a9a0-8741-49e8-a9e6-1e808637513f";
+
+  const c1 = await join(fx, "claude", rKey, { cwd: repoDir, sessionId: s1Uuid, boundSession: true });
+  const c2 = await join(fx, "claude", rKey, { cwd: repoDir, sessionId: s2Uuid, boundSession: true });
+  const c3 = await join(fx, "claude", rKey, { cwd: repoDir, sessionId: s3Uuid, boundSession: true });
+  const c4 = await join(fx, "claude", rKey, { cwd: repoDir, sessionId: s4Uuid, boundSession: true });
+  const unboundClaude = await join(fx, "claude", rKey, { cwd: repoDir });
+
+  try {
+    // 1. Nameless/sessionless register with role='orchestrator' is rejected so it cannot make every 'claude' orchestrator
+    await assert.rejects(
+      unboundClaude.request({
+        type: "register",
+        name: "claude",
+        harness: "claude",
+        cwd: repoDir,
+        role: "orchestrator",
+      }),
+      /bound session id/,
+    );
+
+    // 2. Session 1 claims orchestrator via register; stores s1Uuid and marks only s1 as orchestrator in who
+    const reg1 = await c1.request({
+      type: "register",
+      name: "claude",
+      harness: "claude",
+      cwd: repoDir,
+      sessionId: s1Uuid,
+      role: "orchestrator",
+    });
+    assert.equal(reg1.type, "registered");
+    if (reg1.type === "registered") {
+      assert.equal(reg1.role, "orchestrator");
+      assert.equal(reg1.orchestrator, s1Uuid);
+      assert.equal(reg1.claimRejected, undefined);
+      // Existing row from hello had wake=false; omitting wake on existing row preserves wake=false
+      assert.equal(reg1.agent?.wake, false);
+    }
+
+    const who1 = await c1.request({ type: "who" });
+    assert.equal(who1.type, "who");
+    if (who1.type === "who") {
+      const r1 = who1.agents.find((a) => a.sessionId === s1Uuid);
+      const r2 = who1.agents.find((a) => a.sessionId === s2Uuid);
+      const r3 = who1.agents.find((a) => a.sessionId === s3Uuid);
+      const r4 = who1.agents.find((a) => a.sessionId === s4Uuid);
+      assert.equal(r1?.role, "orchestrator");
+      assert.equal(r2?.role, "worker");
+      assert.equal(r3?.role, "worker");
+      assert.equal(r4?.role, "worker");
+    }
+
+    // 3. Session 2 races to claim orchestrator while Session 1 is online -> rejected with winner info
+    const reg2Race = await c2.request({
+      type: "register",
+      name: "claude",
+      harness: "claude",
+      cwd: repoDir,
+      sessionId: s2Uuid,
+      role: "orchestrator",
+      wake: true,
+    });
+    assert.equal(reg2Race.type, "registered");
+    if (reg2Race.type === "registered") {
+      assert.equal(reg2Race.role, "worker");
+      assert.equal(reg2Race.orchestrator, s1Uuid);
+      assert.equal(reg2Race.claimRejected, true);
+      assert.match(reg2Race.claimDetail ?? "", new RegExp(s1Uuid));
+      assert.match(reg2Race.claimDetail ?? "", /do not retry/i);
+      assert.equal(reg2Race.agent?.wake, true);
+    }
+
+    // 4. New registration row (never seen before) defaults wake=true when wake is omitted
+    const newSessionUuid = "99999999-8888-4777-8666-555555555555";
+    const regNew = await unboundClaude.request({
+      type: "register",
+      name: "claude",
+      harness: "claude",
+      cwd: repoDir,
+      sessionId: newSessionUuid,
+    });
+    assert.equal(regNew.type, "registered");
+    if (regNew.type === "registered") {
+      assert.equal(regNew.created, true);
+      assert.equal(regNew.agent?.wake, true);
+    }
+
+    // 5. Directed publish on custom topic 'lathe-1.1' with to=s2Uuid is visible in s2's default inbox and NOT dropped by filterHookMessages
+    const pubRes = await c1.request({
+      type: "publish",
+      topic: "lathe-1.1",
+      to: s2Uuid,
+      body: "brief for lane 1.1",
+    });
+    assert.equal(pubRes.type, "published");
+
+    const c3Inbox = await c3.request({ type: "inbox" });
+    assert.equal(c3Inbox.type, "inbox");
+    if (c3Inbox.type === "inbox") {
+      assert.equal(c3Inbox.messages.some((m) => m.body === "brief for lane 1.1"), false);
+    }
+
+    const c2Inbox = await c2.request({ type: "inbox" });
+    assert.equal(c2Inbox.type, "inbox");
+    if (c2Inbox.type === "inbox") {
+      const msg = c2Inbox.messages.find((m) => m.body === "brief for lane 1.1");
+      assert.ok(msg, "directed custom-topic message must appear in recipient's default inbox");
+      assert.equal(msg.fromName, "claude");
+      assert.equal(msg.fromId, s1Uuid);
+      const hookFiltered = filterHookMessages(c2Inbox.messages, "claude", s2Uuid);
+      assert.equal(hookFiltered.length, 1);
+      assert.match(formatMessage(msg), new RegExp(`from_session=${s1Uuid}`));
+    }
+
+    // 6. Ask from s1 to s2Uuid and reply from s2 routes only to s1Uuid and closes the pending ask
+    const c3Pushed: BusMessage[] = [];
+    c3.onMessage = (f) => c3Pushed.push(f.message);
+    const askRes = await c1.request({
+      type: "ask",
+      to: s2Uuid,
+      topic: "lathe-1.1",
+      body: "implement dark-factory-mode",
+    });
+    assert.equal(askRes.type, "published");
+    if (askRes.type !== "published") return;
+    const cid = askRes.correlationId!;
+
+    const c2AskInbox = await c2.request({ type: "inbox" });
+    assert.equal(c2AskInbox.type, "inbox");
+    if (c2AskInbox.type === "inbox") {
+      assert.equal(c2AskInbox.pendingAsk?.correlationId, cid);
+    }
+
+    const c1ReplyPromise = waitForMessage(c1);
+    const replyRes = await c2.request({
+      type: "reply",
+      correlationId: cid,
+      body: "dark-factory-mode complete",
+    });
+    assert.equal(replyRes.type, "published");
+    const replyMsg = await c1ReplyPromise;
+    assert.equal(replyMsg.to, s1Uuid);
+    assert.equal(replyMsg.fromId, s2Uuid);
+    assert.equal(c3Pushed.some((m) => m.correlationId === cid), false);
+
+    const c2AfterReply = await c2.request({ type: "inbox" });
+    assert.equal(c2AfterReply.type, "inbox");
+    if (c2AfterReply.type === "inbox") {
+      assert.equal(c2AfterReply.pendingAsk, null);
+    }
+
+    // 7. Report from s3 routes only to s1Uuid (the session-scoped orchestrator), not s2 or s4
+    const c2Pushed: BusMessage[] = [];
+    c2.onMessage = (f) => c2Pushed.push(f.message);
+    const c1ReportPromise = waitForMessage(c1);
+    const reportRes = await c3.request({
+      type: "report",
+      body: "lane 3 finished onboarding check",
+    });
+    assert.equal(reportRes.type, "published");
+    const reportMsg = await c1ReportPromise;
+    assert.equal(reportMsg.to, s1Uuid);
+    assert.equal(c2Pushed.some((m) => m.topic === "reports"), false);
+
+    // 8. Once s1 disconnects, s2 can claim orchestrator and take over
+    c1.close();
+    await new Promise((r) => setTimeout(r, 40));
+    const reg2Takeover = await c2.request({
+      type: "register",
+      name: "claude",
+      harness: "claude",
+      cwd: repoDir,
+      sessionId: s2Uuid,
+      role: "orchestrator",
+    });
+    assert.equal(reg2Takeover.type, "registered");
+    if (reg2Takeover.type === "registered") {
+      assert.equal(reg2Takeover.role, "orchestrator");
+      assert.equal(reg2Takeover.orchestrator, s2Uuid);
+      assert.equal(reg2Takeover.claimRejected, undefined);
+    }
+  } finally {
+    c1.close();
+    c2.close();
+    c3.close();
+    c4.close();
+    unboundClaude.close();
+    await fx.daemon.close();
   }
 });

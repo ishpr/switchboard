@@ -258,11 +258,31 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       case "inbox":
         inbox(conn, frame.since, frame.topic, frame.limit, frame.ack, respond);
         break;
-      case "ack":
+      case "ack": {
         requireBoundRepo(conn);
-        store.ack(conn.repo, clientKey(conn), frame.cursor);
+        const key = clientKey(conn);
+        store.ack(conn.repo, key, frame.cursor);
+        const primary = store.getAgent(conn.repo, conn.name)?.sessionId;
+        const multiSession = [...conns].some(
+          (peer) =>
+            peer.authed &&
+            peer.repo === conn.repo &&
+            peer.name === conn.name &&
+            peer.declaredSession &&
+            peer.declaredSession !== (conn.declaredSession ?? primary),
+        );
+        if (!multiSession && primary && !primary.startsWith("zellij:")) {
+          const companionBase = conn.declaredSession === primary ? conn.name : `${conn.name}:${primary}`;
+          if (store.cursor(conn.repo, companionBase) < frame.cursor) {
+            store.ack(conn.repo, companionBase, frame.cursor);
+          }
+        }
+        clearPendingWakeTarget(conn.repo, conn.name, frame.cursor);
+        if (conn.sessionId) clearPendingWakeTarget(conn.repo, conn.sessionId, frame.cursor);
+        if (primary) clearPendingWakeTarget(conn.repo, primary, frame.cursor);
         respond({ type: "ok", detail: "acked" });
         break;
+      }
       case "doctor":
         await sendDoctor(conn, frame, respond);
         break;
@@ -493,9 +513,10 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     const effectiveCwd = frame.cwd === "/" ? resolveShimCwd("/") : frame.cwd;
     const effectiveRepo = frame.cwd === "/" && effectiveCwd !== "/" ? repoKey(effectiveCwd) : frame.repoKey;
     const declaredSession = frame.sessionId || null;
-    const existing =
-      (declaredSession ? store.getAgentBySession(effectiveRepo, declaredSession) : undefined) ??
-      store.getAgent(effectiveRepo, frame.name);
+    const byName = store.getAgent(effectiveRepo, frame.name);
+    const existing = declaredSession
+      ? (store.getAgentBySession(effectiveRepo, declaredSession) ?? (!byName?.sessionId ? byName : undefined))
+      : byName;
     conn.authed = true;
     conn.agentId = randomUUID();
     conn.name = frame.name;
@@ -521,7 +542,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     const existingStatus = existing?.status === "invited" ? undefined : existing?.status;
     conn.status = [...conns].find((peer) => peer !== conn && peer.authed && groupKey(peer) === groupKey(conn))?.status
       || frame.status || existingStatus || "online";
-    conn.role = conn.cwd === "/" ? "worker" : elect(conn.repo, conn.name, frame.role === "orchestrator");
+    conn.role = conn.cwd === "/" ? "worker" : elect(conn.repo, conn.name, frame.role === "orchestrator", conn.sessionId);
     if (conn.cwd !== "/") {
       restoreSubscriptions(conn);
       if (declaredSession && !declaredSession.startsWith("zellij:")) {
@@ -584,12 +605,68 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     }
   }
 
-  function elect(repo: string, name: string, wants: boolean): Role {
+  function isSessionOrchestratorValue(repo: string, orchestrator: string): boolean {
+    if (looksLikeSessionTarget(orchestrator)) return true;
+    if (store.getAgentBySession(repo, orchestrator)) return true;
+    for (const peer of conns) {
+      if (
+        peer.authed &&
+        peer.repo === repo &&
+        peer.harness !== "cli" &&
+        (peer.sessionId === orchestrator || peer.declaredSession === orchestrator)
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function isOrchestratorTarget(
+    repo: string,
+    orchestrator: string | null,
+    peer: { name: string; sessionId?: string | null; declaredSession?: string | null },
+  ): boolean {
+    if (!orchestrator) return false;
+    if (peer.sessionId && peer.sessionId === orchestrator) return true;
+    if (peer.declaredSession && peer.declaredSession === orchestrator) return true;
+    if (isSessionOrchestratorValue(repo, orchestrator)) return false;
+    return peer.name === orchestrator;
+  }
+
+  function hasLiveOrchestratorSocket(repo: string, orchestrator: string | null): boolean {
+    if (!orchestrator) return false;
+    return [...conns].some(
+      (peer) =>
+        peer.authed &&
+        peer.repo === repo &&
+        peer.harness !== "cli" &&
+        !peer.waitOnly &&
+        isOrchestratorTarget(repo, orchestrator, peer),
+    );
+  }
+
+  function syncOrchestratorRoles(repo: string): void {
+    const currentOrch = store.getOrchestrator(repo);
+    for (const peer of conns) {
+      if (!peer.authed || peer.repo !== repo) continue;
+      if (isOrchestratorTarget(repo, currentOrch, peer)) {
+        peer.role = "orchestrator";
+        peer.topics.add("reports");
+      } else if (peer.role === "orchestrator") {
+        peer.role = "worker";
+        if (!store.subscriptions(repo, subscriptionKey(peer)).has("reports")) {
+          peer.topics.delete("reports");
+        }
+      }
+    }
+  }
+
+  function elect(repo: string, name: string, wants: boolean, sessionId?: string | null): Role {
     let stored = store.getOrchestrator(repo);
     if (!stored) {
       const cfgOrch = readRepoConfigByKey(repo)?.orchestrator?.trim();
       if (cfgOrch) {
-        const canonical = resolveOrchestratorName(cfgOrch);
+        const canonical = looksLikeSessionTarget(cfgOrch) ? cfgOrch : resolveOrchestratorName(cfgOrch);
         if (NAME_RE.test(canonical)) {
           store.setOrchestrator(repo, canonical);
           stored = canonical;
@@ -597,7 +674,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       }
     }
     if (stored) {
-      return stored === name ? "orchestrator" : "worker";
+      return isOrchestratorTarget(repo, stored, { name, sessionId }) ? "orchestrator" : "worker";
     }
     if (!wants) return "worker";
     store.setOrchestrator(repo, name);
@@ -605,30 +682,24 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
   }
 
   function applyOrchestrator(conn: Conn, rawName: string, resolveAlias = false): void {
-    const nextOrch = resolveAlias ? resolveOrchestratorName(rawName.trim()) : rawName.trim();
+    const trimmed = rawName.trim();
+    const nextOrch =
+      resolveAlias && !looksLikeSessionTarget(trimmed) ? resolveOrchestratorName(trimmed) : trimmed;
     requireName(nextOrch);
     const currentOrch = store.getOrchestrator(conn.repo);
     if (
       currentOrch &&
       currentOrch !== nextOrch &&
       conn.name !== currentOrch &&
-      conn.harness !== "cli"
+      conn.sessionId !== currentOrch &&
+      conn.declaredSession !== currentOrch &&
+      conn.harness !== "cli" &&
+      hasLiveOrchestratorSocket(conn.repo, currentOrch)
     ) {
       throw new Error(`orchestrator is already ${currentOrch}; only ${currentOrch} or the CLI can reassign it`);
     }
     store.setOrchestrator(conn.repo, nextOrch);
-    for (const peer of conns) {
-      if (!peer.authed || peer.repo !== conn.repo) continue;
-      if (peer.name === nextOrch) {
-        peer.role = "orchestrator";
-        peer.topics.add("reports");
-      } else if (peer.role === "orchestrator") {
-        peer.role = "worker";
-        if (!store.subscriptions(conn.repo, subscriptionKey(peer)).has("reports")) {
-          peer.topics.delete("reports");
-        }
-      }
-    }
+    syncOrchestratorRoles(conn.repo);
   }
 
   function setOrchestrator(conn: Conn, name: string | undefined, respond: Respond): void {
@@ -756,7 +827,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       repo: conn.repo,
       id: frame.id || randomUUID(),
       topic: frame.topic,
-      fromId: conn.agentId,
+      fromId: conn.sessionId || conn.declaredSession || conn.name,
       fromName: conn.name,
       body: frame.body,
       ts: Date.now(),
@@ -870,7 +941,9 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       requireBody(body);
       const name = store.getOrchestrator(conn.repo);
       if (!name) throw new Error("no orchestrator yet");
-      if (conn.role === "orchestrator") throw new Error("the orchestrator reads reports in bus_inbox");
+      if (conn.role === "orchestrator" || isOrchestratorTarget(conn.repo, name, conn)) {
+        throw new Error("the orchestrator reads reports in bus_inbox");
+      }
       await publish(conn, { topic: "reports", body, to: name }, respond);
     } catch (error) {
       const message = error instanceof Error ? error.message : "request failed";
@@ -899,9 +972,21 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       (conn.sessionId !== null && conn.sessionId === askMessage.to) ||
       (conn.declaredSession !== null && conn.declaredSession === askMessage.to) ||
       (!conn.sessionBound && targetSessionOwner === conn.name);
-    if (!isRecipient && conn.name !== askMessage.fromName) throw new Error("only ask participants may reply");
+    const isSender =
+      conn.sessionId || conn.declaredSession
+        ? conn.sessionId === askMessage.fromId ||
+          conn.declaredSession === askMessage.fromId ||
+          (askMessage.fromId === askMessage.fromName && conn.name === askMessage.fromName)
+        : conn.name === askMessage.fromName;
+    if (!isRecipient && !isSender) throw new Error("only ask participants may reply");
+    const senderTarget =
+      askMessage.fromId &&
+      askMessage.fromId !== askMessage.fromName &&
+      describeTarget(conn.repo, askMessage.fromId)
+        ? askMessage.fromId
+        : askMessage.fromName;
     const target =
-      conn.name === askMessage.fromName && !isRecipient && askMessage.to ? askMessage.to : askMessage.fromName;
+      isSender && !isRecipient && askMessage.to ? askMessage.to : senderTarget;
     await publish(
       conn,
       {
@@ -1069,6 +1154,16 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     requireName(frame.name);
     if (!frame.cwd || frame.cwd === "/") throw new Error('cannot register: cwd is "/"');
     if (!frame.harness) throw new Error("harness required");
+    if (frame.role !== undefined && frame.role !== "orchestrator" && frame.role !== "worker") {
+      throw new Error("role must be orchestrator or worker");
+    }
+    const claimSessionId =
+      frame.sessionId ||
+      (conn.harness !== "cli" && conn.name === frame.name ? (conn.sessionId || conn.declaredSession) : null) ||
+      null;
+    if (frame.role === "orchestrator" && !claimSessionId) {
+      throw new Error("cannot claim orchestrator without a bound session id");
+    }
     const isRebind = conn.cwd === "/" || Boolean(frame.rebind && conn.harness !== "cli");
     let nextCwd = frame.cwd;
     let nextRepo = conn.repo;
@@ -1118,12 +1213,13 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       }
       conn.cwd = nextCwd;
       conn.repo = nextRepo;
-      conn.role = elect(conn.repo, conn.name, conn.role === "orchestrator");
+      conn.role = elect(conn.repo, conn.name, conn.role === "orchestrator", claimSessionId);
     }
     store.evictCrossRepoBinding(conn.repo, frame.sessionId, frame.wakeSessionId);
+    const byName = store.getAgent(conn.repo, frame.name);
     const existing = frame.sessionId
-      ? (store.getAgentBySession(conn.repo, frame.sessionId) ?? store.getAgent(conn.repo, frame.name))
-      : store.getAgent(conn.repo, frame.name);
+      ? (store.getAgentBySession(conn.repo, frame.sessionId) ?? (!byName?.sessionId ? byName : undefined))
+      : byName;
     if (frame.sessionId) {
       store.migrateSubscriptions(conn.repo, `name:${frame.name}`, frame.sessionId);
     }
@@ -1138,7 +1234,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       frame.branch !== undefined || frame.head !== undefined
         ? { branch: frame.branch ?? null, head: frame.head ?? null }
         : gitCheckoutInfo(nextCwd);
-    const wake = frame.wake === undefined ? (existing?.wake ?? conn.wake) : frame.wake;
+    const wake = frame.wake === undefined ? (existing ? existing.wake : true) : frame.wake;
     const existingStatus =
       existing?.status === "invited"
         ? (conn.harness !== "cli" && conn.name === frame.name ? "online" : "registered")
@@ -1205,13 +1301,50 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         restoreSubscriptions(peer);
       }
     }
+    let claimRejected: boolean | undefined;
+    let claimDetail: string | undefined;
+    if (frame.role === "orchestrator" && claimSessionId) {
+      const currentOrch = store.getOrchestrator(conn.repo);
+      const canClaim =
+        !currentOrch ||
+        currentOrch === claimSessionId ||
+        (!isSessionOrchestratorValue(conn.repo, currentOrch) && currentOrch === frame.name) ||
+        !hasLiveOrchestratorSocket(conn.repo, currentOrch);
+      if (canClaim) {
+        store.setOrchestrator(conn.repo, claimSessionId);
+        syncOrchestratorRoles(conn.repo);
+      } else {
+        claimRejected = true;
+        claimDetail = `orchestrator role is already claimed by ${currentOrch} (online); registered as worker — do not retry claiming orchestrator`;
+        syncOrchestratorRoles(conn.repo);
+      }
+    } else if (frame.role === "worker") {
+      const currentOrch = store.getOrchestrator(conn.repo);
+      if (claimSessionId && currentOrch === claimSessionId) {
+        store.setOrchestrator(conn.repo, "");
+      }
+      syncOrchestratorRoles(conn.repo);
+      if (conn.harness !== "cli" && conn.name === frame.name) {
+        conn.role = "worker";
+      }
+    } else {
+      syncOrchestratorRoles(conn.repo);
+    }
+    const savedRole: Role = isOrchestratorTarget(conn.repo, store.getOrchestrator(conn.repo), {
+      name: saved.name,
+      sessionId: saved.sessionId,
+      declaredSession: saved.sessionId,
+    })
+      ? "orchestrator"
+      : "worker";
     respond({
       type: "registered",
       name: frame.name,
-      agent: saved,
+      agent: { ...saved, role: savedRole },
       created: !existing,
-      role: conn.role,
-      orchestrator: store.getOrchestrator(conn.repo),
+      role: conn.harness === "cli" ? savedRole : conn.role,
+      orchestrator: store.getOrchestrator(conn.repo) || null,
+      ...(claimRejected ? { claimRejected, claimDetail } : {}),
     });
   }
 
@@ -1617,7 +1750,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         lastSeen: Math.max(...members.map((member) => member.lastSeen)),
         online: true,
         status: conn.status === "invited" ? "online" : (conn.status || "online"),
-        role: conn.role,
+        role: isOrchestratorTarget(repo, orchestrator, conn) ? "orchestrator" : "worker",
         connectionCount: counted.length,
         connectionIds: counted.map((member) => member.agentId),
         builds: counted.flatMap((member) => (member.build ? [member.build] : [])),
@@ -1652,7 +1785,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
             ? (row.wakeSessionId || row.sessionId || null)
             : (row.sessionId || row.wakeSessionId || null),
         connectionCount: 0,
-        role: row.name === orchestrator ? "orchestrator" : "worker",
+        role: isOrchestratorTarget(repo, orchestrator, row) ? "orchestrator" : "worker",
         ratio: discoverRatioBinding({ cwd: row.cwd, harness: row.harness, name: row.name }),
       });
     }

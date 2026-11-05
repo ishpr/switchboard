@@ -173,6 +173,7 @@ export type ClientFrame = (
       branch?: string | null;
       head?: string | null;
       wake?: boolean;
+      role?: Role;
     }
   | {
       type: "state";
@@ -213,7 +214,16 @@ export type ServerFrame = (
   | { type: "who"; agents: AgentRecord[]; daemon?: RuntimeInfo }
   | { type: "doctor"; agents: AgentRecord[]; pruned: PrunedAgent[]; daemon?: RuntimeInfo }
   | { type: "orchestrator"; orchestrator: string | null }
-  | { type: "registered"; name: string; agent?: AgentRecord; created?: boolean; role?: Role; orchestrator?: string | null }
+  | {
+      type: "registered";
+      name: string;
+      agent?: AgentRecord;
+      created?: boolean;
+      role?: Role;
+      orchestrator?: string | null;
+      claimRejected?: boolean;
+      claimDetail?: string;
+    }
   | {
       type: "invited";
       repoKey: string;
