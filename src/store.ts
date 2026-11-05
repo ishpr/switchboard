@@ -25,10 +25,10 @@ const ANSWERED_ASK = `
   SELECT 1 FROM messages r WHERE r.repo = a.repo AND r.kind = 'reply'
     AND r.correlation_id = a.correlation_id
     AND COALESCE(r.reply_state, 'done') = 'done'
-    AND (r.from_name = a.to_name OR EXISTS (
+    AND (r.from_name = a.to_name OR r.from_id = a.to_name OR EXISTS (
       SELECT 1 FROM agents ag WHERE ag.repo = a.repo AND ag.session_id = a.to_name AND ag.name = r.from_name
     ))
-    AND r.to_name = a.from_name AND r.seq > a.seq
+    AND (r.to_name = a.from_name OR r.to_name = a.from_id) AND r.seq > a.seq
   UNION ALL
   SELECT 1 FROM messages s WHERE s.repo = a.repo AND s.kind = 'ask'
     AND s.supersedes = a.correlation_id AND s.seq > a.seq
@@ -332,7 +332,11 @@ export class Store {
        ), latency AS (
          SELECT a.to_name AS agent, AVG(MAX(0, (
            SELECT r.ts FROM messages r WHERE r.repo = a.repo AND r.kind = 'reply'
-             AND r.correlation_id = a.correlation_id AND r.from_name = a.to_name AND r.to_name = a.from_name AND r.seq > a.seq
+             AND r.correlation_id = a.correlation_id
+             AND (r.from_name = a.to_name OR r.from_id = a.to_name OR EXISTS (
+               SELECT 1 FROM agents ag WHERE ag.repo = a.repo AND ag.session_id = a.to_name AND ag.name = r.from_name
+             ))
+             AND (r.to_name = a.from_name OR r.to_name = a.from_id) AND r.seq > a.seq
            ORDER BY r.seq LIMIT 1
          ) - a.ts) / 1000.0) AS avg_latency
          FROM messages a WHERE a.repo = ? AND a.kind = 'ask' AND a.correlation_id IS NOT NULL
@@ -848,10 +852,14 @@ export class Store {
     const row = this.db
       .prepare("SELECT orchestrator FROM roles WHERE repo = ?")
       .get(repo) as { orchestrator: string } | undefined;
-    return row?.orchestrator ?? null;
+    return row?.orchestrator || null;
   }
 
-  setOrchestrator(repo: string, name: string): void {
+  setOrchestrator(repo: string, name: string | null): void {
+    if (!name) {
+      this.db.prepare("DELETE FROM roles WHERE repo = ?").run(repo);
+      return;
+    }
     this.db
       .prepare(
         `INSERT INTO roles (repo, orchestrator) VALUES (?, ?)

@@ -21,7 +21,7 @@ import { formatAgentMetrics, formatBoardState, formatPendingAsks } from "./statu
 import { BusClient } from "./busClient.ts";
 import { startDaemon } from "./daemon.ts";
 import { ensureDaemon, readDaemonInfo } from "./ensure.ts";
-import { hookStdout, shouldSkipHookForPrompt, supportsHookOutput } from "./hook.ts";
+import { filterHookMessages, hookStdout, shouldSkipHookForPrompt, supportsHookOutput } from "./hook.ts";
 import { daemonInfoPath, dbPath, switchboardHome, wakeLogPath } from "./paths.ts";
 import { gitCheckoutInfo, repoKey, type RepoScope } from "./repo.ts";
 import { runShim } from "./shim.ts";
@@ -1133,9 +1133,7 @@ async function hook(): Promise<void> {
       ...(nonAckingHook ? { ack: false } : {}),
     });
     if (frame.type !== "inbox") return;
-    const filtered = frame.messages.filter(
-      (m) => m.topic !== "presence" && m.fromName !== callerName,
-    );
+    const filtered = filterHookMessages(frame.messages, callerName, stdinSessionId);
     const stopHookActive = Boolean(stdinJson && stdinJson.stop_hook_active === true);
     process.stdout.write(
       hookStdout(harness, event, filtered, frame.pendingAsk ?? null, stopHookActive),

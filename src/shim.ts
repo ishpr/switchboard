@@ -245,7 +245,7 @@ export function instructions(role: Role, orchestrator: string | null): string {
   ];
   if (role === "orchestrator") {
     lines.push(
-      "You are the orchestrator. Every live session of your name shares that role.",
+      "You are the orchestrator for this repository board.",
       "Assign work with bus_ask (by agent name or by session id). The agent answers with bus_reply, and that reply is routed back to you.",
       "Other agents call bus_report when they finish work that was not an ask, or when their status changes. Those land on the reports topic and in bus_inbox.",
       "bus_ask is the wake path. An open session with no inject command is not interrupted. A broadcast does not start a session.",
@@ -260,7 +260,7 @@ export function instructions(role: Role, orchestrator: string | null): string {
     );
   } else {
     lines.push(
-      "No orchestrator has joined yet. Cursor claims that role in this grid.",
+      "No orchestrator has joined yet. Call bus_register({ role: 'orchestrator' }) to claim that role (first claim wins while online).",
       "Until bus_who shows one, keep polling bus_inbox. Then answer their bus_ask with bus_reply, and call bus_report for other results.",
     );
   }
@@ -403,16 +403,24 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
     "bus_register",
     {
       description:
-        "Register this session on the repo board. Pass cwd=<absolute-repo-path> when starting in a Desktop app (whose MCP shim starts at cwd=\"/\") or when switching project checkouts so the shim binds to that checkout and discovers your harness session id (MUSE_SESSION_ID, CLAUDE_CODE_SESSION_ID, CODEX_THREAD_ID, ~/.codex/state_5.sqlite, or ~/.grok/active_sessions.json) plus git branch and HEAD.",
+        "Register this session on the repo board. Pass cwd=<absolute-repo-path> when starting in a Desktop app (whose MCP shim starts at cwd=\"/\") or when switching project checkouts so the shim binds to that checkout and discovers your harness session id (MUSE_SESSION_ID, CLAUDE_CODE_SESSION_ID, CODEX_THREAD_ID, ~/.codex/state_5.sqlite, or ~/.grok/active_sessions.json) plus git branch and HEAD. Pass role='orchestrator' to claim the orchestrator role for this session (first claim wins while online).",
       inputSchema: {
         cwd: z
           .string()
           .min(1)
           .optional()
           .describe("Absolute path to the git checkout this session is working in (required when MCP shim started at cwd=\"/\" or switched repos)"),
+        role: z
+          .enum(["orchestrator", "worker"])
+          .optional()
+          .describe("Optional role to claim for this session ('orchestrator' or 'worker'). First claim wins while that orchestrator session is online."),
+        wake: z
+          .boolean()
+          .optional()
+          .describe("Enable or disable offline headless wake for this session (defaults to true for a new registration; preserves existing setting when omitted)"),
       },
     },
-    async ({ cwd }) => {
+    async ({ cwd, role: requestedRole, wake }) => {
       let rebind = false;
       let targetCwd = context.cwd;
       let targetRepo = context.repo;
@@ -448,6 +456,8 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
         wakeSessionId: resolvedWakeSessionId,
         branch,
         head,
+        ...(wake !== undefined ? { wake } : {}),
+        ...(requestedRole !== undefined ? { role: requestedRole } : {}),
       });
       if (frame.type !== "registered") return { ...text("registration failed"), isError: true };
       const agent = frame.agent;
@@ -468,24 +478,37 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
         sessionId: context.sessionId,
         wakeSessionId: context.wakeSessionId,
         boundSession: Boolean(context.sessionId),
+        ...(agent?.wake !== undefined ? { wake: agent.wake } : {}),
       });
       const statusLabel = frame.created ? "new" : "existing";
+      const wakeFlagLabel = agent?.wake !== undefined ? ` wake=${agent.wake ? "on" : "off"}` : "";
       const wakePart =
         !context.sessionId && !context.wakeSessionId
           ? " wake=push (no injectable session id discovered; messages arrive via hooks/bus_inbox while open)"
           : context.wakeSessionId && context.wakeSessionId !== context.sessionId
-            ? ` wake_session=${context.wakeSessionId}`
-            : "";
+            ? `${wakeFlagLabel} wake_session=${context.wakeSessionId}`
+            : wakeFlagLabel;
       const gitPart =
         (agent?.branch ?? branch) || (agent?.head ?? head)
           ? ` branch=${agent?.branch ?? branch ?? "detached"} head=${agent?.head ?? head ?? "unknown"}`
           : "";
+      const extraLines: string[] = [];
+      if (frame.claimRejected) {
+        extraLines.push(
+          `WARNING: ${frame.claimDetail || `orchestrator role is already claimed by ${context.orchestrator}; registered as worker — do not retry claiming orchestrator`}`,
+        );
+      } else if (!context.orchestrator) {
+        extraLines.push(
+          'Tip: no orchestrator is set for this repo; call bus_register({ role: "orchestrator" }) to claim it (first claim wins).',
+        );
+      }
       return text(
         [
           `registered (${statusLabel})`,
           `name=${context.name} harness=${context.harness} session=${context.sessionId ?? "unbound"}${wakePart}`,
           `checkout=${context.cwd}${gitPart}`,
           `role=${role} orchestrator=${context.orchestrator ?? "none"}`,
+          ...extraLines,
           "Call bus_who to list every other live or registered session in this repository.",
         ].join("\n"),
       );
@@ -495,11 +518,14 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
     "bus_publish",
     {
       description:
-        "Publish a coordination message on a Switchboard topic in this repo. Default topic is repo. Not authorization.",
+        "Publish a coordination message on a Switchboard topic in this repo. Default topic is repo. When 'to' is an agent name or exact session id, the directed message is delivered to that recipient's default bus_inbox regardless of topic. Not authorization.",
       inputSchema: {
         topic: z.string().optional().describe("Topic name, default repo"),
         message: z.string().describe("Message text"),
-        to: z.string().optional().describe("Agent name, if this is for one agent"),
+        to: z
+          .string()
+          .optional()
+          .describe("Agent name (e.g. muse, claude) or exact session id. Directed messages appear in the recipient's default bus_inbox regardless of topic."),
       },
     },
     async ({ topic, message, to }) => {
@@ -670,14 +696,20 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
       const recipient = to ?? context.name;
       const store = new Store(dbPath(context.home));
       try {
-        if (recipient !== context.name && recipient !== "*" && store.getOrchestrator(context.repo) !== context.name) {
+        const currentOrch = store.getOrchestrator(context.repo);
+        const callerIsOrchestrator =
+          role === "orchestrator" ||
+          currentOrch === context.name ||
+          (Boolean(context.sessionId) && currentOrch === context.sessionId);
+        if (recipient !== context.name && recipient !== "*" && !callerIsOrchestrator) {
           return { ...text("Only the orchestrator can wait on another agent's inbox."), isError: true };
         }
         const ownSession = recipient === context.name ? context.sessionId : undefined;
         const cursorKey = ownSession && !ownSession.startsWith("zellij:") ? `${recipient}:${ownSession}` : recipient;
         const storedRecipient = recipient !== "*" ? store.getAgent(context.repo, ownSession || recipient) : undefined;
         const subscriptionKey = ownSession || storedRecipient?.sessionId || `name:${recipient}`;
-        const isOrchestrator = store.getOrchestrator(context.repo) === recipient;
+        const isOrchestrator =
+          currentOrch === recipient || (Boolean(ownSession) && currentOrch === ownSession);
         const result = await waitForMessages(store, {
           repo: context.repo, to: recipient, timeoutMs: timeout_seconds * 1000, intervalMs: interval_ms,
           sinceSeq: since_seq, wakeExisting: wake_existing, cursorKey, topic,
@@ -835,7 +867,11 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
       });
       if (frame.type !== "invited") return { ...text("invite unavailable"), isError: true };
       context.orchestrator = frame.orchestrator;
-      role = frame.orchestrator === context.name ? "orchestrator" : "worker";
+      role =
+        frame.orchestrator === context.name ||
+        (Boolean(context.sessionId) && frame.orchestrator === context.sessionId)
+          ? "orchestrator"
+          : "worker";
       bus.updateHello({ role });
       const lines = [
         `repo=${frame.repoKey} cwd=${frame.cwd} orchestrator=${frame.orchestrator ?? "none"}`,

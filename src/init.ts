@@ -244,12 +244,13 @@ export function formatRatioBinding(ratio?: RatioBinding | null): string {
 }
 
 export function resolveOrchestratorName(input: string, fallback = "cursor"): string {
-  const raw = input.trim().toLowerCase();
-  if (!raw) return fallback;
+  const trimmed = input.trim();
+  if (!trimmed) return fallback;
+  const raw = trimmed.toLowerCase();
   if (raw === "antigravity" || raw === "argon" || raw === "argon4" || raw === "argon-4") return "agy";
   if (raw === "orchestrator" || raw === "cursor-agent") return "cursor";
   if (raw === "kimi-cli") return "kimi";
-  return raw;
+  return trimmed;
 }
 
 /**

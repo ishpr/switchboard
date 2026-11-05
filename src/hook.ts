@@ -89,12 +89,31 @@ export function hookStdout(
   return "";
 }
 
+export function filterHookMessages(
+  messages: BusMessage[],
+  callerName: string,
+  sessionId?: string,
+): BusMessage[] {
+  return messages.filter((m) => {
+    if (m.topic === "presence") return false;
+    if (sessionId) {
+      return m.fromId !== sessionId;
+    }
+    if (m.to && m.to !== "*") {
+      return true;
+    }
+    return m.fromName !== callerName;
+  });
+}
+
 export function formatMessage(message: BusMessage): string {
+  const fromSessionTag =
+    message.fromId && message.fromId !== message.fromName ? ` from_session=${message.fromId}` : "";
   const stateTag =
     message.kind === "reply" && message.replyState ? ` state=${message.replyState}` : "";
   const supersedesTag =
     message.kind === "ask" && message.supersedes ? ` supersedes=${message.supersedes}` : "";
-  const head = `[switchboard] ${message.fromName} on ${message.topic} id=${message.id}${
+  const head = `[switchboard] ${message.fromName} on ${message.topic} id=${message.id}${fromSessionTag}${
     message.correlationId ? ` correlation=${message.correlationId}` : ""
   }${stateTag}${supersedesTag}`;
   const footer =
