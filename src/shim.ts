@@ -13,7 +13,7 @@ import { formatAgentMetrics, formatBoardState, formatPendingAsks } from "./statu
 import { BusClient } from "./busClient.ts";
 import { ensureDaemon } from "./ensure.ts";
 import { formatRatioBinding, resolveShimCwd } from "./init.ts";
-import { Store, sessionHandle } from "./store.ts";
+import { Store } from "./store.ts";
 import { formatWaitResult, waitForMessages } from "./wait.ts";
 import { dbPath, switchboardHome } from "./paths.ts";
 import { gitCheckoutInfo, gitRepoRoot, repoKey } from "./repo.ts";
@@ -965,6 +965,13 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
       };
     },
   );
+}
+
+function sessionHandle(name: string, sessionId?: string | null, harness?: string): string {
+  if (!sessionId || !UUID_RE.test(sessionId)) return name;
+  const prefix = sessionId.slice(0, 4).toLowerCase();
+  if (!harness || name === harness) return `${name}-${prefix}`;
+  return name;
 }
 
 function formatInboxMessage(message: BusMessage): string {
