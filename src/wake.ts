@@ -99,7 +99,7 @@ export function decideWake(input: {
   if (input.online && harness === "claude") {
     return {
       mode: "push",
-      detail: `${recipientPrefix ? `${recipientPrefix} (claude)` : "claude session"} is open (no pane/tty/pty inject target); delivered to recipient's session inbox and turn hooks (idle prompt wakes if started inside switchboard/pty or with --channels)`,
+      detail: `${recipientPrefix ? `${recipientPrefix} (claude)` : "claude session"} is open (no pane/tty/pty inject target); delivered to recipient's session inbox and turn hooks (idle prompt wakes if started after 'source ~/.zshrc' for switchboard PTY wrap, inside Zellij/tmux, or with --dangerously-load-development-channels server:switchboard)`,
     };
   }
   if (input.online) {
@@ -337,14 +337,33 @@ function kimiBin(): string {
   return "kimi-cli";
 }
 
+export function augmentPath(envPath = process.env.PATH ?? ""): string {
+  const home = homedir();
+  const candidates = [
+    path.join(home, ".local/bin"),
+    path.join(home, ".grok/bin"),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+  ];
+  const parts = envPath.split(path.delimiter).filter(Boolean);
+  for (const dir of candidates) {
+    if (!parts.includes(dir)) parts.push(dir);
+  }
+  return parts.join(path.delimiter);
+}
+
 export type SpawnWake = (launch: WakeLaunch) => Promise<void>;
 
 export function spawnWake(logFile: string, options: { injectionTimeoutMs?: number } = {}): SpawnWake {
   return (launch) => new Promise((resolve, reject) => {
     const waitForExit = launch.completion === "exit";
+    const mergedEnv = launch.env ? { ...process.env, ...launch.env } : { ...process.env };
+    mergedEnv.PATH = augmentPath(mergedEnv.PATH);
     const child = spawn(launch.cmd, launch.args, {
       cwd: launch.cwd, detached: true,
-      env: launch.env ? { ...process.env, ...launch.env } : process.env,
+      env: mergedEnv,
       stdio: launch.stdin === undefined ? "ignore" : ["pipe", "ignore", "ignore"],
     });
     let settled = false;

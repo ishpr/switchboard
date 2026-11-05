@@ -659,11 +659,17 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
   function isOrchestratorTarget(
     repo: string,
     orchestrator: string | null,
-    peer: { name: string; sessionId?: string | null; declaredSession?: string | null },
+    peer: {
+      name: string;
+      sessionId?: string | null;
+      declaredSession?: string | null;
+      wakeSessionId?: string | null;
+    },
   ): boolean {
     if (!orchestrator) return false;
     if (peer.sessionId && peer.sessionId === orchestrator) return true;
     if (peer.declaredSession && peer.declaredSession === orchestrator) return true;
+    if (peer.wakeSessionId && peer.wakeSessionId === orchestrator) return true;
     if (isSessionOrchestratorValue(repo, orchestrator)) return false;
     return peer.name === orchestrator;
   }
@@ -965,7 +971,19 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
           .replace(/-+$/g, "");
       }
     }
-    const shortSuffix = opts.sessionId && UUID_RE.test(opts.sessionId) ? opts.sessionId.slice(0, 4).toLowerCase() : "";
+    const shortSuffix = opts.sessionId
+      ? UUID_RE.test(opts.sessionId)
+        ? opts.sessionId.slice(0, 4).toLowerCase()
+        : /^zellij:[^:]+:(\d+)$/.exec(opts.sessionId)?.[1]
+          ? `p${/^zellij:[^:]+:(\d+)$/.exec(opts.sessionId)![1]}`
+          : /^tmux:%(\d+)$/.exec(opts.sessionId)?.[1]
+            ? `t${/^tmux:%(\d+)$/.exec(opts.sessionId)![1]}`
+            : /^pty:.*sb-(\d+)\.sock$/.exec(opts.sessionId)?.[1]
+              ? `p${/^pty:.*sb-(\d+)\.sock$/.exec(opts.sessionId)![1]!.slice(-4)}`
+              : /^tty:\/dev\/ttys(\d+)$/.exec(opts.sessionId)?.[1]
+                ? `tty${/^tty:\/dev\/ttys(\d+)$/.exec(opts.sessionId)![1]}`
+                : ""
+      : "";
     if (candidate && candidate !== opts.harness && NAME_RE.test(candidate)) {
       if (!opts.usedNames.has(candidate)) {
         opts.usedNames.add(candidate);
@@ -1049,11 +1067,12 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         }
       >();
       for (const row of storedRows) {
-        if (!row.sessionId || looksLikePaneOrTtyTarget(row.sessionId)) continue;
-        sessionMap.set(row.sessionId, {
+        const sid = row.sessionId || row.wakeSessionId;
+        if (!sid) continue;
+        sessionMap.set(sid, {
           name: row.name,
           harness: row.harness,
-          sessionId: row.sessionId,
+          sessionId: sid,
           wakeSessionId: row.wakeSessionId ?? null,
           cwd: row.cwd,
           branch: row.branch ?? null,
@@ -1065,12 +1084,13 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       }
       for (const peer of conns) {
         if (!peer.authed || peer.repo !== repo || peer.harness === "cli" || peer.waitOnly) continue;
-        if (!peer.sessionBound || !peer.sessionId || looksLikePaneOrTtyTarget(peer.sessionId)) continue;
-        const prev = sessionMap.get(peer.sessionId);
-        sessionMap.set(peer.sessionId, {
+        const sid = peer.sessionId || peer.wakeSessionId;
+        if (!sid) continue;
+        const prev = sessionMap.get(sid);
+        sessionMap.set(sid, {
           name: peer.name,
           harness: peer.harness,
-          sessionId: peer.sessionId,
+          sessionId: sid,
           wakeSessionId: peer.wakeSessionId ?? prev?.wakeSessionId ?? null,
           cwd: peer.cwd !== "/" ? peer.cwd : (prev?.cwd ?? peer.cwd),
           branch: peer.branch ?? prev?.branch ?? null,
@@ -1660,12 +1680,28 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     if (frame.role !== undefined && frame.role !== "orchestrator" && frame.role !== "worker") {
       throw new Error("role must be orchestrator or worker");
     }
+    const checkRepo =
+      conn.cwd === "/" || Boolean(frame.rebind && conn.harness !== "cli")
+        ? (existsSync(frame.cwd) ? repoKey(frame.cwd) : conn.repo)
+        : conn.repo;
+    const hasSameNamePeer = [...conns].some(
+      (peer) =>
+        peer !== conn &&
+        peer.authed &&
+        peer.repo === checkRepo &&
+        peer.harness !== "cli" &&
+        !peer.waitOnly &&
+        peer.name === frame.name,
+    );
     const claimSessionId =
       frame.sessionId ||
-      (conn.harness !== "cli" && conn.name === frame.name ? (conn.sessionId || conn.declaredSession) : null) ||
-      null;
+      frame.wakeSessionId ||
+      (conn.harness !== "cli" && conn.name === frame.name
+        ? (conn.sessionId || conn.declaredSession || (conn.sessionBound ? conn.wakeSessionId : null))
+        : null) ||
+      (!hasSameNamePeer ? frame.name : null);
     if (frame.role === "orchestrator" && !claimSessionId) {
-      throw new Error("cannot claim orchestrator without a bound session id");
+      throw new Error("cannot claim orchestrator without a bound session id when multiple sessions share the same agent name");
     }
     const isRebind = conn.cwd === "/" || Boolean(frame.rebind && conn.harness !== "cli");
     let nextCwd = frame.cwd;
@@ -1852,6 +1888,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       name: saved.name,
       sessionId: saved.sessionId,
       declaredSession: saved.sessionId,
+      wakeSessionId: saved.wakeSessionId,
     })
       ? "orchestrator"
       : "worker";
@@ -2324,6 +2361,24 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     return rows;
   }
 
+  function requireBoundRepo(conn: Conn): void {
+    if (!conn.cwd || conn.cwd === "/" || !conn.repo) {
+      const activeCwds = new Set<string>();
+      for (const peer of conns) {
+        if (peer.authed && peer.cwd && peer.cwd !== "/") activeCwds.add(peer.cwd);
+      }
+      for (const r of store.listRepos()) {
+        for (const a of store.listAgents(r, new Set())) {
+          if (a.cwd && a.cwd !== "/") activeCwds.add(a.cwd);
+        }
+      }
+      const hint = activeCwds.size > 0 ? ` (active checkouts: ${[...activeCwds].sort().join(", ")})` : "";
+      throw new Error(
+        `session is not bound to a repository checkout (cwd is "/"); call bus_register({ cwd: "<absolute-repo-path>" }) first to bind this session to your current workspace${hint}`,
+      );
+    }
+  }
+
   replayDeferredWakes();
 
   return {
@@ -2350,14 +2405,6 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
 
 function send(socket: WebSocket, frame: ServerFrame): void {
   if (socket.readyState === socket.OPEN) socket.send(JSON.stringify(frame));
-}
-
-function requireBoundRepo(conn: Conn): void {
-  if (!conn.cwd || conn.cwd === "/" || !conn.repo) {
-    throw new Error(
-      'session is not bound to a repository checkout (cwd is "/"); call bus_register({ cwd: "<absolute-repo-path>" }) first to bind this session to your current workspace',
-    );
-  }
 }
 
 function looksLikeSessionTarget(to: string): boolean {

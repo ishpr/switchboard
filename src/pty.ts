@@ -251,6 +251,39 @@ except OSError:
 sys.exit(exit_code)
 `;
 
+export function normalizeHarnessArgs(harness: string, args: string[], env: NodeJS.ProcessEnv = process.env): string[] {
+  if (harness !== "claude") return args;
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (arg === "--channels" && i + 1 < args.length) {
+      const next = args[i + 1]!;
+      if (next === "switchboard" || next === "server:switchboard") {
+        out.push("--dangerously-load-development-channels", "server:switchboard");
+        i++;
+        continue;
+      }
+    }
+    if (arg === "--channels=switchboard" || arg === "--channels=server:switchboard") {
+      out.push("--dangerously-load-development-channels", "server:switchboard");
+      continue;
+    }
+    if (arg === "--dangerously-load-development-channels" && args[i + 1] === "switchboard") {
+      out.push("--dangerously-load-development-channels", "server:switchboard");
+      i++;
+      continue;
+    }
+    out.push(arg);
+  }
+  if (
+    env.SWITCHBOARD_CLAUDE_CHANNELS === "1" &&
+    !out.includes("--dangerously-load-development-channels")
+  ) {
+    out.unshift("--dangerously-load-development-channels", "server:switchboard");
+  }
+  return out;
+}
+
 export async function runPtyWrap(
   command: string,
   args: string[],
@@ -268,13 +301,7 @@ export async function runPtyWrap(
     SWITCHBOARD_WAKE_SESSION: wakeSessionId,
     SWITCHBOARD_HARNESS: (opts.env ?? process.env).SWITCHBOARD_HARNESS || inferredHarness,
   };
-  if (
-    inferredHarness === "claude" &&
-    env.SWITCHBOARD_CLAUDE_CHANNELS === "1" &&
-    !args.includes("--dangerously-load-development-channels")
-  ) {
-    args = ["--dangerously-load-development-channels", "server:switchboard", ...args];
-  }
+  args = normalizeHarnessArgs(inferredHarness, args, env);
   const pythonBin = existsSync("/usr/bin/python3") ? "/usr/bin/python3" : "python3";
   return await new Promise<number>((resolve, reject) => {
     const child = spawn(pythonBin, ["-c", PYTHON_PTY_RELAY, sockPath, command, ...args], {

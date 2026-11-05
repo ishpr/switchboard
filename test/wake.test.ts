@@ -12,13 +12,14 @@ import {
   missingSessionSource,
   parsePtySessionFromPs,
   parseTerminalTtyFromPs,
+  parseTmuxSessionFromPs,
   parseZellijSessionFromPs,
 } from "../src/shim.ts";
 import { createPaneProbe, paneTarget } from "../src/health.ts";
-import { runPtyWrap } from "../src/pty.ts";
+import { normalizeHarnessArgs, runPtyWrap } from "../src/pty.ts";
 import { DatabaseSync } from "node:sqlite";
 import type { BusMessage } from "../src/types.ts";
-import { decideWake, headlessLaunch, isCodexTurnInProgress, launchFor, promptFor, spawnWake } from "../src/wake.ts";
+import { augmentPath, decideWake, headlessLaunch, isCodexTurnInProgress, launchFor, promptFor, spawnWake } from "../src/wake.ts";
 
 const message: BusMessage = {
   id: "m1",
@@ -497,10 +498,27 @@ test("universal PTY relay wraps CLI processes, injects prompts over Unix socket,
   );
 
   try {
-    // 1. Verify parsePtySessionFromPs and discoverHarnessSession preserve UUID sessionId while binding pty: wakeSessionId
+    // 1. Verify parsePtySessionFromPs, parseTmuxSessionFromPs, normalizeHarnessArgs, augmentPath, and discoverHarnessSession
     const parsedPs = parsePtySessionFromPs("12345 SWITCHBOARD_WAKE_SESSION=pty:/tmp/sb-test.sock claude");
     assert.equal(parsedPs.ppid, 12345);
     assert.equal(parsedPs.session, "pty:/tmp/sb-test.sock");
+
+    const parsedTmux = parseTmuxSessionFromPs("54321 zsh -lc claude TMUX_PANE=%14 PATH=/usr/bin");
+    assert.equal(parsedTmux.ppid, 54321);
+    assert.equal(parsedTmux.session, "tmux:%14");
+
+    assert.deepEqual(normalizeHarnessArgs("claude", ["--resume", "abc", "--channels", "switchboard"]), [
+      "--resume",
+      "abc",
+      "--dangerously-load-development-channels",
+      "server:switchboard",
+    ]);
+    assert.deepEqual(normalizeHarnessArgs("claude", ["--channels=server:switchboard"]), [
+      "--dangerously-load-development-channels",
+      "server:switchboard",
+    ]);
+    assert.match(augmentPath("/usr/bin"), /\.local\/bin/);
+    assert.match(augmentPath("/usr/bin"), /\.grok\/bin/);
 
     const claudeUuid = "104c6460-a8d4-424a-9533-2640ba973657";
     const discovered = discoverHarnessSession({
