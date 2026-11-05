@@ -408,6 +408,78 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
     wakeSessionId?: string;
     subscribeWake?: (wake: () => void) => () => void;
   }): void {
+  const syncRegistrationWithDaemon = async () => {
+    if (!context.cwd || context.cwd === "/") return;
+    try {
+      const fresh = discoverHarnessSession({ cwd: context.cwd, harness: context.harness, env: process.env });
+      const resolvedSessionId = fresh.sessionId || context.sessionId;
+      const resolvedWakeSessionId = fresh.wakeSessionId || context.wakeSessionId || resolvedSessionId;
+      if (!resolvedSessionId) return;
+      const { branch, head } = gitCheckoutInfo(context.cwd);
+      const whoFrame = await bus.request({ type: "who" });
+      if (whoFrame.type === "who") {
+        const match = whoFrame.agents.find((a) => a.sessionId === resolvedSessionId);
+        if (match?.name && match.name !== context.name) {
+          context.name = match.name;
+        }
+        if (whoFrame.orchestrator !== undefined) {
+          context.orchestrator = whoFrame.orchestrator;
+        }
+      }
+      const regFrame = await bus.request({
+        type: "register",
+        name: context.name,
+        harness: context.harness,
+        cwd: context.cwd,
+        sessionId: resolvedSessionId,
+        wakeSessionId: resolvedWakeSessionId,
+        branch,
+        head,
+      });
+      if (regFrame.type === "registered") {
+        const agent = regFrame.agent;
+        context.name = agent?.name ?? context.name;
+        context.sessionId = (agent?.sessionId ?? resolvedSessionId) || undefined;
+        context.wakeSessionId = (agent?.wakeSessionId ?? resolvedWakeSessionId) || undefined;
+        if (regFrame.role) role = regFrame.role;
+        if (regFrame.orchestrator !== undefined) context.orchestrator = regFrame.orchestrator;
+        bus.updateHello({
+          name: context.name,
+          cwd: context.cwd,
+          repoKey: context.repo,
+          role,
+          branch,
+          head,
+          sessionId: context.sessionId,
+          wakeSessionId: context.wakeSessionId,
+          boundSession: Boolean(context.sessionId),
+          ...(agent?.wake !== undefined ? { wake: agent.wake } : {}),
+        });
+      }
+    } catch {
+      // Ignore transient reconnect races
+    }
+  };
+
+  const busWithHook = bus as BusClient & { _baseOnMessage?: typeof bus.onMessage; _initialRegistered?: boolean };
+  if (!busWithHook._baseOnMessage && bus.onMessage) {
+    busWithHook._baseOnMessage = bus.onMessage;
+  }
+  bus.onMessage = (frame) => {
+    if (frame.message.body.startsWith("[switchboard: SYSTEM RE-INIT]")) {
+      void syncRegistrationWithDaemon();
+    }
+    if (frame.message.topic === "presence") return;
+    busWithHook._baseOnMessage?.(frame);
+  };
+  if (busWithHook._initialRegistered) {
+    const reloadSyncTimer = setTimeout(() => {
+      void syncRegistrationWithDaemon();
+    }, 150);
+    reloadSyncTimer.unref?.();
+  }
+  busWithHook._initialRegistered = true;
+
   mcp.registerTool(
     "bus_register",
     {
@@ -547,14 +619,19 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
           .string()
           .optional()
           .describe("Agent name (e.g. muse, dark-factory), short session handle (e.g. claude-104c), or exact session id. Directed messages appear in the recipient's default bus_inbox regardless of topic."),
+        universal: z
+          .boolean()
+          .optional()
+          .describe("When true, broadcasts this message to the universal inbox across all active repository boards so every agent receives it"),
       },
     },
-    async ({ topic, message, to }) => {
+    async ({ topic, message, to, universal }) => {
       const frame = await bus.request({
         type: "publish",
         topic: topic || "repo",
         body: message,
         to,
+        ...(universal ? { universal: true } : {}),
       });
       return text(frame.type === "published" ? publishedText(frame) : "published");
     },
@@ -649,7 +726,7 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
             const wake = agent.wake ? "headless_wake=on" : "headless_wake=off";
             const handle =
               agent.sessionId && UUID_RE.test(agent.sessionId)
-                ? ` handle=${sessionHandle(agent.name, agent.sessionId, agent.harness)}`
+                ? ` handle=${agent.harness}-${agent.sessionId.slice(0, 4).toLowerCase()}`
                 : "";
             const session = `${handle}${agent.sessionId ? ` session=${agent.sessionId}` : ""}${agent.wakeSessionId && agent.wakeSessionId !== agent.sessionId ? ` wake_session=${agent.wakeSessionId}` : ""} connections=${agent.connectionCount ?? (agent.online ? 1 : 0)}`;
             const git = agent.branch || agent.head ? ` git=${agent.branch ?? "detached"}@${agent.head ?? "unknown"}` : "";
@@ -961,6 +1038,53 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
           cwd: frame.cwd,
           orchestrator: frame.orchestrator,
           invited: frame.invited,
+        },
+      };
+    },
+  );
+
+  mcp.registerTool(
+    "bus_reinit",
+    {
+      description:
+        "Force all sessions in this repo (or across all repos when universal=true) to re-initialize their Switchboard registration, auto-assigning distinct lane names from each session's role and git branch/worktree (e.g. 'orch', 'dark-factory-mode', 'onboarding') for sessions still named after their bare harness, and posting a system re-init directive to every session's inbox and turn hooks.",
+      inputSchema: {
+        universal: z
+          .boolean()
+          .optional()
+          .describe("When true, re-initializes sessions and broadcasts across all active repository boards (default false: current repo only)"),
+        assign_names: z
+          .boolean()
+          .optional()
+          .describe("Automatically assign distinct lane names (from role/git branch/worktree or short handle) to sessions still using a generic harness name like 'claude' (default true)"),
+        message: z
+          .string()
+          .optional()
+          .describe("Optional additional instructions to include in the system re-init broadcast"),
+      },
+    },
+    async ({ universal, assign_names, message }) => {
+      const frame = await bus.request({
+        type: "reinit",
+        universal,
+        assignNames: assign_names,
+        message,
+      });
+      if (frame.type !== "reinited") return { ...text("reinit failed"), isError: true };
+      const lines = [
+        frame.detail,
+        ...frame.updatedAgents.map(
+          (a) =>
+            `${a.newName}${a.oldName !== a.newName ? ` (was ${a.oldName})` : ""} handle=${a.handle} role=${a.role}${a.branch ? ` branch=${a.branch}` : ""} session=${a.sessionId ?? "unbound"}`,
+        ),
+      ];
+      return {
+        ...text(lines.join("\n")),
+        structuredContent: {
+          repos: frame.repos,
+          updated_agents: frame.updatedAgents,
+          notified_sockets: frame.notifiedSockets,
+          detail: frame.detail,
         },
       };
     },

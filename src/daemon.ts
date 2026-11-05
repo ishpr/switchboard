@@ -22,6 +22,7 @@ import {
   PRESENCE_TTL_MS,
   STATE_KEY_RE,
   TOPIC_RE,
+  UNIVERSAL_REPO,
   WAKE_COOLDOWN_MS,
   type BusMessage,
   type BuildInfo,
@@ -216,6 +217,9 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     switch (frame.type) {
       case "publish":
         await publish(conn, frame, respond);
+        break;
+      case "reinit":
+        await handleReinit(conn, frame, respond);
         break;
       case "subscribe": {
         requireBoundRepo(conn);
@@ -892,21 +896,27 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     const liveBoundSameName = allBoundSameName
       .filter((c) => c.online)
       .sort((a, b) => a.sessionId.localeCompare(b.sessionId));
-    if (liveBoundSameName.length > 1) {
-      const list = liveBoundSameName
+    const ambiguousCandidates =
+      liveBoundSameName.length > 1
+        ? liveBoundSameName
+        : allBoundSameName.length === 0 && !store.getAgent(repo, rawTo)
+          ? [...sessionCandidates.values()]
+              .filter((c) => c.online && c.harness === rawTo)
+              .sort((a, b) => a.sessionId.localeCompare(b.sessionId))
+          : [];
+    if (ambiguousCandidates.length > 1) {
+      const list = ambiguousCandidates
         .map((c) => {
-          const h = sessionHandle(c.name, c.sessionId, c.harness);
+          const shortH = `${c.harness}-${c.sessionId.slice(0, 4).toLowerCase()}`;
+          const label = c.name !== c.harness && c.name !== shortH ? `${c.name} (handle=${shortH}` : `${shortH} (`;
           const br = c.branch ? `, ${c.branch}` : "";
-          return `${h} (${c.role}${br}, session=${c.sessionId})`;
+          return `${label}${c.name !== c.harness && c.name !== shortH ? ", " : ""}${c.role}${br}, session=${c.sessionId})`;
         })
         .join("; ");
-      const firstHandle = sessionHandle(
-        liveBoundSameName[0]!.name,
-        liveBoundSameName[0]!.sessionId,
-        liveBoundSameName[0]!.harness,
-      );
+      const first = ambiguousCandidates[0]!;
+      const firstHandle = sessionHandle(first.name, first.sessionId, first.harness);
       throw new Error(
-        `ambiguous target "${rawTo}": ${liveBoundSameName.length} ${rawTo} sessions are online in this repo [${list}]. Specify a session handle (e.g. "${firstHandle}") or session UUID, or omit "to" on topic="repo" to broadcast.`,
+        `ambiguous target "${rawTo}": ${ambiguousCandidates.length} ${rawTo} sessions are online in this repo [${list}]. Specify a session handle (e.g. "${firstHandle}") or session UUID, or omit "to" on topic="repo" to broadcast.`,
       );
     }
     if (liveBoundSameName.length === 1 && allBoundSameName.length > 1) {
@@ -915,17 +925,363 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     return rawTo;
   }
 
+  function deriveLaneName(opts: {
+    name: string;
+    harness: string;
+    sessionId: string | null;
+    cwd: string;
+    branch: string | null;
+    isOrchestrator: boolean;
+    usedNames: Set<string>;
+  }): string {
+    if (opts.name !== opts.harness) {
+      opts.usedNames.add(opts.name);
+      return opts.name;
+    }
+    if (opts.isOrchestrator && !opts.usedNames.has("orch")) {
+      opts.usedNames.add("orch");
+      return "orch";
+    }
+    const rawBranch = opts.branch?.trim() || "";
+    const ignoredBranches = new Set(["main", "master", "develop", "dev", "head", "detached", "trunk"]);
+    let candidate = "";
+    if (rawBranch && !ignoredBranches.has(rawBranch.toLowerCase())) {
+      candidate = rawBranch
+        .replace(/^(?:worktree-|feature\/|feat\/|chore\/|fix\/|bugfix\/|hotfix\/|ws\/|claude\/)+/i, "")
+        .toLowerCase()
+        .replace(/[^a-z0-9_-]+/g, "-")
+        .replace(/^-+|-+$/g, "")
+        .slice(0, 28)
+        .replace(/-+$/g, "");
+    }
+    if (!candidate) {
+      const wtMatch = /\/(?:\.claude\/worktrees|claude-ws\/[^/]+)\/([^/]+)$/.exec(opts.cwd);
+      if (wtMatch?.[1]) {
+        candidate = wtMatch[1]
+          .toLowerCase()
+          .replace(/[^a-z0-9_-]+/g, "-")
+          .replace(/^-+|-+$/g, "")
+          .slice(0, 28)
+          .replace(/-+$/g, "");
+      }
+    }
+    const shortSuffix = opts.sessionId && UUID_RE.test(opts.sessionId) ? opts.sessionId.slice(0, 4).toLowerCase() : "";
+    if (candidate && candidate !== opts.harness && NAME_RE.test(candidate)) {
+      if (!opts.usedNames.has(candidate)) {
+        opts.usedNames.add(candidate);
+        return candidate;
+      }
+      if (shortSuffix) {
+        const withSuffix = `${candidate.slice(0, 23)}-${shortSuffix}`;
+        if (NAME_RE.test(withSuffix) && !opts.usedNames.has(withSuffix)) {
+          opts.usedNames.add(withSuffix);
+          return withSuffix;
+        }
+      }
+    }
+    if (shortSuffix) {
+      const handle = `${opts.harness}-${shortSuffix}`;
+      if (NAME_RE.test(handle) && !opts.usedNames.has(handle)) {
+        opts.usedNames.add(handle);
+        return handle;
+      }
+    }
+    opts.usedNames.add(opts.name);
+    return opts.name;
+  }
+
+  function allActiveRepos(conn: Conn): string[] {
+    const repos = new Set<string>(store.listRepos());
+    for (const peer of conns) {
+      if (peer.authed && peer.repo && peer.repo !== UNIVERSAL_REPO) repos.add(peer.repo);
+    }
+    if (conn.repo && conn.repo !== UNIVERSAL_REPO) repos.add(conn.repo);
+    repos.delete(UNIVERSAL_REPO);
+    return [...repos].sort();
+  }
+
+  async function handleReinit(
+    conn: Conn,
+    frame: Extract<ClientFrame, { type: "reinit" }>,
+    respond: Respond,
+  ): Promise<void> {
+    const assignNames = frame.assignNames !== false;
+    const targetRepos =
+      frame.universal || conn.cwd === "/" || !conn.repo ? allActiveRepos(conn) : [conn.repo];
+    const updatedAgents: Array<{
+      repo: string;
+      sessionId: string | null;
+      oldName: string;
+      newName: string;
+      handle: string;
+      cwd: string;
+      branch: string | null;
+      role: Role;
+    }> = [];
+    let notifiedSockets = 0;
+
+    for (const repo of targetRepos) {
+      const currentOrch = store.getOrchestrator(repo);
+      const storedRows = store.listAgents(repo, new Set());
+      const usedNames = new Set<string>();
+      for (const row of storedRows) {
+        if (row.name !== row.harness) usedNames.add(row.name);
+      }
+      for (const peer of conns) {
+        if (peer.authed && peer.repo === repo && peer.harness !== "cli" && peer.name !== peer.harness) {
+          usedNames.add(peer.name);
+        }
+      }
+
+      const sessionMap = new Map<
+        string,
+        {
+          name: string;
+          harness: string;
+          sessionId: string;
+          wakeSessionId: string | null;
+          cwd: string;
+          branch: string | null;
+          head: string | null;
+          wake: boolean;
+          status: string;
+          online: boolean;
+        }
+      >();
+      for (const row of storedRows) {
+        if (!row.sessionId || looksLikePaneOrTtyTarget(row.sessionId)) continue;
+        sessionMap.set(row.sessionId, {
+          name: row.name,
+          harness: row.harness,
+          sessionId: row.sessionId,
+          wakeSessionId: row.wakeSessionId ?? null,
+          cwd: row.cwd,
+          branch: row.branch ?? null,
+          head: row.head ?? null,
+          wake: row.wake,
+          status: row.status,
+          online: false,
+        });
+      }
+      for (const peer of conns) {
+        if (!peer.authed || peer.repo !== repo || peer.harness === "cli" || peer.waitOnly) continue;
+        if (!peer.sessionBound || !peer.sessionId || looksLikePaneOrTtyTarget(peer.sessionId)) continue;
+        const prev = sessionMap.get(peer.sessionId);
+        sessionMap.set(peer.sessionId, {
+          name: peer.name,
+          harness: peer.harness,
+          sessionId: peer.sessionId,
+          wakeSessionId: peer.wakeSessionId ?? prev?.wakeSessionId ?? null,
+          cwd: peer.cwd !== "/" ? peer.cwd : (prev?.cwd ?? peer.cwd),
+          branch: peer.branch ?? prev?.branch ?? null,
+          head: peer.head ?? prev?.head ?? null,
+          wake: prev?.wake ?? peer.wake,
+          status: peer.status || prev?.status || "online",
+          online: true,
+        });
+      }
+
+      // Sort so orchestrator is named first, then by sessionId for determinism
+      const candidates = [...sessionMap.values()].sort((a, b) => {
+        const aOrch = isOrchestratorTarget(repo, currentOrch, a) ? 0 : 1;
+        const bOrch = isOrchestratorTarget(repo, currentOrch, b) ? 0 : 1;
+        if (aOrch !== bOrch) return aOrch - bOrch;
+        return a.sessionId.localeCompare(b.sessionId);
+      });
+
+      const harnessCounts = new Map<string, number>();
+      for (const c of candidates) {
+        harnessCounts.set(c.harness, (harnessCounts.get(c.harness) ?? 0) + 1);
+      }
+
+      for (const c of candidates) {
+        const isOrch = isOrchestratorTarget(repo, currentOrch, c);
+        const oldName = c.name;
+        const shouldDerive =
+          assignNames &&
+          oldName === c.harness &&
+          ((harnessCounts.get(c.harness) ?? 0) > 1 || Boolean(c.branch) || isOrch);
+        const newName = shouldDerive
+          ? deriveLaneName({
+              name: oldName,
+              harness: c.harness,
+              sessionId: c.sessionId,
+              cwd: c.cwd,
+              branch: c.branch,
+              isOrchestrator: isOrch,
+              usedNames,
+            })
+          : oldName;
+        if (newName !== oldName) {
+          store.upsertAgent({
+            repo,
+            name: newName,
+            harness: c.harness,
+            sessionId: c.sessionId,
+            wakeSessionId: c.wakeSessionId,
+            cwd: c.cwd,
+            branch: c.branch,
+            head: c.head,
+            wake: c.wake,
+            status: c.status,
+            bySession: true,
+          });
+          store.migrateSessionCursors(repo, oldName, newName, c.sessionId);
+          for (const peer of conns) {
+            if (
+              peer.authed &&
+              peer.repo === repo &&
+              (peer.sessionId === c.sessionId || peer.declaredSession === c.sessionId)
+            ) {
+              peer.name = newName;
+            }
+          }
+          if (currentOrch === oldName && isOrch) {
+            store.setOrchestrator(repo, c.sessionId);
+          }
+        }
+        const shortHandle = UUID_RE.test(c.sessionId)
+          ? `${c.harness}-${c.sessionId.slice(0, 4).toLowerCase()}`
+          : sessionHandle(newName, c.sessionId, c.harness);
+        updatedAgents.push({
+          repo,
+          sessionId: c.sessionId,
+          oldName,
+          newName,
+          handle: shortHandle,
+          cwd: c.cwd,
+          branch: c.branch,
+          role: isOrch ? "orchestrator" : "worker",
+        });
+      }
+
+      const repoAgents = updatedAgents.filter((a) => a.repo === repo);
+      const rosterLines =
+        repoAgents.length > 0
+          ? [
+              "Active session roster:",
+              ...repoAgents.map(
+                (a) =>
+                  `- ${a.newName}${a.oldName !== a.newName ? ` (renamed from ${a.oldName})` : ""} handle=${a.handle} role=${a.role}${a.branch ? ` branch=${a.branch}` : ""} session=${a.sessionId}`,
+              ),
+            ]
+          : [];
+      const customNote = frame.message?.trim() ? `\n${frame.message.trim()}\n` : "";
+      const body = [
+        `[switchboard: SYSTEM RE-INIT] build=${BUILD.version}@${BUILD.commit_sha?.slice(0, 7) ?? "dev"}`,
+        customNote.trim(),
+        ...rosterLines,
+        'Action: Your Switchboard session registration has been refreshed. Address peers by their lane name (e.g. "dark-factory-mode", "orch"), short handle (e.g. "claude-104c"), or session UUID in bus_ask and bus_publish. If your session is unbound or switched worktrees, call bus_register({ cwd: "<your-worktree-path>", name: "<your-lane-name>" }) now.',
+      ]
+        .filter(Boolean)
+        .join("\n");
+
+      const msg = store.insert({
+        repo,
+        id: randomUUID(),
+        topic: "repo",
+        fromId: conn.sessionId || conn.declaredSession || conn.name,
+        fromName: conn.name,
+        body,
+        ts: Date.now(),
+        kind: "pub",
+        correlationId: null,
+        to: null,
+      });
+      for (const peer of conns) {
+        if (!peer.authed || peer.repo !== repo || peer.harness === "cli") continue;
+        send(peer.socket, { type: "message", message: msg });
+        notifiedSockets++;
+      }
+      await wakeFor(repo, msg);
+    }
+
+    // Also record in UNIVERSAL_REPO for audit/unbound visibility
+    store.insert({
+      repo: UNIVERSAL_REPO,
+      id: randomUUID(),
+      topic: "repo",
+      fromId: conn.sessionId || conn.declaredSession || conn.name,
+      fromName: conn.name,
+      body: `[switchboard: SYSTEM RE-INIT] build=${BUILD.version}@${BUILD.commit_sha?.slice(0, 7) ?? "dev"} repos=${targetRepos.join(",")}${frame.message ? `\n${frame.message}` : ""}`,
+      ts: Date.now(),
+      kind: "pub",
+      correlationId: null,
+      to: null,
+    });
+
+    respond({
+      type: "reinited",
+      repos: targetRepos,
+      updatedAgents,
+      notifiedSockets,
+      detail: `re-initialized ${updatedAgents.length} session(s) across ${targetRepos.length} repo(s); notified ${notifiedSockets} live socket(s)`,
+    });
+  }
+
   async function publish(
     conn: Conn,
-    frame: { topic: string; body: string; id?: string; to?: string },
+    frame: { topic: string; body: string; id?: string; to?: string; universal?: boolean },
     respond: Respond,
     kind: BusMessage["kind"] = "pub",
     correlationId: string | null = null,
     extra?: { replyState?: ReplyState | null; supersedes?: string | null },
   ): Promise<void> {
-    requireBoundRepo(conn);
+    if (!frame.universal) {
+      requireBoundRepo(conn);
+    }
     requireTopic(frame.topic);
     requireBody(frame.body);
+    if (frame.universal) {
+      const targetRepos = allActiveRepos(conn);
+      const universalMsg = store.insert({
+        repo: UNIVERSAL_REPO,
+        id: frame.id || randomUUID(),
+        topic: frame.topic,
+        fromId: conn.sessionId || conn.declaredSession || conn.name,
+        fromName: conn.name,
+        body: frame.body,
+        ts: Date.now(),
+        kind,
+        correlationId,
+        to: frame.to === "*" ? null : frame.to || null,
+        replyState: extra?.replyState ?? null,
+        supersedes: extra?.supersedes ?? null,
+      });
+      let lastWake: WakeInfo = {
+        mode: "push",
+        detail: `universal broadcast delivered across ${targetRepos.length} repo board(s)`,
+      };
+      for (const repo of targetRepos) {
+        const repoMsg = store.insert({
+          repo,
+          id: randomUUID(),
+          topic: frame.topic,
+          fromId: conn.sessionId || conn.declaredSession || conn.name,
+          fromName: conn.name,
+          body: frame.body,
+          ts: universalMsg.ts,
+          kind,
+          correlationId,
+          to: frame.to === "*" ? null : frame.to || null,
+          replyState: extra?.replyState ?? null,
+          supersedes: extra?.supersedes ?? null,
+        });
+        fanout(repoMsg, conn);
+        lastWake = await wakeFor(repo, repoMsg);
+      }
+      respond({
+        type: "published",
+        id: universalMsg.id,
+        seq: universalMsg.seq,
+        wake: {
+          mode: lastWake.mode,
+          detail: `universal broadcast across ${targetRepos.length} repo board(s) (${lastWake.detail})`,
+        },
+        correlationId: universalMsg.correlationId,
+      });
+      return;
+    }
     const resolvedTo =
       frame.to !== undefined && frame.to !== "*" ? resolveRecipientTarget(conn.repo, frame.to) : frame.to;
     const message = store.insert({
