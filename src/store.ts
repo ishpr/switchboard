@@ -344,7 +344,7 @@ export class Store {
          WHERE a.repo = ? AND a.kind = 'ask' AND a.correlation_id IS NOT NULL
            AND (
              ? IS NULL
-             OR (? = 1 AND (a.from_id = ? OR a.to_name = ?))
+             OR (? = 1 AND (a.from_id = ? OR a.to_name = ? OR a.to_name = ?))
              OR (? = 0 AND (a.from_name = ? OR a.to_name = ? OR (? IS NOT NULL AND (a.from_id = ? OR a.to_name = ?))))
            )
            AND NOT EXISTS (${ANSWERED_ASK})
@@ -356,6 +356,7 @@ export class Store {
         multiSessionForName ? 1 : 0,
         session,
         session,
+        participant ?? null,
         multiSessionForName ? 1 : 0,
         participant ?? null,
         participant ?? null,

@@ -888,8 +888,9 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         `ambiguous session handle "${rawTo}": matches multiple sessions (${handleMatches.map((m) => m.sessionId).join(", ")}); specify the full session UUID`,
       );
     }
-    const liveBoundSameName = [...sessionCandidates.values()]
-      .filter((c) => c.online && c.name === rawTo)
+    const allBoundSameName = [...sessionCandidates.values()].filter((c) => c.name === rawTo);
+    const liveBoundSameName = allBoundSameName
+      .filter((c) => c.online)
       .sort((a, b) => a.sessionId.localeCompare(b.sessionId));
     if (liveBoundSameName.length > 1) {
       const list = liveBoundSameName
@@ -907,6 +908,9 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       throw new Error(
         `ambiguous target "${rawTo}": ${liveBoundSameName.length} ${rawTo} sessions are online in this repo [${list}]. Specify a session handle (e.g. "${firstHandle}") or session UUID, or omit "to" on topic="repo" to broadcast.`,
       );
+    }
+    if (liveBoundSameName.length === 1 && allBoundSameName.length > 1) {
+      return liveBoundSameName[0]!.sessionId;
     }
     return rawTo;
   }
