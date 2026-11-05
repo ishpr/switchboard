@@ -714,12 +714,20 @@ export class Store {
     const now = Date.now();
     const keyBySession = Boolean(agent.sessionId && (agent.bySession || !isPaneOrTty(agent.sessionId)));
     if (keyBySession && agent.sessionId) {
+      const existingRow = this.getAgentBySession(agent.repo, agent.sessionId);
       const placeholder = this.db
         .prepare(
           "SELECT wake_session_id FROM agents WHERE repo = ? AND name = ? AND (session_key = ? OR status = 'invited') AND session_id IS NULL ORDER BY last_seen DESC LIMIT 1",
         )
         .get(agent.repo, agent.name, `name:${agent.name}`) as { wake_session_id: string | null } | undefined;
-      const carriedWakeSessionId = agent.wakeSessionId ?? placeholder?.wake_session_id ?? null;
+      const incomingWake = agent.wakeSessionId ?? null;
+      const existingWake = existingRow?.wakeSessionId ?? placeholder?.wake_session_id ?? null;
+      const carriedWakeSessionId =
+        incomingWake && isPaneOrTty(incomingWake)
+          ? incomingWake
+          : existingWake && isPaneOrTty(existingWake)
+            ? existingWake
+            : (incomingWake ?? existingWake ?? null);
       // Remove any unbound or invited placeholder row for this (repo, name) once a real session id is bound.
       this.db
         .prepare(

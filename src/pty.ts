@@ -1,8 +1,13 @@
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, unlinkSync } from "node:fs";
 import net from "node:net";
 import path from "node:path";
+import { BusClient } from "./busClient.ts";
+import { readDaemonInfo } from "./ensure.ts";
 import { switchboardHome } from "./paths.ts";
+import { repoKey } from "./repo.ts";
+import { readToken } from "./token.ts";
+import { UUID_RE } from "./wake.ts";
 
 export const PTY_RE = /^pty:(\/.+\.sock)$/;
 
@@ -284,6 +289,110 @@ export function normalizeHarnessArgs(harness: string, args: string[], env: NodeJ
   return out;
 }
 
+export function extractSessionTargetFromWrap(
+  args: string[],
+  psOutput?: string,
+  relayPid?: number,
+): { fullSessionId?: string; prefix?: string } {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    const next = args[i + 1];
+    if (
+      (arg === "--resume" || arg === "-r" || arg === "--session" || arg === "--session-id" || arg === "resume") &&
+      next &&
+      UUID_RE.test(next)
+    ) {
+      return { fullSessionId: next };
+    }
+    if (arg === "attach" && next && /^[0-9a-f]{6,36}$/i.test(next)) {
+      return { prefix: next };
+    }
+  }
+  if (psOutput && relayPid && relayPid > 1) {
+    const rows: Array<{ pid: number; ppid: number; cmd: string }> = [];
+    for (const rawLine of psOutput.split("\n")) {
+      const m = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(rawLine);
+      if (!m) continue;
+      rows.push({ pid: Number(m[1]), ppid: Number(m[2]), cmd: m[3]! });
+    }
+    const childCmds: string[] = [];
+    for (const r of rows) {
+      if (r.ppid === relayPid) {
+        childCmds.push(r.cmd);
+        for (const grand of rows) {
+          if (grand.ppid === r.pid) childCmds.push(grand.cmd);
+        }
+      }
+    }
+    for (const cmd of childCmds) {
+      const attachMatch = /\bclaude\s+attach\s+([0-9a-f]{6,36})\b/i.exec(cmd);
+      if (attachMatch) return { prefix: attachMatch[1]! };
+      const uuidMatch = /\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/i.exec(cmd);
+      if (uuidMatch) return { fullSessionId: uuidMatch[1]! };
+    }
+  }
+  return {};
+}
+
+async function bindPtyWakeToDaemon(opts: {
+  home: string;
+  cwd: string;
+  harness: string;
+  wakeSessionId: string;
+  args: string[];
+  relayPid?: number;
+}): Promise<boolean> {
+  if (!opts.cwd || opts.cwd === "/") return false;
+  const info = readDaemonInfo(opts.home);
+  if (!info) return false;
+  let psOut: string | undefined;
+  if (opts.relayPid && opts.relayPid > 1) {
+    try {
+      psOut = execFileSync("ps", ["-axo", "pid=,ppid=,command="], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+    } catch {
+      // ignore ps failure
+    }
+  }
+  const { fullSessionId, prefix } = extractSessionTargetFromWrap(opts.args, psOut, opts.relayPid);
+  if (!fullSessionId && !prefix) return false;
+  const client = new BusClient();
+  try {
+    await client.connect(info.url, {
+      type: "hello",
+      token: readToken(opts.home),
+      name: "cli",
+      harness: "cli",
+      repoKey: repoKey(opts.cwd),
+      cwd: opts.cwd,
+    });
+    const who = await client.request({ type: "who" });
+    if (who.type !== "who") return false;
+    const matched = who.agents.find((a) => {
+      if (fullSessionId && a.sessionId === fullSessionId) return true;
+      if (prefix && a.sessionId && a.sessionId.toLowerCase().startsWith(prefix.toLowerCase())) return true;
+      return false;
+    });
+    const resolvedSessionId = matched?.sessionId || fullSessionId;
+    if (!resolvedSessionId) return false;
+    await client.request({
+      type: "register",
+      name: matched?.name || process.env.SWITCHBOARD_NAME || opts.harness,
+      harness: matched?.harness || opts.harness,
+      cwd: matched?.cwd || opts.cwd,
+      sessionId: resolvedSessionId,
+      wakeSessionId: opts.wakeSessionId,
+    });
+    return true;
+  } catch {
+    return false;
+  } finally {
+    client.close();
+  }
+}
+
 export async function runPtyWrap(
   command: string,
   args: string[],
@@ -293,7 +402,8 @@ export async function runPtyWrap(
     onSocketReady?: (wakeSessionId: string, sockPath: string) => void;
   } = {},
 ): Promise<number> {
-  const sockPath = ptySocketPath(process.pid, opts.home ?? switchboardHome());
+  const home = opts.home ?? switchboardHome();
+  const sockPath = ptySocketPath(process.pid, home);
   const wakeSessionId = `pty:${sockPath}`;
   const inferredHarness = path.basename(command).toLowerCase().replace(/-cli$|-agent$/, "");
   const env: NodeJS.ProcessEnv = {
@@ -308,17 +418,42 @@ export async function runPtyWrap(
       stdio: "inherit",
       env,
     });
-    if (opts.onSocketReady) {
-      const poll = setInterval(() => {
-        if (existsSync(sockPath)) {
-          clearInterval(poll);
-          opts.onSocketReady!(wakeSessionId, sockPath);
+    const timers: Array<ReturnType<typeof setTimeout>> = [];
+    const clearAllTimers = () => {
+      for (const t of timers) clearTimeout(t);
+      timers.length = 0;
+    };
+    const poll = setInterval(() => {
+      if (existsSync(sockPath)) {
+        clearInterval(poll);
+        opts.onSocketReady?.(wakeSessionId, sockPath);
+        if (!opts.home) {
+          for (const delay of [50, 600, 2000]) {
+            const t = setTimeout(() => {
+              if (!existsSync(sockPath)) return;
+              void bindPtyWakeToDaemon({
+                home,
+                cwd: process.cwd(),
+                harness: inferredHarness,
+                wakeSessionId,
+                args,
+                relayPid: child.pid,
+              });
+            }, delay);
+            t.unref?.();
+            timers.push(t);
+          }
         }
-      }, 25);
-      poll.unref?.();
-      child.on("close", () => clearInterval(poll));
-    }
+      }
+    }, 25);
+    poll.unref?.();
+    child.on("close", () => {
+      clearInterval(poll);
+      clearAllTimers();
+    });
     child.on("error", (err) => {
+      clearInterval(poll);
+      clearAllTimers();
       try {
         if (existsSync(sockPath)) unlinkSync(sockPath);
       } catch {
