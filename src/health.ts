@@ -77,7 +77,7 @@ export async function sessionDiagnostics(
   if (pane === false) warnings.push(`${wakeMode === "inject" ? "wake=inject targets" : "session targets"} missing or exited ${target!.kind} pane ${sessionId}; rebind the session`);
   if (pane === null) warnings.push(`could not verify ${target!.kind} pane ${sessionId}; check multiplexer availability and permissions`);
   if (stale) warnings.push("last seen more than 10 minutes ago; check the agent connection");
-  if (agent.online && !agent.wake) warnings.push("wake=off on an active agent; offline headless wake is disabled (bound-session injection still applies)");
+  if (agent.online && !agent.wake) warnings.push("headless_wake=off on an active agent; offline headless wake is disabled (bound-session injection still applies)");
   return { health, wakeMode, warnings };
 }
 

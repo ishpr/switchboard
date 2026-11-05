@@ -13,7 +13,7 @@ import { formatAgentMetrics, formatBoardState, formatPendingAsks } from "./statu
 import { BusClient } from "./busClient.ts";
 import { ensureDaemon } from "./ensure.ts";
 import { formatRatioBinding, resolveShimCwd } from "./init.ts";
-import { Store } from "./store.ts";
+import { Store, sessionHandle } from "./store.ts";
 import { formatWaitResult, waitForMessages } from "./wait.ts";
 import { dbPath, switchboardHome } from "./paths.ts";
 import { gitCheckoutInfo, gitRepoRoot, repoKey } from "./repo.ts";
@@ -419,6 +419,11 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
           .min(1)
           .optional()
           .describe("Absolute path to the git checkout this session is working in (required when MCP shim started at cwd=\"/\" or switched repos)"),
+        name: z
+          .string()
+          .regex(NAME_RE)
+          .optional()
+          .describe("Optional distinct agent/lane name for this session (e.g. 'dark-factory', 'orch'). When omitted, preserves your current name and auto-derives a short handle (<harness>-<first4>) from your session id."),
         role: z
           .enum(["orchestrator", "worker"])
           .optional()
@@ -429,7 +434,7 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
           .describe("Enable or disable offline headless wake for this session (defaults to true for a new registration; preserves existing setting when omitted)"),
       },
     },
-    async ({ cwd, role: requestedRole, wake }) => {
+    async ({ cwd, name, role: requestedRole, wake }) => {
       let rebind = false;
       let targetCwd = context.cwd;
       let targetRepo = context.repo;
@@ -454,10 +459,11 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
       if (!targetCwd || targetCwd === "/" || (!resolvedSessionId && !cwd)) {
         return { ...text(missingSessionSource(context.harness, targetCwd)), isError: true };
       }
+      const targetName = name ?? context.name;
       const { branch, head } = gitCheckoutInfo(targetCwd);
       const frame = await bus.request({
         type: "register",
-        name: context.name,
+        name: targetName,
         harness: context.harness,
         cwd: targetCwd,
         rebind: Boolean(cwd),
@@ -472,6 +478,7 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
       const agent = frame.agent;
       const effectiveSessionId = agent?.sessionId ?? resolvedSessionId;
       const effectiveWakeSessionId = agent?.wakeSessionId ?? resolvedWakeSessionId;
+      context.name = agent?.name ?? targetName;
       context.cwd = targetCwd;
       context.repo = targetRepo;
       context.sessionId = effectiveSessionId ?? undefined;
@@ -479,6 +486,7 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
       if (frame.role) role = frame.role;
       if (frame.orchestrator !== undefined) context.orchestrator = frame.orchestrator;
       bus.updateHello({
+        name: context.name,
         cwd: context.cwd,
         repoKey: context.repo,
         role,
@@ -490,6 +498,10 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
         ...(agent?.wake !== undefined ? { wake: agent.wake } : {}),
       });
       const statusLabel = frame.created ? "new" : "existing";
+      const handlePart =
+        context.sessionId && UUID_RE.test(context.sessionId)
+          ? ` handle=${sessionHandle(context.name, context.sessionId, context.harness)}`
+          : "";
       const wakeFlagLabel = agent?.wake !== undefined ? ` wake=${agent.wake ? "on" : "off"}` : "";
       const wakePart =
         !context.sessionId && !context.wakeSessionId
@@ -514,7 +526,7 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
       return text(
         [
           `registered (${statusLabel})`,
-          `name=${context.name} harness=${context.harness} session=${context.sessionId ?? "unbound"}${wakePart}`,
+          `name=${context.name}${handlePart} harness=${context.harness} session=${context.sessionId ?? "unbound"}${wakePart}`,
           `checkout=${context.cwd}${gitPart}`,
           `role=${role} orchestrator=${context.orchestrator ?? "none"}`,
           ...extraLines,
@@ -527,14 +539,14 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
     "bus_publish",
     {
       description:
-        "Publish a coordination message on a Switchboard topic in this repo. Default topic is repo. When 'to' is an agent name or exact session id, the directed message is delivered to that recipient's default bus_inbox regardless of topic. Not authorization.",
+        "Publish a coordination message on a Switchboard topic in this repo. Default topic is repo. When 'to' is an agent name, short session handle (e.g. claude-104c), or exact session id, the directed message is delivered to that recipient's default bus_inbox regardless of topic. Not authorization.",
       inputSchema: {
         topic: z.string().optional().describe("Topic name, default repo"),
         message: z.string().describe("Message text"),
         to: z
           .string()
           .optional()
-          .describe("Agent name (e.g. muse, claude) or exact session id. Directed messages appear in the recipient's default bus_inbox regardless of topic."),
+          .describe("Agent name (e.g. muse, dark-factory), short session handle (e.g. claude-104c), or exact session id. Directed messages appear in the recipient's default bus_inbox regardless of topic."),
       },
     },
     async ({ topic, message, to }) => {
@@ -635,7 +647,11 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
           ...frame.agents.map((agent) => {
             const state = agent.online ? "online" : "offline";
             const wake = agent.wake ? "headless_wake=on" : "headless_wake=off";
-            const session = `${agent.sessionId ? ` session=${agent.sessionId}` : ""}${agent.wakeSessionId && agent.wakeSessionId !== agent.sessionId ? ` wake_session=${agent.wakeSessionId}` : ""} connections=${agent.connectionCount ?? (agent.online ? 1 : 0)}`;
+            const handle =
+              agent.sessionId && UUID_RE.test(agent.sessionId)
+                ? ` handle=${sessionHandle(agent.name, agent.sessionId, agent.harness)}`
+                : "";
+            const session = `${handle}${agent.sessionId ? ` session=${agent.sessionId}` : ""}${agent.wakeSessionId && agent.wakeSessionId !== agent.sessionId ? ` wake_session=${agent.wakeSessionId}` : ""} connections=${agent.connectionCount ?? (agent.online ? 1 : 0)}`;
             const git = agent.branch || agent.head ? ` git=${agent.branch ?? "detached"}@${agent.head ?? "unknown"}` : "";
             const ratioStr = formatRatioBinding(agent.ratio);
             const ratio = ratioStr ? ` ${ratioStr}` : "";
@@ -650,9 +666,9 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
     "bus_ask",
     {
       description:
-        "Ask one agent by shared name (reaches all live sessions of that harness) or by session id (reaches only that session). Wake and inject use the bound session id. Pass supersedes to replace and close an earlier open ask. The answer comes back through bus_reply.",
+        "Ask one agent by distinct name, short session handle (e.g. claude-104c), or session UUID. When multiple sessions share a harness name (e.g. 'claude'), specify the short handle or session UUID. Wake and inject use the bound session id. Pass supersedes to replace and close an earlier open ask. The answer comes back through bus_reply.",
       inputSchema: {
-        agent: z.string().describe("Agent name (e.g. muse, codex) or exact session id"),
+        agent: z.string().describe("Agent name (e.g. muse, dark-factory), short session handle (e.g. claude-104c), or exact session id"),
         question: z.string(),
         topic: z.string().optional(),
         supersedes: z.string().optional().describe("Correlation id of an earlier ask that this ask replaces and closes"),
@@ -706,7 +722,7 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
     "bus_wait",
     {
       description:
-        "Wait for unread inbox messages (seq > your current inbox cursor) without consuming them. Already-read messages are never returned by bus_wait; to inspect already-read history, call bus_inbox({ since: 0 }). Defaults to your own session inbox; orchestrators may monitor another recipient by name or session id. Broadcasts also match. Timeout defaults to 30 seconds (1..600); if your MCP client enforces a 120s tool timeout (e.g. Claude Code), pass timeout_seconds <= 90 so bus_wait returns before the client backgrounds the tool call. Use bus_inbox after a wake to consume mail.",
+        "Wait for unread inbox messages (seq > your current inbox cursor) without consuming them. Already-read messages are never returned by bus_wait; to inspect already-read history, call bus_inbox({ since: 0 }). Defaults to your own session inbox; orchestrators may monitor another recipient by name, short handle (e.g. claude-104c), or session id. Broadcasts also match. Timeout defaults to 30 seconds (1..600); if your MCP client enforces a 120s tool timeout (e.g. Claude Code), pass timeout_seconds <= 90 so bus_wait returns before the client backgrounds the tool call. Use bus_inbox after a wake to consume mail.",
       annotations: { readOnlyHint: true, idempotentHint: true },
       inputSchema: {
         to: z.string().regex(NAME_RE).or(z.literal("*")).optional(),
@@ -724,7 +740,14 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
       },
     },
     async ({ to, timeout_seconds, interval_ms, since_seq, wake_existing, topic }, extra) => {
-      const isOwnSessionTarget = Boolean(context.sessionId && to === context.sessionId);
+      const ownHandle = context.sessionId ? sessionHandle(context.name, context.sessionId, context.harness) : null;
+      const ownHarnessHandle = context.sessionId ? `${context.harness}-${context.sessionId.slice(0, 4)}`.toLowerCase() : null;
+      const toLower = to?.toLowerCase();
+      const isOwnSessionTarget = Boolean(
+        context.sessionId &&
+          to &&
+          (to === context.sessionId || toLower === ownHandle?.toLowerCase() || toLower === ownHarnessHandle),
+      );
       const rawRecipient = isOwnSessionTarget ? context.name : (to ?? context.name);
       const store = new Store(dbPath(context.home));
       try {
@@ -736,10 +759,22 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
         if (rawRecipient !== context.name && !isOwnSessionTarget && rawRecipient !== "*" && !callerIsOrchestrator) {
           return { ...text("Only the orchestrator can wait on another agent's inbox."), isError: true };
         }
-        const bySession = rawRecipient !== "*" ? store.getAgentBySession(context.repo, rawRecipient) : undefined;
+        let bySession = rawRecipient !== "*" ? store.getAgentBySession(context.repo, rawRecipient) : undefined;
+        if (!bySession && rawRecipient !== "*" && !isOwnSessionTarget) {
+          const lowerTarget = rawRecipient.toLowerCase();
+          const handleMatches = store.listAgents(context.repo, new Set()).filter((row) => {
+            if (!row.sessionId) return false;
+            const h1 = sessionHandle(row.name, row.sessionId, row.harness).toLowerCase();
+            const h2 = `${row.harness}-${row.sessionId.slice(0, 4)}`.toLowerCase();
+            return h1 === lowerTarget || h2 === lowerTarget;
+          });
+          if (handleMatches.length === 1) {
+            bySession = handleMatches[0];
+          }
+        }
         const recipient = bySession ? bySession.name : rawRecipient;
         const ownSession =
-          rawRecipient === context.name
+          isOwnSessionTarget || rawRecipient === context.name
             ? context.sessionId
             : bySession?.sessionId ?? (UUID_RE.test(rawRecipient) ? rawRecipient : undefined);
         const cursorKey =

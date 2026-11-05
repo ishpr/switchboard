@@ -15,6 +15,14 @@ function isPaneOrTty(sessionId?: string | null): boolean {
   return sessionId.startsWith("zellij:") || /^(?:tmux:)?%\d+$/.test(sessionId) || TTY_RE.test(sessionId);
 }
 
+export function sessionHandle(name: string, sessionId?: string | null, harness?: string): string {
+  if (!sessionId || isPaneOrTty(sessionId)) return name;
+  if (harness && name !== harness) return name;
+  const short = sessionId.slice(0, 4).toLowerCase();
+  if (name.toLowerCase().endsWith(`-${short}`)) return name;
+  return `${name}-${short}`;
+}
+
 export function inboxCursorKey(clientKey: string, topic?: string): string {
   return topic ? JSON.stringify([clientKey, "topic", topic]) : clientKey;
 }
@@ -211,6 +219,20 @@ export class Store {
       .run(repo, name, next);
   }
 
+  migrateSessionCursors(repo: string, oldName: string, newName: string, sessionId: string): void {
+    if (!sessionId || oldName === newName || isPaneOrTty(sessionId)) return;
+    const oldBase = `${oldName}:${sessionId}`;
+    const newBase = `${newName}:${sessionId}`;
+    for (const prefix of ["", "hook:"]) {
+      const prev = this.cursor(repo, `${prefix}${oldBase}`);
+      if (prev > 0) this.ack(repo, `${prefix}${newBase}`, prev);
+      for (const topic of ["dm", "repo", "reports"]) {
+        const prevTopic = this.cursor(repo, `${prefix}${inboxCursorKey(oldBase, topic)}`);
+        if (prevTopic > 0) this.ack(repo, `${prefix}${inboxCursorKey(newBase, topic)}`, prevTopic);
+      }
+    }
+  }
+
   insert(input: {
     repo: string;
     id: string;
@@ -292,21 +314,57 @@ export class Store {
   }
 
   /** Workspace-wide tracker: only a matching done reply or superseding ask closes an ask. */
-  pendingAsks(repo: string, limit = 50, now = Date.now(), participant?: string): PendingAsk[] {
+  pendingAsks(
+    repo: string,
+    limit = 50,
+    now = Date.now(),
+    participant?: string,
+    sessionId?: string | null,
+  ): PendingAsk[] {
     const boundedLimit = Number.isInteger(limit) ? Math.max(1, Math.min(limit, 200)) : 50;
-    const rows = this.db.prepare(
-      `SELECT a.*, (
-         SELECT r.reply_state FROM messages r
-         WHERE r.repo = a.repo AND r.kind = 'reply'
-           AND r.correlation_id = a.correlation_id AND r.seq > a.seq
-         ORDER BY r.seq DESC LIMIT 1
-       ) AS last_reply_state
-       FROM messages a
-       WHERE a.repo = ? AND a.kind = 'ask' AND a.correlation_id IS NOT NULL
-         AND (? IS NULL OR a.from_name = ? OR a.to_name = ?)
-         AND NOT EXISTS (${ANSWERED_ASK})
-       ORDER BY a.seq DESC LIMIT ?`,
-    ).all(repo, participant ?? null, participant ?? null, participant ?? null, boundedLimit) as (Row & {
+    const session = sessionId ?? null;
+    const multiSessionForName = Boolean(
+      participant &&
+        session &&
+        (
+          this.db
+            .prepare("SELECT COUNT(*) AS cnt FROM agents WHERE repo = ? AND name = ?")
+            .get(repo, participant) as { cnt: number }
+        ).cnt > 1,
+    );
+    const rows = this.db
+      .prepare(
+        `SELECT a.*, (
+           SELECT r.reply_state FROM messages r
+           WHERE r.repo = a.repo AND r.kind = 'reply'
+             AND r.correlation_id = a.correlation_id AND r.seq > a.seq
+           ORDER BY r.seq DESC LIMIT 1
+         ) AS last_reply_state
+         FROM messages a
+         WHERE a.repo = ? AND a.kind = 'ask' AND a.correlation_id IS NOT NULL
+           AND (
+             ? IS NULL
+             OR (? = 1 AND (a.from_id = ? OR a.to_name = ? OR a.to_name = ?))
+             OR (? = 0 AND (a.from_name = ? OR a.to_name = ? OR (? IS NOT NULL AND (a.from_id = ? OR a.to_name = ?))))
+           )
+           AND NOT EXISTS (${ANSWERED_ASK})
+         ORDER BY a.seq DESC LIMIT ?`,
+      )
+      .all(
+        repo,
+        participant ?? null,
+        multiSessionForName ? 1 : 0,
+        session,
+        session,
+        participant ?? null,
+        multiSessionForName ? 1 : 0,
+        participant ?? null,
+        participant ?? null,
+        session,
+        session,
+        session,
+        boundedLimit,
+      ) as (Row & {
       last_reply_state?: ReplyState | null;
     })[];
     return rows.map((row) => ({
@@ -323,7 +381,8 @@ export class Store {
   }
 
   /** Cumulative board telemetry; first recipient reply per ask determines latency. */
-  agentMetrics(repo: string, participant?: string): AgentMetrics[] {
+  agentMetrics(repo: string, participant?: string, sessionId?: string | null): AgentMetrics[] {
+    const session = sessionId ?? null;
     const rows = this.db.prepare(
       `WITH names AS (
          SELECT name AS agent FROM agents WHERE repo = ?
@@ -358,8 +417,8 @@ export class Store {
          latency.avg_latency AS avg_reply_latency_seconds,
          replies.last_reply AS last_reply_at
        FROM names LEFT JOIN asks USING (agent) LEFT JOIN replies USING (agent) LEFT JOIN latency USING (agent)
-       WHERE (? IS NULL OR names.agent = ?) ORDER BY names.agent`,
-    ).all(repo, repo, repo, repo, repo, repo, participant ?? null, participant ?? null) as AgentMetrics[];
+       WHERE (? IS NULL OR names.agent = ? OR (? IS NOT NULL AND names.agent = ?)) ORDER BY names.agent`,
+    ).all(repo, repo, repo, repo, repo, repo, participant ?? null, participant ?? null, session, session) as AgentMetrics[];
     return rows.map((row) => ({ ...row }));
   }
 
