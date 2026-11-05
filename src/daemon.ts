@@ -15,7 +15,7 @@ import { gitCheckoutInfo, gitRepoRoot, repoKey } from "./repo.ts";
 import { createPaneProbe, formatDiagnostics, paneTarget, sessionDiagnostics, type PaneProbe } from "./health.ts";
 import { BUILD, buildWarning, runtimeInfo } from "./build.ts";
 import { extractStateRatioProject } from "./status.ts";
-import { Store, inboxCursorKey } from "./store.ts";
+import { Store, inboxCursorKey, sessionHandle } from "./store.ts";
 import {
   BODY_MAX,
   NAME_RE,
@@ -512,10 +512,18 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       type: "ok",
       daemon: daemonInfo,
       detail: `${frame.status === undefined ? "status" : "status updated"}${detail ? `; ${detail}` : ""}`,
-      pending_asks: store.pendingAsks(conn.repo, frame.limit, Date.now(),
-        conn.role === "orchestrator" || conn.harness === "cli" ? undefined : conn.name),
-      agent_metrics: store.agentMetrics(conn.repo,
-        conn.role === "orchestrator" || conn.harness === "cli" ? undefined : conn.name),
+      pending_asks: store.pendingAsks(
+        conn.repo,
+        frame.limit,
+        Date.now(),
+        conn.role === "orchestrator" || conn.harness === "cli" ? undefined : conn.name,
+        conn.role === "orchestrator" || conn.harness === "cli" ? undefined : conn.sessionId,
+      ),
+      agent_metrics: store.agentMetrics(
+        conn.repo,
+        conn.role === "orchestrator" || conn.harness === "cli" ? undefined : conn.name,
+        conn.role === "orchestrator" || conn.harness === "cli" ? undefined : conn.sessionId,
+      ),
       board_state: boardState,
     });
   }
@@ -532,13 +540,17 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     const effectiveCwd = frame.cwd === "/" ? resolveShimCwd("/") : frame.cwd;
     const effectiveRepo = frame.cwd === "/" && effectiveCwd !== "/" ? repoKey(effectiveCwd) : frame.repoKey;
     const declaredSession = frame.sessionId || null;
+    const bySession = declaredSession ? store.getAgentBySession(effectiveRepo, declaredSession) : undefined;
     const byName = store.getAgent(effectiveRepo, frame.name);
     const existing = declaredSession
-      ? (store.getAgentBySession(effectiveRepo, declaredSession) ?? (!byName?.sessionId ? byName : undefined))
+      ? (bySession ?? (!byName?.sessionId ? byName : undefined))
       : byName;
     conn.authed = true;
     conn.agentId = randomUUID();
-    conn.name = frame.name;
+    conn.name =
+      bySession && (frame.harness === "cli" || frame.name === frame.harness)
+        ? bySession.name
+        : frame.name;
     conn.waitOnly = Boolean(frame.waitOnly);
     conn.harness = (conn.waitOnly && existing && (!frame.harness || frame.harness === "wait" || frame.harness === "unknown"))
       ? existing.harness
@@ -825,6 +837,80 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       : conn.name;
   }
 
+  function resolveRecipientTarget(repo: string, rawTo: string): string {
+    if (rawTo === "*") return "*";
+    requireName(rawTo);
+    if (looksLikeSessionTarget(rawTo)) {
+      if (!describeTarget(repo, rawTo)) {
+        throw new Error(`target session ${rawTo} is not registered in this repository`);
+      }
+      return rawTo;
+    }
+    const lower = rawTo.toLowerCase();
+    const sessionCandidates = new Map<
+      string,
+      { name: string; harness: string; sessionId: string; role: Role; branch: string | null; online: boolean }
+    >();
+    const currentOrch = store.getOrchestrator(repo);
+    for (const row of store.listAgents(repo, new Set())) {
+      if (!row.sessionId || looksLikePaneOrTtyTarget(row.sessionId)) continue;
+      sessionCandidates.set(row.sessionId, {
+        name: row.name,
+        harness: row.harness,
+        sessionId: row.sessionId,
+        role: isOrchestratorTarget(repo, currentOrch, row) ? "orchestrator" : "worker",
+        branch: row.branch ?? null,
+        online: false,
+      });
+    }
+    for (const peer of conns) {
+      if (!peer.authed || peer.repo !== repo || peer.harness === "cli" || peer.waitOnly) continue;
+      if (!peer.sessionBound || !peer.sessionId || looksLikePaneOrTtyTarget(peer.sessionId)) continue;
+      sessionCandidates.set(peer.sessionId, {
+        name: peer.name,
+        harness: peer.harness,
+        sessionId: peer.sessionId,
+        role: isOrchestratorTarget(repo, currentOrch, peer) ? "orchestrator" : "worker",
+        branch: peer.branch ?? sessionCandidates.get(peer.sessionId)?.branch ?? null,
+        online: true,
+      });
+    }
+    const handleMatches = [...sessionCandidates.values()].filter((c) => {
+      const h1 = sessionHandle(c.name, c.sessionId, c.harness).toLowerCase();
+      const h2 = `${c.harness}-${c.sessionId.slice(0, 4)}`.toLowerCase();
+      return h1 === lower || h2 === lower;
+    });
+    if (handleMatches.length === 1) {
+      return handleMatches[0]!.sessionId;
+    }
+    if (handleMatches.length > 1) {
+      throw new Error(
+        `ambiguous session handle "${rawTo}": matches multiple sessions (${handleMatches.map((m) => m.sessionId).join(", ")}); specify the full session UUID`,
+      );
+    }
+    const liveBoundSameName = [...sessionCandidates.values()]
+      .filter((c) => c.online && c.name === rawTo)
+      .sort((a, b) => a.sessionId.localeCompare(b.sessionId));
+    if (liveBoundSameName.length > 1) {
+      const list = liveBoundSameName
+        .map((c) => {
+          const h = sessionHandle(c.name, c.sessionId, c.harness);
+          const br = c.branch ? `, ${c.branch}` : "";
+          return `${h} (${c.role}${br}, session=${c.sessionId})`;
+        })
+        .join("; ");
+      const firstHandle = sessionHandle(
+        liveBoundSameName[0]!.name,
+        liveBoundSameName[0]!.sessionId,
+        liveBoundSameName[0]!.harness,
+      );
+      throw new Error(
+        `ambiguous target "${rawTo}": ${liveBoundSameName.length} ${rawTo} sessions are online in this repo [${list}]. Specify a session handle (e.g. "${firstHandle}") or session UUID, or omit "to" on topic="repo" to broadcast.`,
+      );
+    }
+    return rawTo;
+  }
+
   async function publish(
     conn: Conn,
     frame: { topic: string; body: string; id?: string; to?: string },
@@ -836,12 +922,8 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     requireBoundRepo(conn);
     requireTopic(frame.topic);
     requireBody(frame.body);
-    if (frame.to !== undefined && frame.to !== "*") {
-      requireName(frame.to);
-      if (looksLikeSessionTarget(frame.to) && !describeTarget(conn.repo, frame.to)) {
-        throw new Error(`target session ${frame.to} is not registered in this repository`);
-      }
-    }
+    const resolvedTo =
+      frame.to !== undefined && frame.to !== "*" ? resolveRecipientTarget(conn.repo, frame.to) : frame.to;
     const message = store.insert({
       repo: conn.repo,
       id: frame.id || randomUUID(),
@@ -852,7 +934,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       ts: Date.now(),
       kind,
       correlationId,
-      to: frame.to === "*" ? null : frame.to || null,
+      to: resolvedTo === "*" ? null : resolvedTo || null,
       replyState: extra?.replyState ?? null,
       supersedes: extra?.supersedes ?? null,
     });
@@ -870,7 +952,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
 
   async function ask(
     conn: Conn,
-    to: string,
+    rawTo: string,
     body: string,
     topic: string | undefined,
     supersedes: string | undefined,
@@ -878,10 +960,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     respond: Respond,
   ): Promise<void> {
     requireBoundRepo(conn);
-    requireName(to);
-    if (looksLikeSessionTarget(to) && !describeTarget(conn.repo, to)) {
-      throw new Error(`target session ${to} is not registered in this repository`);
-    }
+    const to = resolveRecipientTarget(conn.repo, rawTo);
     const others = [...conns].filter(
       (peer) =>
         peer.authed &&
@@ -1261,13 +1340,17 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     if (isSessionLiveInOtherRepo(nextRepo, frame.sessionId, frame.wakeSessionId, conn)) {
       throw new Error("cannot register: session is currently active in another repository board");
     }
+    const isOwnConn =
+      conn.harness !== "cli" &&
+      (conn.name === frame.name || Boolean(frame.sessionId && (conn.sessionId === frame.sessionId || conn.declaredSession === frame.sessionId)));
+    const oldConnName = conn.name;
     const oldCwd = conn.cwd;
     const oldRepo = conn.repo;
     const nextDeclaredSession =
-      conn.harness !== "cli" && conn.name === frame.name && frame.sessionId
+      isOwnConn && frame.sessionId
         ? frame.sessionId
         : conn.declaredSession;
-    const groupChanged = oldRepo !== nextRepo || conn.declaredSession !== nextDeclaredSession;
+    const groupChanged = oldRepo !== nextRepo || conn.declaredSession !== nextDeclaredSession || (isOwnConn && oldConnName !== frame.name);
     if (oldCwd !== "/" && groupChanged && conn.harness !== "cli") {
       presence(conn, "offline");
     }
@@ -1277,7 +1360,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       }
       conn.cwd = nextCwd;
       conn.repo = nextRepo;
-      conn.role = elect(conn.repo, conn.name, conn.role === "orchestrator", claimSessionId);
+      conn.role = elect(conn.repo, frame.name, conn.role === "orchestrator", claimSessionId);
     }
     store.evictCrossRepoBinding(conn.repo, frame.sessionId, frame.wakeSessionId);
     const byName = store.getAgent(conn.repo, frame.name);
@@ -1286,6 +1369,12 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       : byName;
     if (frame.sessionId) {
       store.migrateSubscriptions(conn.repo, `name:${frame.name}`, frame.sessionId);
+      if (existing && existing.name !== frame.name) {
+        store.migrateSessionCursors(conn.repo, existing.name, frame.name, frame.sessionId);
+      }
+      if (isOwnConn && oldConnName !== frame.name) {
+        store.migrateSessionCursors(conn.repo, oldConnName, frame.name, frame.sessionId);
+      }
     }
     if (frame.sessionId && !frame.sessionId.startsWith("zellij:")) {
       const sessionKey = `${frame.name}:${frame.sessionId}`;
@@ -1301,10 +1390,10 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     const wake = frame.wake === undefined ? (existing ? existing.wake : true) : frame.wake;
     const existingStatus =
       existing?.status === "invited"
-        ? (conn.harness !== "cli" && conn.name === frame.name ? "online" : "registered")
+        ? (isOwnConn ? "online" : "registered")
         : existing?.status;
     const status =
-      conn.harness === "cli" || conn.name !== frame.name
+      !isOwnConn
         ? (existingStatus || "registered")
         : (conn.status === "invited" ? "online" : (conn.status || "online"));
     const inheritedWakeSessionId =
@@ -1324,7 +1413,8 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       status,
       bySession: Boolean(frame.sessionId),
     });
-    if (conn.harness !== "cli" && conn.name === frame.name) {
+    if (isOwnConn) {
+      conn.name = frame.name;
       if (frame.sessionId) {
         conn.declaredSession = frame.sessionId;
         conn.sessionId = frame.sessionId;
@@ -1350,7 +1440,11 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       }
     } else {
       for (const peer of conns) {
-        if (!peer.authed || peer.repo !== conn.repo || peer.name !== frame.name || peer.harness === "cli") continue;
+        if (!peer.authed || peer.repo !== conn.repo || peer.harness === "cli") continue;
+        if (peer.name !== frame.name && !(frame.sessionId && (peer.sessionId === frame.sessionId || peer.declaredSession === frame.sessionId))) {
+          continue;
+        }
+        peer.name = frame.name;
         if (!peer.sessionBound && frame.sessionId) {
           peer.declaredSession = frame.sessionId;
           peer.sessionId = frame.sessionId;
@@ -1902,6 +1996,10 @@ function looksLikeSessionTarget(to: string): boolean {
     to.startsWith("tmux:") ||
     /^%\d+$/.test(to)
   );
+}
+
+function looksLikePaneOrTtyTarget(id: string): boolean {
+  return Boolean(paneTarget(id) || TTY_RE.test(id));
 }
 
 function requireTopic(topic: string): void {

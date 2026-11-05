@@ -2275,3 +2275,175 @@ test("turn hooks do not hide direct messages from bus_inbox, default inbox marks
     await fx.daemon.close();
   }
 });
+
+test("short session handles resolve targets, bare ambiguous harness names are rejected, pending asks scope by session, and renaming migrates cursors", async () => {
+  const fx = await fixture();
+  const repoDir = mkdtempSync(path.join(tmpdir(), "switchboard-lathe-handles-"));
+  mkdirSync(path.join(repoDir, ".git"), { recursive: true });
+
+  const orchUuid = "dd09f9b0-41e0-40c8-b7c4-ecfd0407549a";
+  const worker1Uuid = "104c6460-a8d4-424a-9533-2640ba973657";
+  const worker2Uuid = "29973b2f-7694-410c-a596-f3159b3217c0";
+
+  const orch = await join(fx, "claude", "lathe-handles", {
+    harness: "claude",
+    cwd: repoDir,
+    sessionId: orchUuid,
+    boundSession: true,
+    wake: false,
+    branch: "main",
+  });
+  const worker1 = await join(fx, "claude", "lathe-handles", {
+    harness: "claude",
+    cwd: repoDir,
+    sessionId: worker1Uuid,
+    boundSession: true,
+    wake: false,
+    branch: "feat/dark-factory-mode",
+  });
+  const worker2 = await join(fx, "claude", "lathe-handles", {
+    harness: "claude",
+    cwd: repoDir,
+    sessionId: worker2Uuid,
+    boundSession: true,
+    wake: false,
+    branch: "feat/other-lane",
+  });
+
+  try {
+    await orch.request({
+      type: "register",
+      name: "claude",
+      harness: "claude",
+      cwd: repoDir,
+      sessionId: orchUuid,
+      role: "orchestrator",
+      branch: "main",
+      wake: false,
+    });
+    await worker1.request({
+      type: "register",
+      name: "claude",
+      harness: "claude",
+      cwd: repoDir,
+      sessionId: worker1Uuid,
+      branch: "feat/dark-factory-mode",
+      wake: false,
+    });
+    await worker2.request({
+      type: "register",
+      name: "claude",
+      harness: "claude",
+      cwd: repoDir,
+      sessionId: worker2Uuid,
+      branch: "feat/other-lane",
+      wake: false,
+    });
+
+    // 1. Bare "claude" target in ask or publish is rejected as ambiguous with short handles listed
+    await assert.rejects(
+      () => orch.request({ type: "ask", to: "claude", body: "who gets this?" }),
+      /ambiguous target "claude": 3 claude sessions are online in this repo.*claude-104c.*claude-2997.*claude-dd09/,
+    );
+    await assert.rejects(
+      () => orch.request({ type: "publish", topic: "repo", to: "claude", body: "directed ambiguous" }),
+      /ambiguous target "claude": 3 claude sessions are online in this repo/,
+    );
+
+    // 2. Short handle "claude-104c" resolves to worker1Uuid in both ask and publish
+    const ask1 = await orch.request({
+      type: "ask",
+      to: "claude-104c",
+      body: "task for worker1 via short handle",
+    });
+    assert.equal(ask1.type, "published");
+
+    const pub2 = await orch.request({
+      type: "publish",
+      topic: "lathe-lane",
+      to: "claude-2997",
+      body: "note for worker2 via short handle",
+    });
+    assert.equal(pub2.type, "published");
+
+    // 3. Session-scoped pendingAsks: worker1 sees its pending ask, worker2 sees 0 pending asks
+    const status1 = await worker1.request({ type: "status", pending: true });
+    assert.equal(status1.type, "ok");
+    if (status1.type === "ok") {
+      assert.equal(status1.pending_asks?.length, 1);
+      assert.equal(status1.pending_asks?.[0]?.to, worker1Uuid);
+    }
+    const status2 = await worker2.request({ type: "status", pending: true });
+    assert.equal(status2.type, "ok");
+    if (status2.type === "ok") {
+      assert.equal(status2.pending_asks?.length, 0);
+    }
+
+    // Worker 2 receives its directed custom-topic publish in default inbox with to === worker2Uuid
+    const inbox2 = await worker2.request({ type: "inbox" });
+    assert.equal(inbox2.type, "inbox");
+    if (inbox2.type === "inbox") {
+      assert.equal(inbox2.messages.length, 1);
+      assert.equal(inbox2.messages[0]?.to, worker2Uuid);
+    }
+
+    // Worker 1 consumes its inbox so its cursor advances
+    const inbox1 = await worker1.request({ type: "inbox" });
+    assert.equal(inbox1.type, "inbox");
+    if (inbox1.type === "inbox") {
+      assert.equal(inbox1.messages.length, 1);
+      assert.equal(inbox1.messages[0]?.to, worker1Uuid);
+    }
+
+    // 4. Worker 1 renames itself to "dark-factory" via register; cursors migrate and CLI hook inherits name
+    const regRename = await worker1.request({
+      type: "register",
+      name: "dark-factory",
+      harness: "claude",
+      cwd: repoDir,
+      sessionId: worker1Uuid,
+      branch: "feat/dark-factory-mode",
+      wake: false,
+    });
+    assert.equal(regRename.type, "registered");
+    if (regRename.type === "registered") {
+      assert.equal(regRename.agent?.name, "dark-factory");
+    }
+
+    // Re-polling inbox after rename does not re-read already-consumed messages
+    const inboxAfterRename = await worker1.request({ type: "inbox" });
+    assert.equal(inboxAfterRename.type, "inbox");
+    if (inboxAfterRename.type === "inbox") {
+      assert.equal(inboxAfterRename.messages.length, 0);
+    }
+
+    // Orchestrator can now address worker1 by its custom alias "dark-factory" OR by "claude-104c"
+    const askByAlias = await orch.request({
+      type: "ask",
+      to: "dark-factory",
+      body: "ping by alias",
+    });
+    assert.equal(askByAlias.type, "published");
+
+    // CLI hook connecting with default harness name "claude" and sessionId=worker1Uuid inherits "dark-factory"
+    const hookClient = await join(fx, "claude", "lathe-handles", {
+      harness: "cli",
+      cwd: repoDir,
+      sessionId: worker1Uuid,
+    });
+    try {
+      const hookInbox = await hookClient.request({ type: "inbox", ack: false, hook: true });
+      assert.equal(hookInbox.type, "inbox");
+      if (hookInbox.type === "inbox") {
+        assert.equal(hookInbox.messages.some((m) => m.body === "ping by alias"), true);
+      }
+    } finally {
+      hookClient.close();
+    }
+  } finally {
+    orch.close();
+    worker1.close();
+    worker2.close();
+    await fx.daemon.close();
+  }
+});
