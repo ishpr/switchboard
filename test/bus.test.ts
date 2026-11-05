@@ -7,7 +7,9 @@ import test from "node:test";
 import { BusClient } from "../src/busClient.ts";
 import { startDaemon, type DaemonHandle, isLoopback } from "../src/daemon.ts";
 import { formatMessage, hookStdout, shouldSkipHookForPrompt } from "../src/hook.ts";
+import { gitRepoRoot, repoKey } from "../src/repo.ts";
 import { formatBoardState } from "../src/status.ts";
+import { Store } from "../src/store.ts";
 import { ensureToken } from "../src/token.ts";
 import type { BusMessage, ClientHello, WakeLaunch } from "../src/types.ts";
 
@@ -1725,9 +1727,203 @@ test("bus_who detects Ratio project mismatches across agents, and bus_state/bus_
       assert.doesNotMatch(formatted, /verdict:grok[^\n]*stale verdict head/);
       assert.match(formatted, /verdict:muse[^\n]*WARNING: stale verdict head \(0000999 != aaaa111\)/);
     }
+
+    // 4. Prose mentions of ratio_project=p-other in ask body do NOT override bus_state contract (p-ratio)
+    const claude2 = await join(fx, "claude", "repo-ratio", {
+      harness: "claude",
+      cwd: repoDir,
+      sessionId: "019c8e1c-9999-7000-8000-000000000009",
+      boundSession: true,
+    });
+    try {
+      const proseAsk = await cursor.request({
+        type: "ask",
+        to: "claude",
+        body: "Note: do not touch ratio_project=p-serveone in this task; verify p-ratio only",
+      });
+      assert.equal(proseAsk.type, "published");
+
+      // Explicit ratioProject field on ask takes precedence when provided
+      await assert.rejects(
+        cursor.request({
+          type: "ask",
+          to: "claude",
+          body: "Check explicit ratioProject guard",
+          ratioProject: "p-serveone",
+        }),
+        /Ratio project mismatch.*claude has X-Ratio-Project=p-ratio.*requires p-serveone/,
+      );
+    } finally {
+      claude2.close();
+    }
   } finally {
     claude.close();
     cursor.close();
     await fx.daemon.close();
+  }
+});
+
+test("rebind validates before mutation, preserves linked worktree cwd, clears prior repo topics, carries invited tty onto bound UUID, and protects deferred asks", async () => {
+  const home = mkdtempSync(path.join(tmpdir(), "switchboard-adv-audit-"));
+  const token = ensureToken(home);
+  const dbFile = path.join(home, "switchboard.db");
+  const repoA = mkdtempSync(path.join(tmpdir(), "switchboard-adv-a-"));
+  const repoB = mkdtempSync(path.join(tmpdir(), "switchboard-adv-b-"));
+  execFileSync("git", ["init"], { cwd: repoA, stdio: "ignore" });
+  execFileSync("git", ["init"], { cwd: repoB, stdio: "ignore" });
+  execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=t@e.com", "commit", "--allow-empty", "-m", "init"], {
+    cwd: repoB,
+    stdio: "ignore",
+  });
+  const repoBWorktree = path.join(mkdtempSync(path.join(tmpdir(), "switchboard-adv-b-wt-")), "feature-wt");
+  execFileSync("git", ["worktree", "add", "-b", "feature-wt", repoBWorktree], { cwd: repoB, stdio: "ignore" });
+
+  let turnActive = true;
+  const wakeLaunches: WakeLaunch[] = [];
+  const daemon = await startDaemon({
+    port: 0,
+    dbFile,
+    token,
+    spawnWake: async (launch) => {
+      wakeLaunches.push(launch);
+    },
+    isTurnInProgress: (harness) => harness === "codex" && turnActive,
+    wakeCooldownMs: 80,
+  });
+
+  const desktop = new BusClient();
+  const peerA = new BusClient();
+  const peerB = new BusClient();
+  try {
+    // 1. Invited agent row with tty:/dev/ttys012 keeps wake_session_id and cleans up 'invited' placeholder when connecting with a bound UUID
+    const store = new Store(dbFile);
+    const repoBKey = repoKey(repoB);
+    store.saveInvitedAgent({
+      repo: repoBKey,
+      name: "grok",
+      harness: "grok",
+      sessionId: null,
+      wakeSessionId: "tty:/dev/ttys012",
+      cwd: repoB,
+      branch: "main",
+      head: "1111aaa",
+      status: "invited",
+    });
+    store.close();
+
+    const grokUuid = "019c8e1c-7777-7000-8000-000000000077";
+    await peerB.connect(
+      daemon.url,
+      hello(token, "grok", repoBKey, {
+        harness: "grok",
+        cwd: repoB,
+        sessionId: grokUuid,
+        boundSession: true,
+        wake: true,
+      }),
+    );
+    const whoB = await peerB.request({ type: "who" });
+    assert.equal(whoB.type, "who");
+    if (whoB.type === "who") {
+      const grokRows = whoB.agents.filter((a) => a.name === "grok");
+      assert.equal(grokRows.length, 1);
+      assert.equal(grokRows[0]?.sessionId, grokUuid);
+      assert.equal(grokRows[0]?.wakeSessionId, "tty:/dev/ttys012");
+      assert.equal(grokRows[0]?.status, "online");
+    }
+
+    // 2. Desktop client on repoA subscribes to custom topic 'alpha', then attempts an invalid rebind (session live in repoB)
+    const repoAKey = repoKey(repoA);
+    await desktop.connect(
+      daemon.url,
+      hello(token, "agy", repoAKey, {
+        harness: "antigravity",
+        cwd: repoA,
+        role: "orchestrator",
+      }),
+    );
+    await peerA.connect(
+      daemon.url,
+      hello(token, "muse", repoAKey, {
+        harness: "muse",
+        cwd: repoA,
+      }),
+    );
+    await desktop.request({ type: "subscribe", topics: ["alpha"] });
+
+    // Non-orchestrator worker cannot reassign orchestrator via setOrchestrator
+    await assert.rejects(peerA.request({ type: "orchestrator", name: "muse" }), /orchestrator is already agy/);
+
+    // Attempting to rebind with grokUuid (which is live on repoB) fails WITHOUT mutating desktop's repoA binding
+    await assert.rejects(
+      desktop.request({
+        type: "register",
+        name: "agy",
+        harness: "antigravity",
+        cwd: repoA,
+        rebind: true,
+        sessionId: grokUuid,
+      }),
+      /currently active in another repository board/,
+    );
+    const whoStillA = await desktop.request({ type: "who" });
+    assert.equal(whoStillA.type, "who");
+    if (whoStillA.type === "who") {
+      assert.ok(whoStillA.agents.some((a) => a.name === "muse"));
+    }
+
+    // 3. Rebind desktop to linked git worktree of repoB -> preserves worktree cwd, shares repoBKey board, clears 'alpha' topic, returns role & orchestrator
+    const rebound = await desktop.request({
+      type: "register",
+      name: "agy",
+      harness: "antigravity",
+      cwd: repoBWorktree,
+      rebind: true,
+    });
+    assert.equal(rebound.type, "registered");
+    if (rebound.type === "registered") {
+      assert.equal(rebound.agent?.cwd, gitRepoRoot(repoBWorktree, "split"));
+      assert.equal(rebound.agent?.repo, repoBKey);
+      assert.equal(rebound.role, "orchestrator");
+      assert.equal(rebound.orchestrator, "agy");
+    }
+
+    // Broadcast on 'alpha' in repoB should NOT be pushed to desktop because rebind cleared repoA's 'alpha' subscription
+    const receivedOnDesktop: BusMessage[] = [];
+    desktop.onMessage = (f) => receivedOnDesktop.push(f.message);
+    await peerB.request({ type: "publish", topic: "alpha", body: "unsubscribed on repoB" });
+    await new Promise((r) => setTimeout(r, 40));
+    assert.equal(receivedOnDesktop.some((m) => m.topic === "alpha"), false);
+
+    // 4. Deferred wake on active Codex turn preserves an unread 'ask' over a subsequent 'pub' during cooldown
+    const codexClient = new BusClient();
+    const codexUuid = "019c8e1c-8888-7000-8000-000000000088";
+    await codexClient.connect(
+      daemon.url,
+      hello(token, "codex", repoBKey, {
+        harness: "codex",
+        cwd: repoB,
+        sessionId: codexUuid,
+        boundSession: true,
+        wake: true,
+      }),
+    );
+    try {
+      await desktop.request({ type: "ask", to: "codex", body: "important ask that must not be overwritten" });
+      await desktop.request({ type: "publish", topic: "dm", to: "codex", body: "followup pub note" });
+      turnActive = false;
+      await new Promise((r) => setTimeout(r, 150));
+      assert.equal(wakeLaunches.length, 1);
+      const launchedPrompt = wakeLaunches[0]?.args.join(" ") ?? "";
+      assert.match(launchedPrompt, /important ask that must not be overwritten/);
+      assert.match(launchedPrompt, /bus_reply/);
+    } finally {
+      codexClient.close();
+    }
+  } finally {
+    desktop.close();
+    peerA.close();
+    peerB.close();
+    await daemon.close();
   }
 });

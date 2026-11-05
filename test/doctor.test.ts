@@ -181,3 +181,52 @@ test("CLI --share and --scope select shared/split worktree boards independently 
     }
   } finally { await fx.close(); }
 });
+
+test("prune clears dead wake_session_id on invited rows and preserves resumable UUIDs in session_id", async () => {
+  const fx = await fixture(async () => false);
+  try {
+    fx.store.saveInvitedAgent({
+      repo: "repo-a",
+      name: "grok",
+      harness: "grok",
+      sessionId: null,
+      wakeSessionId: "zellij:grid:9",
+      cwd: "/work",
+      branch: "main",
+      head: "abc1234",
+      status: "invited",
+    });
+    const museUuid = "019c8e1c-1111-7000-8000-000000000001";
+    fx.store.upsertAgent({
+      repo: "repo-a",
+      name: "muse",
+      harness: "muse",
+      sessionId: museUuid,
+      wakeSessionId: "zellij:grid:10",
+      cwd: "/work",
+      wake: true,
+      status: "online",
+      bySession: true,
+    });
+    const client = await fx.join();
+    const res = await doctor(client, { prune: true });
+    assert.deepEqual(
+      res.pruned.map((p) => [p.name, p.sessionId, p.reason]),
+      [
+        ["grok", "zellij:grid:9", "dead_pane"],
+        ["muse", "zellij:grid:10", "dead_pane"],
+      ],
+    );
+    const grokAfter = fx.store.getAgent("repo-a", "grok")!;
+    assert.equal(grokAfter.status, "offline");
+    assert.equal(grokAfter.sessionId, null);
+    assert.equal(grokAfter.wakeSessionId, null);
+
+    const museAfter = fx.store.getAgent("repo-a", "muse")!;
+    assert.equal(museAfter.status, "offline");
+    assert.equal(museAfter.sessionId, museUuid);
+    assert.equal(museAfter.wakeSessionId, museUuid);
+  } finally {
+    await fx.close();
+  }
+});

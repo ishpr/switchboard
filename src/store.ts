@@ -509,23 +509,57 @@ export class Store {
     cursorKey = to,
     topic?: string,
     sessionId?: string | null,
+    opts?: { subscriptionKey?: string; isOrchestrator?: boolean },
   ): BusMessage[] {
     const session = sessionId ?? null;
+    const subKey =
+      opts?.subscriptionKey ?? (session || this.getAgent(repo, to)?.sessionId || `name:${to}`);
+    const isOrch = (opts?.isOrchestrator ?? (this.getOrchestrator(repo) === to)) ? 1 : 0;
     const rows = this.db.prepare(
       `SELECT * FROM messages WHERE repo = ?
          AND seq > MAX(?, COALESCE((SELECT MAX(cursor) FROM cursors WHERE repo = ? AND client_key = ?), 0))
          AND (
-           to_name IS NULL
-           OR to_name = '*'
-           OR to_name = ?
-           OR (? IS NOT NULL AND to_name = ?)
-           OR (? IS NULL AND EXISTS (
-             SELECT 1 FROM agents ag WHERE ag.repo = messages.repo AND ag.session_id = messages.to_name AND ag.name = ?
+           (to_name IS NOT NULL AND to_name != '*' AND (
+             to_name = ?
+             OR (? IS NOT NULL AND to_name = ?)
+             OR (? IS NULL AND EXISTS (
+               SELECT 1 FROM agents ag WHERE ag.repo = messages.repo AND ag.session_id = messages.to_name AND ag.name = ?
+             ))
+           ))
+           OR
+           ((to_name IS NULL OR to_name = '*') AND (
+             ? IS NOT NULL
+             OR ? = '*'
+             OR topic IN ('repo', 'dm')
+             OR (? = 1 AND topic = 'reports')
+             OR EXISTS (
+               SELECT 1 FROM subscriptions sub
+               WHERE sub.repo = messages.repo
+                 AND sub.session_key = ?
+                 AND sub.topic = messages.topic
+                 AND messages.seq > sub.since_seq
+             )
            ))
          )
          AND ((? IS NULL AND topic != 'presence') OR topic = ?)
        ORDER BY seq ASC LIMIT 200`,
-    ).all(repo, since, repo, inboxCursorKey(cursorKey, topic), to, session, session, session, to, topic ?? null, topic ?? null) as Row[];
+    ).all(
+      repo,
+      since,
+      repo,
+      inboxCursorKey(cursorKey, topic),
+      to,
+      session,
+      session,
+      session,
+      to,
+      topic ?? null,
+      to,
+      isOrch,
+      subKey,
+      topic ?? null,
+      topic ?? null,
+    ) as Row[];
     return rows.map(mapMessage);
   }
 
@@ -535,22 +569,55 @@ export class Store {
     cursorKey = to,
     topic?: string,
     sessionId?: string | null,
+    opts?: { subscriptionKey?: string; isOrchestrator?: boolean },
   ): number {
     const session = sessionId ?? null;
+    const subKey =
+      opts?.subscriptionKey ?? (session || this.getAgent(repo, to)?.sessionId || `name:${to}`);
+    const isOrch = (opts?.isOrchestrator ?? (this.getOrchestrator(repo) === to)) ? 1 : 0;
     const row = this.db.prepare(
       `SELECT COALESCE(MAX(seq), 0) AS seq FROM messages WHERE repo = ?
          AND seq > COALESCE((SELECT MAX(cursor) FROM cursors WHERE repo = ? AND client_key = ?), 0)
          AND (
-           to_name IS NULL
-           OR to_name = '*'
-           OR to_name = ?
-           OR (? IS NOT NULL AND to_name = ?)
-           OR (? IS NULL AND EXISTS (
-             SELECT 1 FROM agents ag WHERE ag.repo = messages.repo AND ag.session_id = messages.to_name AND ag.name = ?
+           (to_name IS NOT NULL AND to_name != '*' AND (
+             to_name = ?
+             OR (? IS NOT NULL AND to_name = ?)
+             OR (? IS NULL AND EXISTS (
+               SELECT 1 FROM agents ag WHERE ag.repo = messages.repo AND ag.session_id = messages.to_name AND ag.name = ?
+             ))
+           ))
+           OR
+           ((to_name IS NULL OR to_name = '*') AND (
+             ? IS NOT NULL
+             OR ? = '*'
+             OR topic IN ('repo', 'dm')
+             OR (? = 1 AND topic = 'reports')
+             OR EXISTS (
+               SELECT 1 FROM subscriptions sub
+               WHERE sub.repo = messages.repo
+                 AND sub.session_key = ?
+                 AND sub.topic = messages.topic
+                 AND messages.seq > sub.since_seq
+             )
            ))
          )
          AND ((? IS NULL AND topic != 'presence') OR topic = ?)`,
-    ).get(repo, repo, inboxCursorKey(cursorKey, topic), to, session, session, session, to, topic ?? null, topic ?? null) as { seq: number };
+    ).get(
+      repo,
+      repo,
+      inboxCursorKey(cursorKey, topic),
+      to,
+      session,
+      session,
+      session,
+      to,
+      topic ?? null,
+      to,
+      isOrch,
+      subKey,
+      topic ?? null,
+      topic ?? null,
+    ) as { seq: number };
     return row.seq;
   }
 
@@ -570,10 +637,18 @@ export class Store {
     const now = Date.now();
     const keyBySession = Boolean(agent.sessionId && (agent.bySession || !isPaneOrTty(agent.sessionId)));
     if (keyBySession && agent.sessionId) {
-      // Remove any unbound placeholder row for this (repo, name) once a real session id is bound.
+      const placeholder = this.db
+        .prepare(
+          "SELECT wake_session_id FROM agents WHERE repo = ? AND name = ? AND (session_key = ? OR status = 'invited') AND session_id IS NULL ORDER BY last_seen DESC LIMIT 1",
+        )
+        .get(agent.repo, agent.name, `name:${agent.name}`) as { wake_session_id: string | null } | undefined;
+      const carriedWakeSessionId = agent.wakeSessionId ?? placeholder?.wake_session_id ?? null;
+      // Remove any unbound or invited placeholder row for this (repo, name) once a real session id is bound.
       this.db
-        .prepare("DELETE FROM agents WHERE repo = ? AND session_key = ? AND session_id IS NULL")
-        .run(agent.repo, `name:${agent.name}`);
+        .prepare(
+          "DELETE FROM agents WHERE repo = ? AND name = ? AND (session_key = ? OR status = 'invited') AND session_id IS NULL",
+        )
+        .run(agent.repo, agent.name, `name:${agent.name}`);
       this.db
         .prepare(
           `INSERT INTO agents (repo, session_key, name, harness, session_id, wake_session_id, cwd, branch, head, wake, last_seen, status)
@@ -596,7 +671,7 @@ export class Store {
           agent.name,
           agent.harness,
           agent.sessionId,
-          agent.wakeSessionId ?? null,
+          carriedWakeSessionId,
           agent.cwd,
           agent.branch ?? null,
           agent.head ?? null,
@@ -745,11 +820,27 @@ export class Store {
 
   /** Compare the scanned registration before changing it; preserve concurrent reconnects. */
   pruneAgent(expected: AgentRecord, reason: "dead_pane" | "stale"): boolean {
+    const clearSessionId = reason === "dead_pane" && Boolean(expected.sessionId && isPaneOrTty(expected.sessionId));
+    const clearWakeSessionId = reason === "dead_pane";
+    const expectedWake = expected.wakeSessionId ?? expected.sessionId ?? null;
     const result = this.db.prepare(
-      `UPDATE agents SET status = 'offline', session_id = CASE WHEN ? = 'dead_pane' THEN NULL ELSE session_id END
-       WHERE repo = ? AND name = ? AND session_id IS ? AND last_seen = ? AND status = ?
-         AND (status != 'offline' OR (? = 'dead_pane' AND session_id IS NOT NULL))`,
-    ).run(reason, expected.repo, expected.name, expected.sessionId, expected.lastSeen, expected.status, reason);
+      `UPDATE agents
+       SET status = 'offline',
+           session_id = CASE WHEN ? = 1 THEN NULL ELSE session_id END,
+           wake_session_id = CASE WHEN ? = 1 THEN NULL ELSE wake_session_id END
+       WHERE repo = ? AND name = ? AND session_id IS ? AND COALESCE(wake_session_id, session_id) IS ? AND last_seen = ? AND status = ?
+         AND (status != 'offline' OR (? = 'dead_pane' AND (session_id IS NOT NULL OR wake_session_id IS NOT NULL)))`,
+    ).run(
+      clearSessionId ? 1 : 0,
+      clearWakeSessionId ? 1 : 0,
+      expected.repo,
+      expected.name,
+      expected.sessionId,
+      expectedWake,
+      expected.lastSeen,
+      expected.status,
+      reason,
+    );
     return result.changes > 0;
   }
 
@@ -771,8 +862,8 @@ export class Store {
 
   getAgentBySession(repo: string, sessionId: string): AgentRecord | undefined {
     const row = this.db
-      .prepare("SELECT * FROM agents WHERE repo = ? AND (session_id = ? OR session_key = ?) LIMIT 1")
-      .get(repo, sessionId, sessionId) as AgentRow | undefined;
+      .prepare("SELECT * FROM agents WHERE repo = ? AND (session_id = ? OR wake_session_id = ? OR session_key = ?) LIMIT 1")
+      .get(repo, sessionId, sessionId, sessionId) as AgentRow | undefined;
     return row ? mapAgent(row, false) : undefined;
   }
 

@@ -284,3 +284,53 @@ test("CLI wait holds an online WS presence without double-counting and wakes imm
     await fx.close();
   }
 });
+
+test("waitForMessages filters unsubscribed custom broadcast topics and scopes directed messages by sessionId", async () => {
+  const store = new Store(":memory:");
+  try {
+    const s1 = "019c8e1c-0001-7000-8000-000000000001";
+    const s2 = "019c8e1c-0002-7000-8000-000000000002";
+    store.upsertAgent({ repo: "board", name: "grok", harness: "grok", sessionId: s1, cwd: "/work", wake: false, status: "online", bySession: true });
+    store.upsertAgent({ repo: "board", name: "grok", harness: "grok", sessionId: s2, cwd: "/work", wake: false, status: "online", bySession: true });
+
+    // 1. Unsubscribed broadcast on custom topic 'alerts' and 'reports' (for worker) should not wake waitForMessages
+    insert(store, { to: null, topic: "alerts", body: "unsubscribed broadcast" });
+    insert(store, { to: null, topic: "reports", body: "orchestrator report" });
+    // Message directed to sibling session s2 should not wake s1
+    insert(store, { to: s2, topic: "dm", body: "only for s2" });
+
+    const resBeforeSub = await waitForMessages(store, {
+      repo: "board",
+      to: "grok",
+      sessionId: s1,
+      subscriptionKey: s1,
+      isOrchestrator: false,
+      wakeExisting: true,
+      timeoutMs: 0,
+    });
+    assert.equal(resBeforeSub.status, "TIMEOUT");
+
+    // 2. Subscribing s1 to 'alerts' and publishing a new message wakes s1
+    const subSeq = store.maxSeq("board");
+    store.subscribe("board", s1, ["alerts"], subSeq);
+    const liveAlert = insert(store, { to: null, topic: "alerts", body: "subscribed broadcast" });
+    const directS1 = insert(store, { to: s1, topic: "dm", body: "direct for s1" });
+
+    const resAfterSub = await waitForMessages(store, {
+      repo: "board",
+      to: "grok",
+      sessionId: s1,
+      subscriptionKey: s1,
+      isOrchestrator: false,
+      wakeExisting: true,
+      timeoutMs: 0,
+    });
+    assert.equal(resAfterSub.status, "MESSAGES");
+    assert.deepEqual(
+      resAfterSub.messages.map((m) => m.seq),
+      [liveAlert.seq, directS1.seq],
+    );
+  } finally {
+    store.close();
+  }
+});

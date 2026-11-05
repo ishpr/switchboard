@@ -35,6 +35,9 @@ export class BusClient {
 
   updateHello(patch: Partial<ClientHello>): void {
     if (this.lastHello) {
+      if (patch.repoKey && patch.repoKey !== this.lastHello.repoKey) {
+        this.subscribedTopics.clear();
+      }
       this.lastHello = { ...this.lastHello, ...patch };
     }
   }

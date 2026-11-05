@@ -440,6 +440,7 @@ async function waitCmd(): Promise<void> {
     const result = await waitForMessages(store, {
       repo, to, timeoutMs, intervalMs, sinceSeq,
       wakeExisting: values["wake-existing"], cursorKey, topic: values.topic,
+      sessionId: values.session,
     }, {
       onReady: (baseline) => process.stderr.write(`waiting to=${to} since_seq=${baseline} timeout_seconds=${timeoutMs / 1000}\n`),
       subscribeWake: waitClient
@@ -544,6 +545,7 @@ async function ask(): Promise<void> {
       message: { type: "string" },
       topic: { type: "string" },
       supersedes: { type: "string" },
+      "ratio-project": { type: "string" },
       name: { type: "string" },
       cwd: { type: "string" },
       role: { type: "string" },
@@ -562,6 +564,7 @@ async function ask(): Promise<void> {
       body: values.message,
       topic: values.topic,
       supersedes: values.supersedes,
+      ratioProject: values["ratio-project"],
     });
     if (frame.type !== "published") throw new Error("unexpected response");
     process.stdout.write(

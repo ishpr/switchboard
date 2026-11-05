@@ -12,7 +12,7 @@ import {
   type SpawnTerminalTab,
 } from "./init.ts";
 import { gitCheckoutInfo, gitRepoRoot, repoKey } from "./repo.ts";
-import { createPaneProbe, formatDiagnostics, sessionDiagnostics, type PaneProbe } from "./health.ts";
+import { createPaneProbe, formatDiagnostics, paneTarget, sessionDiagnostics, type PaneProbe } from "./health.ts";
 import { BUILD, buildWarning, runtimeInfo } from "./build.ts";
 import { extractStateRatioProject } from "./status.ts";
 import { Store, inboxCursorKey } from "./store.ts";
@@ -105,7 +105,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     options.isTurnInProgress ??
     ((harness: string, sessionId: string | null) =>
       harness === "codex" && isCodexTurnInProgress(sessionId));
-  const trailingWakes = new Map<string, ReturnType<typeof setTimeout>>();
+  const trailingWakes = new Map<string, { timer: ReturnType<typeof setTimeout>; message: BusMessage }>();
   const daemonInfo = runtimeInfo();
   const onlineGroups = new Set<string>();
   const pendingOffline = new Map<string, ReturnType<typeof setTimeout>>();
@@ -270,7 +270,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         await sendWho(conn, respond);
         break;
       case "ask":
-        await ask(conn, frame.to, frame.body, frame.topic, frame.supersedes, respond);
+        await ask(conn, frame.to, frame.body, frame.topic, frame.supersedes, frame.ratioProject, respond);
         break;
       case "reply":
         await reply(conn, frame.correlationId, frame.body, frame.state, respond);
@@ -382,7 +382,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       return repoAgents;
     }).map((agent) => ({
       agent,
-      stored: store.getAgent(agent.repo, agent.sessionId || agent.name),
+      stored: store.getAgent(agent.repo, agent.sessionId || agent.wakeSessionId || agent.name),
     }));
     const rows = await Promise.all(candidates.map(async ({ agent }) => ({
       ...agent, diagnostics: await diagnostics(agent, probe, ratioByRepo.get(agent.repo)),
@@ -394,11 +394,37 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         const stored = candidates[i]!.stored;
         const reason = row.diagnostics.health;
         if (reason !== "dead_pane" && reason !== "stale") continue;
-        const current = agents(row.repo, { includeAllOffline: true }).find((peer) => peer.name === row.name && peer.sessionId === row.sessionId);
+        const current = agents(row.repo, { includeAllOffline: true }).find(
+          (peer) =>
+            peer.name === row.name &&
+            peer.sessionId === row.sessionId &&
+            (peer.wakeSessionId ?? null) === (row.wakeSessionId ?? null),
+        );
         if (!current || current.lastSeen !== row.lastSeen) continue;
-        // Only mutate the registration if it still belongs to the scanned session.
-        const targetId = row.sessionId ?? row.wakeSessionId ?? null;
-        const ownsRegistration = stored?.sessionId === targetId;
+        // Only mutate the registration if it still belongs to the scanned session and is not owned by a live healthy sibling.
+        const targetId =
+          (reason === "dead_pane"
+            ? (row.wakeSessionId ?? row.sessionId)
+            : (row.sessionId ?? row.wakeSessionId)) ?? null;
+        const liveSiblingOwnsStored = Boolean(
+          stored &&
+            rows.some(
+              (other) =>
+                other !== row &&
+                other.repo === row.repo &&
+                other.name === row.name &&
+                other.diagnostics.health === "online" &&
+                ((stored.sessionId !== null && other.sessionId === stored.sessionId) ||
+                  (stored.wakeSessionId && other.wakeSessionId === stored.wakeSessionId)),
+            ),
+        );
+        const ownsRegistration = Boolean(
+          stored &&
+            !liveSiblingOwnsStored &&
+            (stored.sessionId === row.sessionId ||
+              stored.sessionId === targetId ||
+              (targetId !== null && stored.wakeSessionId === targetId)),
+        );
         if (ownsRegistration && !store.pruneAgent(stored!, reason)) continue;
         let clearedLiveBinding = false;
         if (reason === "dead_pane") {
@@ -409,9 +435,13 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
               peer.name === row.name &&
               (peer.sessionId === targetId || peer.wakeSessionId === targetId)
             ) {
-              peer.sessionBound = false;
-              peer.sessionId = null;
-              peer.wakeSessionId = null;
+              if (peer.sessionId === targetId) {
+                peer.sessionBound = false;
+                peer.sessionId = null;
+              }
+              if (peer.wakeSessionId === targetId) {
+                peer.wakeSessionId = null;
+              }
               clearedLiveBinding = true;
             }
           }
@@ -482,12 +512,15 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     conn.sessionId = conn.declaredSession;
     conn.wakeSessionId =
       frame.wakeSessionId ||
-      ((!conn.sessionBound || conn.sessionId === existing?.sessionId) ? existing?.wakeSessionId : null) ||
+      ((!conn.sessionBound || conn.sessionId === existing?.sessionId || !existing?.sessionId)
+        ? existing?.wakeSessionId
+        : null) ||
       (conn.sessionBound ? conn.sessionId : existing?.sessionId ?? null);
     conn.build = frame.build;
     conn.wake = frame.wake === undefined ? (existing?.wake ?? false) : frame.wake;
+    const existingStatus = existing?.status === "invited" ? undefined : existing?.status;
     conn.status = [...conns].find((peer) => peer !== conn && peer.authed && groupKey(peer) === groupKey(conn))?.status
-      || frame.status || existing?.status || "online";
+      || frame.status || existingStatus || "online";
     conn.role = conn.cwd === "/" ? "worker" : elect(conn.repo, conn.name, frame.role === "orchestrator");
     if (conn.cwd !== "/") {
       restoreSubscriptions(conn);
@@ -500,8 +533,8 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       }
     }
     if (conn.cwd !== "/" && conn.harness !== "cli" && !conn.waitOnly && (!existing || conn.sessionBound)) {
-      if (!isSessionLiveInOtherRepo(conn.repo, conn.declaredSession, frame.wakeSessionId)) {
-        store.evictCrossRepoBinding(conn.repo, conn.declaredSession, frame.wakeSessionId);
+      if (!isSessionLiveInOtherRepo(conn.repo, conn.declaredSession, conn.wakeSessionId)) {
+        store.evictCrossRepoBinding(conn.repo, conn.declaredSession, conn.wakeSessionId);
       }
       store.upsertAgent({
         repo: conn.repo,
@@ -529,7 +562,12 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         status: conn.status,
       });
     } else if (conn.cwd !== "/" && conn.harness !== "cli") {
-      store.touchAgent(conn.repo, conn.name, undefined, conn.sessionId);
+      store.touchAgent(
+        conn.repo,
+        conn.name,
+        existing?.status === "invited" ? conn.status : undefined,
+        conn.sessionId,
+      );
     }
     respond({
       type: "welcome",
@@ -547,7 +585,17 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
   }
 
   function elect(repo: string, name: string, wants: boolean): Role {
-    const stored = store.getOrchestrator(repo);
+    let stored = store.getOrchestrator(repo);
+    if (!stored) {
+      const cfgOrch = readRepoConfigByKey(repo)?.orchestrator?.trim();
+      if (cfgOrch) {
+        const canonical = resolveOrchestratorName(cfgOrch);
+        if (NAME_RE.test(canonical)) {
+          store.setOrchestrator(repo, canonical);
+          stored = canonical;
+        }
+      }
+    }
     if (stored) {
       return stored === name ? "orchestrator" : "worker";
     }
@@ -556,23 +604,37 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     return "orchestrator";
   }
 
+  function applyOrchestrator(conn: Conn, rawName: string, resolveAlias = false): void {
+    const nextOrch = resolveAlias ? resolveOrchestratorName(rawName.trim()) : rawName.trim();
+    requireName(nextOrch);
+    const currentOrch = store.getOrchestrator(conn.repo);
+    if (
+      currentOrch &&
+      currentOrch !== nextOrch &&
+      conn.name !== currentOrch &&
+      conn.harness !== "cli"
+    ) {
+      throw new Error(`orchestrator is already ${currentOrch}; only ${currentOrch} or the CLI can reassign it`);
+    }
+    store.setOrchestrator(conn.repo, nextOrch);
+    for (const peer of conns) {
+      if (!peer.authed || peer.repo !== conn.repo) continue;
+      if (peer.name === nextOrch) {
+        peer.role = "orchestrator";
+        peer.topics.add("reports");
+      } else if (peer.role === "orchestrator") {
+        peer.role = "worker";
+        if (!store.subscriptions(conn.repo, subscriptionKey(peer)).has("reports")) {
+          peer.topics.delete("reports");
+        }
+      }
+    }
+  }
+
   function setOrchestrator(conn: Conn, name: string | undefined, respond: Respond): void {
     requireBoundRepo(conn);
     if (name !== undefined) {
-      requireName(name);
-      store.setOrchestrator(conn.repo, name);
-      for (const peer of conns) {
-        if (!peer.authed || peer.repo !== conn.repo) continue;
-        if (peer.name === name) {
-          peer.role = "orchestrator";
-          peer.topics.add("reports");
-        } else if (peer.role === "orchestrator") {
-          peer.role = "worker";
-          if (!store.subscriptions(conn.repo, subscriptionKey(peer)).has("reports")) {
-            peer.topics.delete("reports");
-          }
-        }
-      }
+      applyOrchestrator(conn, name, false);
     }
     respond({
       type: "orchestrator",
@@ -658,6 +720,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
   }
 
   function restoreSubscriptions(conn: Conn): void {
+    conn.topics.clear();
     conn.topics.add("repo");
     conn.topics.add("presence");
     if (conn.role === "orchestrator") conn.topics.add("reports");
@@ -721,6 +784,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     body: string,
     topic: string | undefined,
     supersedes: string | undefined,
+    ratioProject: string | undefined,
     respond: Respond,
   ): Promise<void> {
     requireBoundRepo(conn);
@@ -743,15 +807,35 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       const priorAsk = store.byCorrelation(conn.repo, supersedes);
       if (!priorAsk) throw new Error("no ask with that supersedes correlation id");
     }
-    const bodyRatioMatch = /(?:X-Ratio-Project|ratio_project)\s*[=:]\s*["']?(p-[a-z0-9_-]+)["']?/i.exec(body);
     const boardExpectedRatio =
-      bodyRatioMatch?.[1] ??
-      extractStateRatioProject(store.listState(conn.repo)) ??
-      readRepoConfigByKey(conn.repo)?.ratioProject?.trim() ??
+      ratioProject?.trim() ||
+      extractStateRatioProject(store.listState(conn.repo)) ||
+      readRepoConfigByKey(conn.repo)?.ratioProject?.trim() ||
       null;
     if (boardExpectedRatio) {
-      const target = describeTarget(conn.repo, to);
-      if (target) {
+      const liveTargets = [...conns]
+        .filter(
+          (peer) =>
+            peer.authed &&
+            peer.repo === conn.repo &&
+            peer.harness !== "cli" &&
+            !peer.waitOnly &&
+            (peer.name === to || peer.sessionId === to || peer.declaredSession === to),
+        )
+        .map((peer) => ({
+          name: peer.name,
+          harness: peer.harness,
+          cwd: peer.cwd,
+          sessionId: peer.sessionId,
+        }));
+      const fallbackTarget = describeTarget(conn.repo, to);
+      const targetsToCheck =
+        liveTargets.length > 0
+          ? liveTargets
+          : fallbackTarget
+            ? [fallbackTarget]
+            : [];
+      for (const target of targetsToCheck) {
         const targetRatio = discoverRatioBinding({
           cwd: target.cwd,
           harness: target.harness,
@@ -762,8 +846,10 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
           targetRatio.project !== "unpinned" &&
           targetRatio.project !== boardExpectedRatio
         ) {
+          const label =
+            liveTargets.length > 1 && target.sessionId ? `${target.name} (session=${target.sessionId})` : target.name;
           throw new Error(
-            `cannot ask ${target.name}: Ratio project mismatch (${target.name} has X-Ratio-Project=${targetRatio.project} in ${targetRatio.source}, but this board/ask requires ${boardExpectedRatio})`,
+            `cannot ask ${label}: Ratio project mismatch (${target.name} has X-Ratio-Project=${targetRatio.project} in ${targetRatio.source} [configured MCP header], but this board/ask requires ${boardExpectedRatio})`,
           );
         }
       }
@@ -900,6 +986,21 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     respond({ type: "state", action: "delete", ok: true, entry: null, deleted: res.deleted, rev: res.rev });
   }
 
+  function clearPendingWakeTarget(repo: string, target: string | null | undefined, maxAckedSeq?: number): void {
+    if (!target) return;
+    const key = JSON.stringify([repo, target]);
+    const entry = trailingWakes.get(key);
+    if (entry && (maxAckedSeq === undefined || entry.message.seq <= maxAckedSeq || !isMessageUnreadForTarget(repo, entry.message))) {
+      clearTimeout(entry.timer);
+      trailingWakes.delete(key);
+      store.clearDeferredWake(repo, target);
+      return;
+    }
+    if (!entry) {
+      store.clearDeferredWake(repo, target);
+    }
+  }
+
   function inbox(
     conn: Conn,
     since: number | undefined,
@@ -944,9 +1045,9 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
           store.ack(conn.repo, companionKey, next);
         }
       }
-      store.clearDeferredWake(conn.repo, conn.name);
-      if (conn.sessionId) store.clearDeferredWake(conn.repo, conn.sessionId);
-      if (primary) store.clearDeferredWake(conn.repo, primary);
+      clearPendingWakeTarget(conn.repo, conn.name, next);
+      if (conn.sessionId) clearPendingWakeTarget(conn.repo, conn.sessionId, next);
+      if (primary) clearPendingWakeTarget(conn.repo, primary, next);
     }
     store.touchAgent(conn.repo, conn.name, undefined, conn.sessionId);
     const updatedCursor = shouldAck ? store.cursor(conn.repo, key) : next;
@@ -968,39 +1069,60 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     requireName(frame.name);
     if (!frame.cwd || frame.cwd === "/") throw new Error('cannot register: cwd is "/"');
     if (!frame.harness) throw new Error("harness required");
-    if (conn.cwd === "/" || (frame.rebind && conn.harness !== "cli")) {
-      const targetRoot = gitRepoRoot(frame.cwd);
-      if (!existsSync(frame.cwd) || !existsSync(`${targetRoot}/.git`)) {
+    const isRebind = conn.cwd === "/" || Boolean(frame.rebind && conn.harness !== "cli");
+    let nextCwd = frame.cwd;
+    let nextRepo = conn.repo;
+    if (isRebind) {
+      const sharedRoot = gitRepoRoot(frame.cwd, "share");
+      const splitRoot = gitRepoRoot(frame.cwd, "split");
+      if (!existsSync(frame.cwd) || (!existsSync(`${sharedRoot}/.git`) && !existsSync(`${splitRoot}/.git`))) {
         throw new Error(`cannot bind repository: ${frame.cwd} is not a git checkout`);
       }
-      const nextRepo = repoKey(targetRoot);
-      if (conn.repo && conn.repo !== nextRepo) {
+      nextCwd = splitRoot;
+      nextRepo = repoKey(frame.cwd);
+    } else {
+      requireBoundRepo(conn);
+      if (
+        frame.cwd !== conn.cwd &&
+        existsSync(frame.cwd) &&
+        existsSync(conn.cwd) &&
+        existsSync(`${gitRepoRoot(frame.cwd)}/.git`) &&
+        existsSync(`${gitRepoRoot(conn.cwd)}/.git`) &&
+        repoKey(frame.cwd) !== conn.repo &&
+        repoKey(frame.cwd, "split") !== conn.repo &&
+        repoKey(frame.cwd) !== repoKey(conn.cwd)
+      ) {
+        throw new Error("cannot register: cwd belongs to a different repository board");
+      }
+      if (existsSync(frame.cwd) && (existsSync(`${gitRepoRoot(frame.cwd)}/.git`) || existsSync(`${gitRepoRoot(frame.cwd, "split")}/.git`))) {
+        nextCwd = gitRepoRoot(frame.cwd, "split");
+      }
+      nextRepo = conn.repo;
+    }
+    if (isSessionLiveInOtherRepo(nextRepo, frame.sessionId, frame.wakeSessionId, conn)) {
+      throw new Error("cannot register: session is currently active in another repository board");
+    }
+    const oldCwd = conn.cwd;
+    const oldRepo = conn.repo;
+    const nextDeclaredSession =
+      conn.harness !== "cli" && conn.name === frame.name && frame.sessionId
+        ? frame.sessionId
+        : conn.declaredSession;
+    const groupChanged = oldRepo !== nextRepo || conn.declaredSession !== nextDeclaredSession;
+    if (oldCwd !== "/" && groupChanged && conn.harness !== "cli") {
+      presence(conn, "offline");
+    }
+    if (isRebind) {
+      if (oldRepo && oldRepo !== nextRepo) {
         store.evictCrossRepoBinding(nextRepo, conn.sessionId, conn.wakeSessionId);
       }
-      conn.cwd = targetRoot;
+      conn.cwd = nextCwd;
       conn.repo = nextRepo;
-      const orch = store.getOrchestrator(conn.repo);
-      conn.role = orch === conn.name ? "orchestrator" : "worker";
-    }
-    requireBoundRepo(conn);
-    if (
-      frame.cwd !== conn.cwd &&
-      existsSync(frame.cwd) &&
-      existsSync(conn.cwd) &&
-      existsSync(`${gitRepoRoot(frame.cwd)}/.git`) &&
-      existsSync(`${gitRepoRoot(conn.cwd)}/.git`) &&
-      repoKey(frame.cwd) !== conn.repo &&
-      repoKey(frame.cwd, "split") !== conn.repo &&
-      repoKey(frame.cwd) !== repoKey(conn.cwd)
-    ) {
-      throw new Error("cannot register: cwd belongs to a different repository board");
-    }
-    if (isSessionLiveInOtherRepo(conn.repo, frame.sessionId, frame.wakeSessionId, conn)) {
-      throw new Error("cannot register: session is currently active in another repository board");
+      conn.role = elect(conn.repo, conn.name, conn.role === "orchestrator");
     }
     store.evictCrossRepoBinding(conn.repo, frame.sessionId, frame.wakeSessionId);
     const existing = frame.sessionId
-      ? store.getAgentBySession(conn.repo, frame.sessionId)
+      ? (store.getAgentBySession(conn.repo, frame.sessionId) ?? store.getAgent(conn.repo, frame.name))
       : store.getAgent(conn.repo, frame.name);
     if (frame.sessionId) {
       store.migrateSubscriptions(conn.repo, `name:${frame.name}`, frame.sessionId);
@@ -1015,19 +1137,27 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     const checkout =
       frame.branch !== undefined || frame.head !== undefined
         ? { branch: frame.branch ?? null, head: frame.head ?? null }
-        : gitCheckoutInfo(frame.cwd);
+        : gitCheckoutInfo(nextCwd);
     const wake = frame.wake === undefined ? (existing?.wake ?? conn.wake) : frame.wake;
+    const existingStatus =
+      existing?.status === "invited"
+        ? (conn.harness !== "cli" && conn.name === frame.name ? "online" : "registered")
+        : existing?.status;
     const status =
       conn.harness === "cli" || conn.name !== frame.name
-        ? (existing?.status || "registered")
-        : (conn.status || "online");
+        ? (existingStatus || "registered")
+        : (conn.status === "invited" ? "online" : (conn.status || "online"));
+    const inheritedWakeSessionId =
+      frame.wakeSessionId ??
+      (!existing?.sessionId || existing.sessionId === frame.sessionId ? existing?.wakeSessionId : null) ??
+      null;
     const saved = store.upsertAgent({
       repo: conn.repo,
       name: frame.name,
       harness: frame.harness,
       sessionId: frame.sessionId || null,
-      wakeSessionId: frame.wakeSessionId ?? existing?.wakeSessionId ?? null,
-      cwd: frame.cwd,
+      wakeSessionId: inheritedWakeSessionId,
+      cwd: nextCwd,
       branch: checkout.branch,
       head: checkout.head,
       wake,
@@ -1039,14 +1169,25 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         conn.declaredSession = frame.sessionId;
         conn.sessionId = frame.sessionId;
         conn.sessionBound = true;
+      } else if (isRebind && oldRepo !== nextRepo) {
+        conn.declaredSession = null;
+        conn.sessionId = null;
+        conn.sessionBound = false;
       }
-      if (frame.wakeSessionId || frame.sessionId) {
-        conn.wakeSessionId = frame.wakeSessionId || frame.sessionId || conn.wakeSessionId;
-      }
-      conn.branch = checkout.branch ?? conn.branch;
-      conn.head = checkout.head ?? conn.head;
+      conn.wakeSessionId =
+        frame.wakeSessionId ||
+        saved.wakeSessionId ||
+        frame.sessionId ||
+        (oldRepo === nextRepo ? conn.wakeSessionId : null);
+      conn.branch = checkout.branch ?? (oldRepo === nextRepo ? conn.branch : null);
+      conn.head = checkout.head ?? (oldRepo === nextRepo ? conn.head : null);
       conn.wake = wake;
+      conn.status = status;
       restoreSubscriptions(conn);
+      if (conn.cwd !== "/" && (oldCwd === "/" || groupChanged)) {
+        presence(conn, "online");
+        replayDeferredWakes(conn.repo);
+      }
     } else {
       for (const peer of conns) {
         if (!peer.authed || peer.repo !== conn.repo || peer.name !== frame.name || peer.harness === "cli") continue;
@@ -1055,8 +1196,8 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
           peer.sessionId = frame.sessionId;
           peer.sessionBound = true;
         }
-        if (frame.wakeSessionId || frame.sessionId) {
-          peer.wakeSessionId = frame.wakeSessionId || frame.sessionId || peer.wakeSessionId;
+        if (frame.wakeSessionId || saved.wakeSessionId || frame.sessionId) {
+          peer.wakeSessionId = frame.wakeSessionId || saved.wakeSessionId || frame.sessionId || peer.wakeSessionId;
         }
         peer.branch = checkout.branch ?? peer.branch;
         peer.head = checkout.head ?? peer.head;
@@ -1064,7 +1205,14 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         restoreSubscriptions(peer);
       }
     }
-    respond({ type: "registered", name: frame.name, agent: saved, created: !existing });
+    respond({
+      type: "registered",
+      name: frame.name,
+      agent: saved,
+      created: !existing,
+      role: conn.role,
+      orchestrator: store.getOrchestrator(conn.repo),
+    });
   }
 
   async function invite(
@@ -1081,23 +1229,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       throw new Error("invite mode must be terminal or headless");
     }
     if (frame.orchestrator !== undefined && frame.orchestrator.trim()) {
-      const nextOrch = resolveOrchestratorName(frame.orchestrator.trim());
-      requireName(nextOrch);
-      const currentOrch = store.getOrchestrator(conn.repo);
-      if (
-        currentOrch &&
-        currentOrch !== nextOrch &&
-        conn.name !== currentOrch &&
-        conn.harness !== "cli"
-      ) {
-        throw new Error(`orchestrator is already ${currentOrch}; only ${currentOrch} or the CLI can reassign it`);
-      }
-      store.setOrchestrator(conn.repo, nextOrch);
-      for (const peer of conns) {
-        if (peer.authed && peer.repo === conn.repo) {
-          peer.role = peer.name === nextOrch ? "orchestrator" : "worker";
-        }
-      }
+      applyOrchestrator(conn, frame.orchestrator, true);
     }
     const repoRootDir = gitRepoRoot(conn.cwd);
     const checkout = gitCheckoutInfo(repoRootDir);
@@ -1233,13 +1365,21 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     if (!message.to) return false;
     const target = describeTarget(repo, message.to);
     if (!target) return false;
+    const row = store.getAgent(repo, message.to);
+    const isDirectSession = looksLikeSessionTarget(message.to);
     const cursorKeys = new Set<string>([target.name, message.to]);
     if (target.declaredSession && !target.declaredSession.startsWith("zellij:")) {
       cursorKeys.add(`${target.name}:${target.declaredSession}`);
     }
+    if (row?.sessionId && !row.sessionId.startsWith("zellij:")) {
+      cursorKeys.add(`${target.name}:${row.sessionId}`);
+    }
     for (const peer of conns) {
       if (!peer.authed || peer.repo !== repo || peer.harness === "cli") continue;
-      if (peer.name === target.name || peer.sessionId === message.to || peer.declaredSession === message.to) {
+      const matchesPeer = isDirectSession
+        ? peer.sessionId === message.to || peer.declaredSession === message.to || (!peer.sessionBound && peer.name === target.name)
+        : peer.name === target.name || peer.sessionId === message.to || peer.declaredSession === message.to;
+      if (matchesPeer) {
         cursorKeys.add(clientKey(peer));
       }
     }
@@ -1276,11 +1416,21 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
   }
 
   function scheduleTrailingWake(key: string, repo: string, message: BusMessage): void {
-    if (message.to) {
-      store.saveDeferredWake(repo, message.to, message.seq);
-    }
     const existing = trailingWakes.get(key);
-    if (existing) clearTimeout(existing);
+    let effectiveMessage = message;
+    if (existing) {
+      clearTimeout(existing.timer);
+      if (
+        existing.message.kind === "ask" &&
+        message.kind !== "ask" &&
+        isMessageUnreadForTarget(repo, existing.message)
+      ) {
+        effectiveMessage = existing.message;
+      }
+    }
+    if (effectiveMessage.to) {
+      store.saveDeferredWake(repo, effectiveMessage.to, effectiveMessage.seq);
+    }
     const elapsed = Date.now() - (lastWake.get(key) ?? 0);
     const remainingCooldown = wakeCooldownMs - Math.max(0, elapsed);
     const delay =
@@ -1290,14 +1440,14 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     const timer = setTimeout(() => {
       trailingWakes.delete(key);
       if (stopping) return;
-      if (!isMessageUnreadForTarget(repo, message)) {
-        if (message.to) store.clearDeferredWake(repo, message.to);
+      if (!isMessageUnreadForTarget(repo, effectiveMessage)) {
+        if (effectiveMessage.to) store.clearDeferredWake(repo, effectiveMessage.to);
         return;
       }
-      void wakeFor(repo, message);
+      void wakeFor(repo, effectiveMessage);
     }, delay);
     timer.unref?.();
-    trailingWakes.set(key, timer);
+    trailingWakes.set(key, { timer, message: effectiveMessage });
   }
 
   function replayDeferredWakes(repoFilter?: string): void {
@@ -1374,6 +1524,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       store.clearDeferredWake(repo, message.to);
       return info;
     } catch (error) {
+      store.clearDeferredWake(repo, message.to);
       const messageText = error instanceof Error ? error.message : "spawn failed";
       return { mode: "skip", detail: `wake failed: ${messageText}` };
     } finally {
@@ -1406,7 +1557,9 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       ?? candidates.find((conn) => conn.sessionBound) ?? candidates[0];
     if (!live && !row) return null;
     const liveWakeSession = live
-      ? (live.wakeSessionId || ((!live.sessionBound || live.sessionId === row?.sessionId) ? row?.wakeSessionId : null) || (live.sessionBound ? live.sessionId : null))
+      ? (live.wakeSessionId ||
+        ((!live.sessionBound || live.sessionId === row?.sessionId || !row?.sessionId) ? row?.wakeSessionId : null) ||
+        (live.sessionBound ? live.sessionId : null))
       : null;
     return {
       name: live?.name ?? row!.name,
@@ -1453,7 +1606,9 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         sessionId: conn.sessionId,
         wakeSessionId:
           conn.wakeSessionId ||
-          ((!conn.sessionBound || conn.sessionId === registered?.sessionId) ? registered?.wakeSessionId : null) ||
+          ((!conn.sessionBound || conn.sessionId === registered?.sessionId || !registered?.sessionId)
+            ? registered?.wakeSessionId
+            : null) ||
           (conn.sessionBound ? conn.sessionId : registered?.sessionId ?? null),
         cwd: conn.cwd,
         branch: conn.branch ?? registered?.branch ?? null,
@@ -1461,7 +1616,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         wake: registered?.wake ?? conn.wake,
         lastSeen: Math.max(...members.map((member) => member.lastSeen)),
         online: true,
-        status: conn.status || "online",
+        status: conn.status === "invited" ? "online" : (conn.status || "online"),
         role: conn.role,
         connectionCount: counted.length,
         connectionIds: counted.map((member) => member.agentId),
@@ -1471,13 +1626,18 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     });
     const includeAllOffline = Boolean(opts?.includeAllOffline);
     const liveNames = new Set(rows.map((row) => row.name));
-    const liveSessions = new Set(rows.flatMap((row) => (row.sessionId ? [row.sessionId] : [])));
+    const liveSessions = new Set(
+      rows.flatMap((row) => [
+        ...(row.sessionId ? [row.sessionId] : []),
+        ...(row.wakeSessionId ? [row.wakeSessionId] : []),
+      ]),
+    );
     const seenOfflineByName = new Set<string>();
     const staleCutoff = Date.now() - 24 * 60 * 60 * 1000;
     for (const row of store.listAgents(repo, new Set())) {
       const represented = row.sessionId
         ? liveSessions.has(row.sessionId) || rows.some((live) => live.online && live.name === row.name && !live.sessionId)
-        : liveNames.has(row.name);
+        : liveNames.has(row.name) || (row.wakeSessionId ? liveSessions.has(row.wakeSessionId) : false);
       if (represented) continue;
       if (!includeAllOffline && row.status !== "invited") {
         if (liveNames.has(row.name)) continue;
@@ -1487,7 +1647,10 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       }
       rows.push({
         ...row,
-        wakeSessionId: row.sessionId || row.wakeSessionId || null,
+        wakeSessionId:
+          row.status === "invited" || (row.wakeSessionId && paneTarget(row.wakeSessionId))
+            ? (row.wakeSessionId || row.sessionId || null)
+            : (row.sessionId || row.wakeSessionId || null),
         connectionCount: 0,
         role: row.name === orchestrator ? "orchestrator" : "worker",
         ratio: discoverRatioBinding({ cwd: row.cwd, harness: row.harness, name: row.name }),
@@ -1508,7 +1671,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         clearInterval(sweep);
         for (const timer of pendingOffline.values()) clearTimeout(timer);
         pendingOffline.clear();
-        for (const timer of trailingWakes.values()) clearTimeout(timer);
+        for (const entry of trailingWakes.values()) clearTimeout(entry.timer);
         trailingWakes.clear();
         for (const conn of conns) conn.socket.close();
         wss.close(() => {
