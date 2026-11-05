@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -215,6 +215,69 @@ export function discoverGrokSession(
   }
 }
 
+export function discoverClaudeSession(
+  cwd: string,
+  claudeHome = process.env.CLAUDE_CONFIG_DIR || path.join(homedir(), ".claude"),
+  ppid = process.ppid,
+): string | undefined {
+  if (!cwd || cwd === "/" || !existsSync(cwd)) return undefined;
+  const sessionsDir = path.join(claudeHome, "sessions");
+  if (!existsSync(sessionsDir)) return undefined;
+  try {
+    const sharedRoot = gitRepoRoot(cwd, "share");
+    const splitRoot = gitRepoRoot(cwd, "split");
+    if (ppid > 1) {
+      const directFile = path.join(sessionsDir, `${ppid}.json`);
+      if (existsSync(directFile)) {
+        const direct = JSON.parse(readFileSync(directFile, "utf8")) as {
+          sessionId?: string;
+          cwd?: string;
+        };
+        if (direct?.sessionId && UUID_RE.test(direct.sessionId)) {
+          if (
+            !direct.cwd ||
+            direct.cwd === cwd ||
+            (sharedRoot !== "/" && gitRepoRoot(direct.cwd, "share") === sharedRoot)
+          ) {
+            return direct.sessionId;
+          }
+        }
+      }
+    }
+    const entries: Array<{ sessionId: string; pid?: number; cwd: string; sortTs: number }> = [];
+    for (const file of readdirSync(sessionsDir)) {
+      if (!file.endsWith(".json")) continue;
+      try {
+        const raw = JSON.parse(readFileSync(path.join(sessionsDir, file), "utf8")) as {
+          sessionId?: string;
+          pid?: number;
+          cwd?: string;
+          updatedAt?: number;
+          startedAt?: number;
+        };
+        if (!raw?.sessionId || !UUID_RE.test(raw.sessionId) || !raw.cwd) continue;
+        if (raw.cwd !== cwd && (splitRoot === "/" || gitRepoRoot(raw.cwd, "split") !== splitRoot)) {
+          continue;
+        }
+        entries.push({
+          sessionId: raw.sessionId,
+          pid: raw.pid,
+          cwd: raw.cwd,
+          sortTs: Number(raw.updatedAt ?? raw.startedAt ?? 0),
+        });
+      } catch {
+        // skip unreadable session file
+      }
+    }
+    entries.sort((a, b) => b.sortTs - a.sortTs);
+    const byPpid = entries.find((e) => e.pid === ppid);
+    if (byPpid) return byPpid.sessionId;
+    return entries[0]?.sessionId;
+  } catch {
+    return undefined;
+  }
+}
+
 export function parsePtySessionFromPs(output: string): { ppid: number; session: string | null } {
   const trimmed = output.trim();
   const match = /^(\d+)\s+(.*)$/s.exec(trimmed);
@@ -228,7 +291,48 @@ export function parsePtySessionFromPs(output: string): { ppid: number; session: 
   return { ppid, session: null };
 }
 
-export function discoverPtySession(env: NodeJS.ProcessEnv = process.env): string | undefined {
+export function parseAttachedPtySessionFromPs(psOutput: string, sessionId: string): string | null {
+  if (!sessionId || !UUID_RE.test(sessionId)) return null;
+  const lowerSession = sessionId.toLowerCase();
+  const rows: Array<{ pid: number; ppid: number; cmd: string }> = [];
+  for (const rawLine of psOutput.split("\n")) {
+    const m = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(rawLine);
+    if (!m) continue;
+    rows.push({ pid: Number(m[1]), ppid: Number(m[2]), cmd: m[3]! });
+  }
+  const byPid = new Map(rows.map((r) => [r.pid, r]));
+  for (const row of rows) {
+    const sockMatch = /(\/[^\s"']*\/sb-(?:pty-\d+-)?\d+\.sock)\b/.exec(row.cmd);
+    if (!sockMatch) continue;
+    const sockPath = sockMatch[1]!;
+    const relatedCmds: string[] = [row.cmd];
+    const parent = byPid.get(row.ppid);
+    if (parent) relatedCmds.push(parent.cmd);
+    for (const child of rows) {
+      if (child.ppid === row.pid || (parent && child.ppid === parent.pid)) {
+        relatedCmds.push(child.cmd);
+        for (const grand of rows) {
+          if (grand.ppid === child.pid) relatedCmds.push(grand.cmd);
+        }
+      }
+    }
+    for (const cmd of relatedCmds) {
+      if (cmd.toLowerCase().includes(lowerSession)) {
+        return `pty:${sockPath}`;
+      }
+      const attachMatch = /\bclaude\s+attach\s+([0-9a-f]{6,36})\b/i.exec(cmd);
+      if (attachMatch && lowerSession.startsWith(attachMatch[1]!.toLowerCase())) {
+        return `pty:${sockPath}`;
+      }
+    }
+  }
+  return null;
+}
+
+export function discoverPtySession(
+  env: NodeJS.ProcessEnv = process.env,
+  sessionId?: string,
+): string | undefined {
   const fromEnv = env.SWITCHBOARD_WAKE_SESSION?.trim();
   if (fromEnv && /^pty:\/.+\.sock$/.test(fromEnv)) {
     return fromEnv;
@@ -248,6 +352,21 @@ export function discoverPtySession(env: NodeJS.ProcessEnv = process.env): string
       break;
     }
   }
+  if (sessionId && UUID_RE.test(sessionId)) {
+    try {
+      const allPs = execFileSync("ps", ["-axo", "pid=,ppid=,command="], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      const attached = parseAttachedPtySessionFromPs(allPs, sessionId);
+      if (attached) {
+        const sockPath = attached.slice("pty:".length);
+        if (existsSync(sockPath)) return attached;
+      }
+    } catch {
+      // ignore ps failure
+    }
+  }
   return undefined;
 }
 
@@ -255,6 +374,7 @@ export function discoverHarnessSession(opts: {
   cwd: string;
   harness: string;
   env?: NodeJS.ProcessEnv;
+  claudeHome?: string;
   codexHome?: string;
   grokHome?: string;
 }): { sessionId?: string; wakeSessionId?: string } {
@@ -263,13 +383,23 @@ export function discoverHarnessSession(opts: {
   const zellijSession = discoverZellijSession(env);
   const tmuxSession = discoverTmuxSession(env);
   const paneSession = zellijSession || tmuxSession;
-  const ptySession = !explicit && !paneSession ? discoverPtySession(env) : undefined;
   const envSession =
     env.CODEX_THREAD_ID?.trim() ||
     env.MUSE_SESSION_ID?.trim() ||
     env.CLAUDE_CODE_SESSION_ID?.trim() ||
     env.GROK_SESSION_ID?.trim() ||
     undefined;
+  const claudeSession =
+    !explicit &&
+    !paneSession &&
+    !envSession &&
+    opts.harness === "claude" &&
+    (Boolean(opts.claudeHome) || shouldInspectAncestorPs(env))
+      ? discoverClaudeSession(
+          opts.cwd,
+          opts.claudeHome || env.CLAUDE_CONFIG_DIR || path.join(homedir(), ".claude"),
+        )
+      : undefined;
   const codexThread =
     !explicit && !paneSession && !envSession && opts.harness === "codex"
       ? discoverCodexThread(opts.cwd, opts.codexHome)
@@ -278,12 +408,14 @@ export function discoverHarnessSession(opts: {
     !explicit && !paneSession && !envSession && opts.harness === "grok"
       ? discoverGrokSession(opts.cwd, opts.grokHome)
       : undefined;
+  const discoveredUuid = envSession || claudeSession || codexThread || grokSession;
+  const ptySession = !explicit && !paneSession ? discoverPtySession(env, discoveredUuid) : undefined;
   const ttySession =
     !explicit && !paneSession && !ptySession && opts.harness !== "codex"
       ? discoverTerminalTty(env, opts.harness)
       : undefined;
   const sessionId =
-    explicit || paneSession || envSession || codexThread || grokSession || ptySession || ttySession || undefined;
+    explicit || paneSession || discoveredUuid || ptySession || ttySession || undefined;
   const wakeSessionId = explicit || paneSession || ptySession || ttySession || sessionId || undefined;
   return { sessionId, wakeSessionId };
 }
@@ -296,7 +428,7 @@ export function missingSessionSource(harness: string, cwd: string): string {
     case "muse":
       return "cannot register: no session id found for muse; expected MUSE_SESSION_ID (or ZELLIJ_PANE_ID / TMUX_PANE / SWITCHBOARD_SESSION)";
     case "claude":
-      return "cannot register: no session id found for claude; expected CLAUDE_CODE_SESSION_ID (or ZELLIJ_PANE_ID / TMUX_PANE / SWITCHBOARD_SESSION)";
+      return `cannot register: no session id found for claude; expected CLAUDE_CODE_SESSION_ID or an active session file for ${cwd} in ~/.claude/sessions/<pid>.json (or ZELLIJ_PANE_ID / TMUX_PANE / SWITCHBOARD_SESSION)`;
     case "codex":
       return `cannot register: no session id found for codex; expected CODEX_THREAD_ID or an active user thread row for ${cwd} in ~/.codex/state_5.sqlite (or ZELLIJ_PANE_ID / TMUX_PANE / SWITCHBOARD_SESSION)`;
     case "grok":
@@ -488,8 +620,10 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
     wakeSessionId?: string;
     subscribeWake?: (wake: () => void) => () => void;
   }): void {
+  let lastSyncAttempt = 0;
   const syncRegistrationWithDaemon = async () => {
     if (!context.cwd || context.cwd === "/") return;
+    lastSyncAttempt = Date.now();
     try {
       const fresh = discoverHarnessSession({ cwd: context.cwd, harness: context.harness, env: process.env });
       const resolvedSessionId = fresh.sessionId || context.sessionId || fresh.wakeSessionId || context.wakeSessionId;
@@ -541,6 +675,13 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
     }
   };
 
+  const ensureSynced = async () => {
+    const needsWakeOrSession =
+      !context.sessionId || !context.wakeSessionId || context.wakeSessionId === context.sessionId;
+    if (!needsWakeOrSession || Date.now() - lastSyncAttempt < 3000) return;
+    await syncRegistrationWithDaemon();
+  };
+
   const busWithHook = bus as BusClient & { _baseOnMessage?: typeof bus.onMessage; _initialRegistered?: boolean };
   if (!busWithHook._baseOnMessage && bus.onMessage) {
     busWithHook._baseOnMessage = bus.onMessage;
@@ -552,10 +693,15 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
     if (frame.message.topic === "presence") return;
     busWithHook._baseOnMessage?.(frame);
   };
-  if (busWithHook._initialRegistered) {
+  if (
+    busWithHook._initialRegistered ||
+    !context.sessionId ||
+    !context.wakeSessionId ||
+    context.wakeSessionId === context.sessionId
+  ) {
     const reloadSyncTimer = setTimeout(() => {
       void syncRegistrationWithDaemon();
-    }, 150);
+    }, busWithHook._initialRegistered ? 150 : 600);
     reloadSyncTimer.unref?.();
   }
   busWithHook._initialRegistered = true;
@@ -715,6 +861,7 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
       },
     },
     async ({ topic, message, to, universal }) => {
+      await ensureSynced();
       const frame = await bus.request({
         type: "publish",
         topic: topic || "repo",
@@ -763,6 +910,7 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
       },
     },
     async ({ since, topic }) => {
+      await ensureSynced();
       const messages: BusMessage[] = [];
       let more = false;
       let pendingAsk: BusMessage | null = null;
@@ -800,6 +948,7 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
       inputSchema: {},
     },
     async () => {
+      await ensureSynced();
       const frame = await bus.request({ type: "who" });
       if (frame.type !== "who") return text("who unavailable");
       if (frame.orchestrator !== undefined) {
@@ -842,6 +991,7 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
       },
     },
     async ({ agent, question, topic, supersedes, ratio_project }) => {
+      await ensureSynced();
       const frame = await bus.request({
         type: "ask",
         to: agent,
@@ -866,6 +1016,7 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
       },
     },
     async ({ correlationId, message, state }) => {
+      await ensureSynced();
       const frame = await bus.request({ type: "reply", correlationId, body: message, state });
       return text(frame.type === "published" ? publishedText(frame) : "replied");
     },
@@ -879,6 +1030,7 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
       inputSchema: { message: z.string().describe("What the orchestrator should know") },
     },
     async ({ message }) => {
+      await ensureSynced();
       const frame = await bus.request({ type: "report", body: message });
       return text(frame.type === "published" ? publishedText(frame) : "reported");
     },
@@ -906,6 +1058,7 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
       },
     },
     async ({ to, timeout_seconds, interval_ms, since_seq, wake_existing, topic }, extra) => {
+      await ensureSynced();
       const ownHandle = context.sessionId ? sessionHandle(context.name, context.sessionId, context.harness) : null;
       const ownHarnessHandle = context.sessionId ? `${context.harness}-${context.sessionId.slice(0, 4)}`.toLowerCase() : null;
       const toLower = to?.toLowerCase();

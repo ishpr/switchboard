@@ -5,18 +5,20 @@ import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { hookStdout, shouldSkipHookForPrompt } from "../src/hook.ts";
 import {
+  discoverClaudeSession,
   discoverCodexThread,
   discoverGrokSession,
   discoverHarnessSession,
   instructions,
   missingSessionSource,
+  parseAttachedPtySessionFromPs,
   parsePtySessionFromPs,
   parseTerminalTtyFromPs,
   parseTmuxSessionFromPs,
   parseZellijSessionFromPs,
 } from "../src/shim.ts";
 import { createPaneProbe, paneTarget } from "../src/health.ts";
-import { normalizeHarnessArgs, runPtyWrap } from "../src/pty.ts";
+import { extractSessionTargetFromWrap, normalizeHarnessArgs, runPtyWrap } from "../src/pty.ts";
 import { DatabaseSync } from "node:sqlite";
 import type { BusMessage } from "../src/types.ts";
 import { augmentPath, decideWake, headlessLaunch, isCodexTurnInProgress, launchFor, promptFor, spawnWake } from "../src/wake.ts";
@@ -506,6 +508,40 @@ test("universal PTY relay wraps CLI processes, injects prompts over Unix socket,
     const parsedTmux = parseTmuxSessionFromPs("54321 zsh -lc claude TMUX_PANE=%14 PATH=/usr/bin");
     assert.equal(parsedTmux.ppid, 54321);
     assert.equal(parsedTmux.session, "tmux:%14");
+
+    const sampleAllPs = [
+      "30647 86788 node /Users/test/Switchboard/dist/cli.js wrap claude --resume dd09f9b0-41e0-40c8-b7c4-ecfd0407549a --channels server:switchboard",
+      "30655 30647 Python -c import pty /Users/test/.switchboard/pty/sb-30647.sock claude --resume dd09f9b0-41e0-40c8-b7c4-ecfd0407549a",
+      "30659 30655 /Users/test/.local/bin/claude attach dd09f9b0",
+    ].join("\n");
+    assert.equal(
+      parseAttachedPtySessionFromPs(sampleAllPs, "dd09f9b0-41e0-40c8-b7c4-ecfd0407549a"),
+      "pty:/Users/test/.switchboard/pty/sb-30647.sock",
+    );
+    assert.deepEqual(extractSessionTargetFromWrap(["--resume", "dd09f9b0-41e0-40c8-b7c4-ecfd0407549a"]), {
+      fullSessionId: "dd09f9b0-41e0-40c8-b7c4-ecfd0407549a",
+    });
+    assert.deepEqual(extractSessionTargetFromWrap([], sampleAllPs, 30655), {
+      prefix: "dd09f9b0",
+    });
+
+    const claudeSessionsDir = path.join(dir, "sessions");
+    mkdirSync(claudeSessionsDir, { recursive: true });
+    writeFileSync(
+      path.join(claudeSessionsDir, "37823.json"),
+      JSON.stringify({
+        pid: 37823,
+        sessionId: "dd09f9b0-41e0-40c8-b7c4-ecfd0407549a",
+        cwd: dir,
+        startedAt: 1000,
+        updatedAt: 2000,
+      }),
+    );
+    assert.equal(discoverClaudeSession(dir, dir, 37823), "dd09f9b0-41e0-40c8-b7c4-ecfd0407549a");
+    assert.equal(
+      discoverHarnessSession({ cwd: dir, harness: "claude", env: {}, claudeHome: dir }).sessionId,
+      "dd09f9b0-41e0-40c8-b7c4-ecfd0407549a",
+    );
 
     assert.deepEqual(normalizeHarnessArgs("claude", ["--resume", "abc", "--channels", "switchboard"]), [
       "--resume",

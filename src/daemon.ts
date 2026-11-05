@@ -566,12 +566,15 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     conn.declaredSession = declaredSession;
     conn.sessionBound = Boolean(frame.boundSession && declaredSession);
     conn.sessionId = conn.declaredSession;
-    conn.wakeSessionId =
-      frame.wakeSessionId ||
-      ((!conn.sessionBound || conn.sessionId === existing?.sessionId || !existing?.sessionId)
+    const eligibleExistingWake =
+      !conn.sessionBound || conn.sessionId === existing?.sessionId || !existing?.sessionId
         ? existing?.wakeSessionId
-        : null) ||
-      (conn.sessionBound ? conn.sessionId : existing?.sessionId ?? null);
+        : null;
+    conn.wakeSessionId = preferWakeSessionId(
+      frame.wakeSessionId,
+      eligibleExistingWake,
+      conn.sessionBound ? conn.sessionId : (existing?.sessionId ?? null),
+    );
     conn.build = frame.build;
     conn.wake = frame.wake === undefined ? (existing?.wake ?? false) : frame.wake;
     const existingStatus = existing?.status === "invited" ? undefined : existing?.status;
@@ -597,7 +600,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         name: conn.name,
         harness: conn.harness,
         sessionId: conn.sessionBound ? conn.declaredSession : (existing?.sessionId ?? null),
-        wakeSessionId: frame.wakeSessionId ?? existing?.wakeSessionId ?? null,
+        wakeSessionId: preferWakeSessionId(frame.wakeSessionId, existing?.wakeSessionId, null),
         cwd: conn.cwd,
         branch: conn.branch,
         head: conn.head,
@@ -1792,10 +1795,9 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       !isOwnConn
         ? (existingStatus || "registered")
         : (conn.status === "invited" ? "online" : (conn.status || "online"));
-    const inheritedWakeSessionId =
-      frame.wakeSessionId ??
-      (!existing?.sessionId || existing.sessionId === frame.sessionId ? existing?.wakeSessionId : null) ??
-      null;
+    const eligibleExistingWake =
+      !existing?.sessionId || existing.sessionId === frame.sessionId ? existing?.wakeSessionId : null;
+    const inheritedWakeSessionId = preferWakeSessionId(frame.wakeSessionId, eligibleExistingWake, null);
     const saved = store.upsertAgent({
       repo: conn.repo,
       name: frame.name,
@@ -1820,11 +1822,11 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         conn.sessionId = null;
         conn.sessionBound = false;
       }
-      conn.wakeSessionId =
-        frame.wakeSessionId ||
-        saved.wakeSessionId ||
-        frame.sessionId ||
-        (oldRepo === nextRepo ? conn.wakeSessionId : null);
+      conn.wakeSessionId = preferWakeSessionId(
+        frame.wakeSessionId,
+        saved.wakeSessionId,
+        frame.sessionId || (oldRepo === nextRepo ? conn.wakeSessionId : null),
+      );
       conn.branch = checkout.branch ?? (oldRepo === nextRepo ? conn.branch : null);
       conn.head = checkout.head ?? (oldRepo === nextRepo ? conn.head : null);
       conn.wake = wake;
@@ -1847,7 +1849,11 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
           peer.sessionBound = true;
         }
         if (frame.wakeSessionId || saved.wakeSessionId || frame.sessionId) {
-          peer.wakeSessionId = frame.wakeSessionId || saved.wakeSessionId || frame.sessionId || peer.wakeSessionId;
+          peer.wakeSessionId = preferWakeSessionId(
+            frame.wakeSessionId,
+            saved.wakeSessionId,
+            frame.sessionId || peer.wakeSessionId,
+          );
         }
         peer.branch = checkout.branch ?? peer.branch;
         peer.head = checkout.head ?? peer.head;
@@ -2257,10 +2263,12 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     const live = candidates.find((conn) => conn.sessionBound && conn.sessionId === row?.sessionId)
       ?? candidates.find((conn) => conn.sessionBound) ?? candidates[0];
     if (!live && !row) return null;
+    const eligibleRowWake =
+      live && (!live.sessionBound || live.sessionId === row?.sessionId || !row?.sessionId)
+        ? row?.wakeSessionId
+        : null;
     const liveWakeSession = live
-      ? (live.wakeSessionId ||
-        ((!live.sessionBound || live.sessionId === row?.sessionId || !row?.sessionId) ? row?.wakeSessionId : null) ||
-        (live.sessionBound ? live.sessionId : null))
+      ? preferWakeSessionId(live.wakeSessionId, eligibleRowWake, live.sessionBound ? live.sessionId : null)
       : null;
     return {
       name: live?.name ?? row!.name,
@@ -2300,17 +2308,20 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       const registered =
         (conn.sessionId ? store.getAgentBySession(repo, conn.sessionId) : undefined) ??
         store.getAgent(repo, conn.name);
+      const eligibleRegWake =
+        !conn.sessionBound || conn.sessionId === registered?.sessionId || !registered?.sessionId
+          ? registered?.wakeSessionId
+          : null;
       return {
         repo,
         name: conn.name,
         harness: conn.harness,
         sessionId: conn.sessionId,
-        wakeSessionId:
-          conn.wakeSessionId ||
-          ((!conn.sessionBound || conn.sessionId === registered?.sessionId || !registered?.sessionId)
-            ? registered?.wakeSessionId
-            : null) ||
-          (conn.sessionBound ? conn.sessionId : registered?.sessionId ?? null),
+        wakeSessionId: preferWakeSessionId(
+          conn.wakeSessionId,
+          eligibleRegWake,
+          conn.sessionBound ? conn.sessionId : (registered?.sessionId ?? null),
+        ),
         cwd: conn.cwd,
         branch: conn.branch ?? registered?.branch ?? null,
         head: conn.head ?? registered?.head ?? null,
@@ -2420,6 +2431,16 @@ function looksLikeSessionTarget(to: string): boolean {
 
 function looksLikePaneOrTtyTarget(id: string): boolean {
   return Boolean(paneTarget(id) || TTY_RE.test(id));
+}
+
+function preferWakeSessionId(
+  incoming?: string | null,
+  existingWake?: string | null,
+  fallbackSession?: string | null,
+): string | null {
+  if (incoming && looksLikePaneOrTtyTarget(incoming)) return incoming;
+  if (existingWake && looksLikePaneOrTtyTarget(existingWake)) return existingWake;
+  return incoming || existingWake || fallbackSession || null;
 }
 
 function requireTopic(topic: string): void {
