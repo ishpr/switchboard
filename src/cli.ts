@@ -29,7 +29,7 @@ import { ensureToken, readToken } from "./token.ts";
 import { DEFAULT_PORT, HEARTBEAT_MS, NAME_RE, type ClientHello, type InviteMode, type ReplyState } from "./types.ts";
 import { formatRatioBinding, GRID_SESSION, gridPlan, gridSessionName, init, resolveOrchestratorName, writeRepoConfig } from "./init.ts";
 import { runPtyWrap } from "./pty.ts";
-import { spawnWake } from "./wake.ts";
+import { augmentPath, spawnWake } from "./wake.ts";
 
 const command = process.argv[2];
 
@@ -158,7 +158,7 @@ function usage(): void {
   mcp                   Stdio MCP shim (what harnesses spawn)
   doctor                Diagnose sessions [--prune] [--all | --share | --scope share|split] [--json]
   who                   List agents in this repo
-  publish               Publish a message [--to agent-or-session-id] [--topic name]
+  publish               Publish a message [--to agent-or-session-id] [--topic name] [--universal]
   inbox                 Print messages since your cursor
   wait                  Wait for new unread messages [--to agent-or-session-id] [--timeout seconds] [--wake-existing] [--json]
   ask                   Ask one agent or session [--to agent-or-session-id] (may wake a headless CLI)
@@ -169,21 +169,23 @@ function usage(): void {
   orchestrator          Get or set the orchestrator for this repo
   invite                Invite agent harnesses onto this repo board [--mode terminal|headless]
   register              Register or bind an agent session on this repo board
+  reinit                Re-initialize live sessions and auto-assign distinct lane names [--universal] [--no-assign-names]
+  wrap                  Run an interactive CLI inside a local PTY wake relay (switchboard wrap <harness> [args...])
   agent add             Register an agent and its wake policy
   account               List or add isolated Claude accounts (list | add)
   hook                  Print hook JSON for a turn already in progress
   token                 Print the machine token path's contents
-  init                  Install the Zellij grid. Asks which panes & accounts to include
+  init                  Configure MCP + hooks across Desktop/CLI harnesses, shell wrappers, and Zellij grid
+  start                 Launch or attach to the Zellij grid for this repo
   --resume, -c          Attach the grid, or continue each harness's latest session
   --restart, -r         Recreate the grid session and resume each harness's session
 
-An idle agent is not inside a hook. ask wakes it by injecting into a bound
-Codex or Muse session, or by starting that harness headless when it is offline
-and wake is on. A broadcast does not start a session.
+An idle agent is woken in real time via its Zellij/tmux pane, local PTY relay
+(switchboard wrap), Terminal.app tty, or Codex queue, or by starting that
+harness headless when it is offline and wake is on.
 
-One agent claims the orchestrator role (Cursor, in the grid). It assigns work
-with ask. Others reply, or report a result that was not an ask. Reports are
-delivered only to the orchestrator.
+One agent claims the orchestrator role (first claim wins while online). It
+assigns work with ask. Others reply, or report a result that was not an ask.
 `);
 }
 
@@ -265,6 +267,7 @@ async function serve(): Promise<void> {
     },
   });
   if (values.home) process.env.SWITCHBOARD_HOME = values.home;
+  process.env.PATH = augmentPath(process.env.PATH);
   const home = switchboardHome();
   const port = values.port ? Number(values.port) : DEFAULT_PORT;
   const token = ensureToken(home);

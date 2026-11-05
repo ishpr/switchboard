@@ -382,7 +382,7 @@ export const HARNESSES: HarnessDef[] = [
     aliases: [],
     candidates: [path.join(homedir(), ".grok/bin/grok")],
     pathNames: ["grok"],
-    args: ["--always-approve", "--model", "grok-4.7", "--reasoning-effort", "xhigh"],
+    args: ["--always-approve"],
     resume: ["--continue"],
   },
   {
@@ -391,7 +391,7 @@ export const HARNESSES: HarnessDef[] = [
     aliases: [],
     candidates: [homeBin("claude")],
     pathNames: ["claude"],
-    args: ["--dangerously-skip-permissions", "--model", "fable"],
+    args: ["--dangerously-skip-permissions"],
     resume: ["--continue"],
   },
   {
@@ -400,7 +400,7 @@ export const HARNESSES: HarnessDef[] = [
     aliases: [],
     candidates: ["/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex"],
     pathNames: ["codex"],
-    args: ["--dangerously-bypass-approvals-and-sandbox", "--model", "gpt-6.1-sol"],
+    args: ["--dangerously-bypass-approvals-and-sandbox"],
     resume: ["resume", "--last"],
   },
   {
@@ -418,7 +418,7 @@ export const HARNESSES: HarnessDef[] = [
     aliases: [],
     candidates: [homeBin("muse")],
     pathNames: ["muse"],
-    args: ["--yolo", "--model", "muse-wonder-1.0", "--reasoning-effort", "xhigh"],
+    args: ["--yolo"],
     resume: ["resume", "--last"],
   },
   {
@@ -959,7 +959,9 @@ claude() { _switchboard_wrap claude "\$@"; }
 grok() { _switchboard_wrap grok "\$@"; }
 muse() { _switchboard_wrap muse "\$@"; }
 kimi() { _switchboard_wrap kimi "\$@"; }
-cursor-agent() { _switchboard_wrap cursor-agent "\$@"; }`;
+cursor-agent() { _switchboard_wrap cursor-agent "\$@"; }
+codex() { _switchboard_wrap codex "\$@"; }
+agy() { _switchboard_wrap agy "\$@"; }`;
 }
 
 function paneBlock(pane: PaneSpec): string {
@@ -989,9 +991,10 @@ export function repoRoot(): string {
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 }
 
-export function upsertCodexHooks(
+function upsertCommandHooks(
   cliPath: string,
-  hooksFile = path.join(process.env.CODEX_HOME || path.join(homedir(), ".codex"), "hooks.json"),
+  hooksFile: string,
+  harness: "codex" | "claude",
   nodeBin = process.execPath,
 ): string {
   let root: Record<string, unknown> = {};
@@ -1019,7 +1022,7 @@ export function upsertCodexHooks(
   ];
 
   for (const { event, matcher } of events) {
-    const cmd = `${shellQuote(nodeBin)} ${shellQuote(cliPath)} hook --harness codex --event ${event}`;
+    const cmd = `${shellQuote(nodeBin)} ${shellQuote(cliPath)} hook --harness ${harness} --event ${event}`;
     const existingGroups = Array.isArray(hooksObj[event]) ? (hooksObj[event] as Array<Record<string, unknown>>) : [];
     const cleanedGroups = existingGroups
       .map((group) => {
@@ -1027,7 +1030,7 @@ export function upsertCodexHooks(
         const list = Array.isArray(group.hooks) ? (group.hooks as Array<Record<string, unknown>>) : [];
         const kept = list.filter((item) => {
           const itemCmd = typeof item?.command === "string" ? item.command : "";
-          return !(itemCmd.includes("hook --harness codex") && itemCmd.includes(`--event ${event}`));
+          return !(itemCmd.includes(`hook --harness ${harness}`) && itemCmd.includes(`--event ${event}`));
         });
         if (kept.length === 0) return null;
         return { ...group, hooks: kept } as Record<string, unknown>;
@@ -1052,6 +1055,301 @@ export function upsertCodexHooks(
   return hooksFile;
 }
 
+export function upsertCodexHooks(
+  cliPath: string,
+  hooksFile = path.join(process.env.CODEX_HOME || path.join(homedir(), ".codex"), "hooks.json"),
+  nodeBin = process.execPath,
+): string {
+  return upsertCommandHooks(cliPath, hooksFile, "codex", nodeBin);
+}
+
+export function upsertClaudeHooks(
+  cliPath: string,
+  settingsFile = path.join(homedir(), ".claude/settings.json"),
+  nodeBin = process.execPath,
+): string {
+  return upsertCommandHooks(cliPath, settingsFile, "claude", nodeBin);
+}
+
+export function upsertJsonMcpServer(opts: {
+  filePath: string;
+  name: string;
+  harness: string;
+  cliPath: string;
+  nodeBin?: string;
+  extraRoot?: Record<string, unknown>;
+}): string {
+  let root: Record<string, unknown> = {};
+  if (existsSync(opts.filePath)) {
+    try {
+      const parsed = JSON.parse(readFileSync(opts.filePath, "utf8"));
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        root = parsed as Record<string, unknown>;
+      }
+    } catch {
+      root = {};
+    }
+  }
+  if (opts.extraRoot) {
+    for (const [k, v] of Object.entries(opts.extraRoot)) {
+      if (root[k] === undefined) root[k] = v;
+    }
+  }
+  const mcpServers =
+    root.mcpServers && typeof root.mcpServers === "object" && !Array.isArray(root.mcpServers)
+      ? (root.mcpServers as Record<string, unknown>)
+      : {};
+  if (opts.harness === "muse" && root.mcp_servers !== undefined) {
+    if (typeof root.mcp_servers === "object" && root.mcp_servers !== null && !Array.isArray(root.mcp_servers)) {
+      for (const [k, v] of Object.entries(root.mcp_servers as Record<string, unknown>)) {
+        if (mcpServers[k] === undefined) mcpServers[k] = v;
+      }
+    }
+    delete root.mcp_servers;
+  }
+  mcpServers.switchboard = {
+    type: "stdio",
+    command: opts.nodeBin ?? process.execPath,
+    args: [opts.cliPath, "mcp"],
+    env: {
+      SWITCHBOARD_NAME: opts.name,
+      SWITCHBOARD_HARNESS: opts.harness,
+      SWITCHBOARD_SCOPE: "share",
+    },
+  };
+  root.mcpServers = mcpServers;
+  mkdirSync(path.dirname(opts.filePath), { recursive: true });
+  writeFileSync(opts.filePath, `${JSON.stringify(root, null, 2)}\n`);
+  return opts.filePath;
+}
+
+export function upsertCodexMcpConfig(
+  cliPath: string,
+  configFile = path.join(process.env.CODEX_HOME || path.join(homedir(), ".codex"), "config.toml"),
+  nodeBin = process.execPath,
+): string {
+  const existing = existsSync(configFile) ? readFileSync(configFile, "utf8") : "";
+  const block = [
+    "[mcp_servers.switchboard]",
+    `command = ${JSON.stringify(nodeBin)}`,
+    `args = [${JSON.stringify(cliPath)}, "mcp"]`,
+    "",
+    "[mcp_servers.switchboard.env]",
+    'SWITCHBOARD_NAME = "codex"',
+    'SWITCHBOARD_HARNESS = "codex"',
+    'SWITCHBOARD_SCOPE = "share"',
+  ].join("\n");
+
+  const stripped = existing
+    .replace(/\n*\[mcp_servers\.switchboard\][\s\S]*?(?=\n\[(?!(?:mcp_servers\.switchboard\.env\]))|$)/g, "")
+    .replace(/\n*\[mcp_servers\.switchboard\.env\][\s\S]*?(?=\n\[|$)/g, "")
+    .trimEnd();
+  const next = stripped ? `${stripped}\n\n${block}\n` : `${block}\n`;
+  mkdirSync(path.dirname(configFile), { recursive: true });
+  writeFileSync(configFile, next);
+  return configFile;
+}
+
+export function upsertCursorHooks(
+  cliPath: string,
+  hooksFile = path.join(homedir(), ".cursor/hooks.json"),
+  nodeBin = process.execPath,
+): string {
+  let root: Record<string, unknown> = { version: 1 };
+  if (existsSync(hooksFile)) {
+    try {
+      const parsed = JSON.parse(readFileSync(hooksFile, "utf8"));
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        root = parsed as Record<string, unknown>;
+      }
+    } catch {
+      root = { version: 1 };
+    }
+  }
+  if (root.version === undefined) root.version = 1;
+  const hooksObj =
+    root.hooks && typeof root.hooks === "object" && !Array.isArray(root.hooks)
+      ? (root.hooks as Record<string, unknown>)
+      : {};
+  root.hooks = hooksObj;
+  const cmd = `${shellQuote(nodeBin)} ${shellQuote(cliPath)} hook --harness cursor --event PostToolUse`;
+  const list = Array.isArray(hooksObj.postToolUse) ? (hooksObj.postToolUse as Array<Record<string, unknown>>) : [];
+  const filtered = list.filter((item) => {
+    const c = typeof item?.command === "string" ? item.command : "";
+    return !c.includes("hook --harness cursor");
+  });
+  filtered.push({ command: cmd });
+  hooksObj.postToolUse = filtered;
+  mkdirSync(path.dirname(hooksFile), { recursive: true });
+  writeFileSync(hooksFile, `${JSON.stringify(root, null, 2)}\n`);
+  return hooksFile;
+}
+
+export function upsertGrokHooks(
+  cliPath: string,
+  settingsFile = path.join(homedir(), ".grok/settings.json"),
+  nodeBin = process.execPath,
+): string {
+  let root: Record<string, unknown> = {};
+  if (existsSync(settingsFile)) {
+    try {
+      const parsed = JSON.parse(readFileSync(settingsFile, "utf8"));
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        root = parsed as Record<string, unknown>;
+      }
+    } catch {
+      root = {};
+    }
+  }
+  const hooksObj =
+    root.hooks && typeof root.hooks === "object" && !Array.isArray(root.hooks)
+      ? (root.hooks as Record<string, unknown>)
+      : {};
+  root.hooks = hooksObj;
+  const cmd = `${shellQuote(nodeBin)} ${shellQuote(cliPath)} hook --harness grok --event Stop`;
+  const existingGroups = Array.isArray(hooksObj.Stop) ? (hooksObj.Stop as Array<Record<string, unknown>>) : [];
+  const cleanedGroups = existingGroups
+    .map((group) => {
+      if (!group || typeof group !== "object") return null;
+      const list = Array.isArray(group.hooks) ? (group.hooks as Array<Record<string, unknown>>) : [];
+      const kept = list.filter((item) => {
+        const itemCmd = typeof item?.command === "string" ? item.command : "";
+        return !itemCmd.includes("hook --harness grok");
+      });
+      if (kept.length === 0) return null;
+      return { ...group, hooks: kept } as Record<string, unknown>;
+    })
+    .filter((group): group is Record<string, unknown> => group !== null);
+  cleanedGroups.push({
+    hooks: [{ type: "command", command: cmd }],
+  });
+  hooksObj.Stop = cleanedGroups;
+  mkdirSync(path.dirname(settingsFile), { recursive: true });
+  writeFileSync(settingsFile, `${JSON.stringify(root, null, 2)}\n`);
+  return settingsFile;
+}
+
+export function configureHarnessConfigs(opts: {
+  cliPath: string;
+  userHome?: string;
+  nodeBin?: string;
+  selectedPanes?: string[];
+  orchestrator?: string;
+}): string[] {
+  const userHome = opts.userHome ?? homedir();
+  const nodeBin = opts.nodeBin ?? process.execPath;
+  const selected = new Set(opts.selectedPanes ?? []);
+  const notes: string[] = [];
+
+  // 1. Shared Claude CLI (~/.claude.json + ~/.claude/settings.json)
+  if (selected.has("claude") || opts.orchestrator === "claude" || existsSync(path.join(userHome, ".claude")) || existsSync(path.join(userHome, ".claude.json"))) {
+    const claudeMcp = upsertJsonMcpServer({
+      filePath: path.join(userHome, ".claude.json"),
+      name: "claude",
+      harness: "claude",
+      cliPath: opts.cliPath,
+      nodeBin,
+    });
+    const claudeHooks = upsertClaudeHooks(opts.cliPath, path.join(userHome, ".claude/settings.json"), nodeBin);
+    notes.push(`claude mcp ${claudeMcp}`);
+    notes.push(`claude hooks ${claudeHooks}`);
+  }
+
+  // 2. Claude Desktop (macOS ~/Library/Application Support/Claude/claude_desktop_config.json)
+  const claudeDesktopDir = path.join(userHome, "Library/Application Support/Claude");
+  if (existsSync(claudeDesktopDir)) {
+    const desktopMcp = upsertJsonMcpServer({
+      filePath: path.join(claudeDesktopDir, "claude_desktop_config.json"),
+      name: "claude-desktop",
+      harness: "claude",
+      cliPath: opts.cliPath,
+      nodeBin,
+    });
+    notes.push(`claude desktop mcp ${desktopMcp}`);
+  }
+
+  // 3. Codex CLI & Codex Desktop (~/.codex/config.toml + ~/.codex/hooks.json)
+  const codexDir = path.join(userHome, ".codex");
+  if (selected.has("codex") || opts.orchestrator === "codex" || existsSync(codexDir)) {
+    const codexMcp = upsertCodexMcpConfig(opts.cliPath, path.join(codexDir, "config.toml"), nodeBin);
+    const codexHooks = upsertCodexHooks(opts.cliPath, path.join(codexDir, "hooks.json"), nodeBin);
+    notes.push(`codex mcp ${codexMcp}`);
+    notes.push(`codex hooks ${codexHooks}`);
+  }
+
+  // 4. Cursor Desktop & cursor-agent (~/.cursor/mcp.json + ~/.cursor/hooks.json)
+  const cursorDir = path.join(userHome, ".cursor");
+  if (selected.has("orchestrator") || opts.orchestrator === "cursor" || existsSync(cursorDir)) {
+    const cursorMcp = upsertJsonMcpServer({
+      filePath: path.join(cursorDir, "mcp.json"),
+      name: "cursor",
+      harness: "cursor",
+      cliPath: opts.cliPath,
+      nodeBin,
+    });
+    const cursorHooks = upsertCursorHooks(opts.cliPath, path.join(cursorDir, "hooks.json"), nodeBin);
+    notes.push(`cursor mcp ${cursorMcp}`);
+    notes.push(`cursor hooks ${cursorHooks}`);
+  }
+
+  // 5. Grok CLI (~/.grok/mcp.json + ~/.grok/settings.json)
+  const grokDir = path.join(userHome, ".grok");
+  if (selected.has("grok") || opts.orchestrator === "grok" || existsSync(grokDir)) {
+    const grokMcp = upsertJsonMcpServer({
+      filePath: path.join(grokDir, "mcp.json"),
+      name: "grok",
+      harness: "grok",
+      cliPath: opts.cliPath,
+      nodeBin,
+    });
+    const grokHooks = upsertGrokHooks(opts.cliPath, path.join(grokDir, "settings.json"), nodeBin);
+    notes.push(`grok mcp ${grokMcp}`);
+    notes.push(`grok hooks ${grokHooks}`);
+  }
+
+  // 6. Muse CLI (~/.config/muse/settings.json)
+  const museDir = path.join(userHome, ".config/muse");
+  if (selected.has("muse") || opts.orchestrator === "muse" || existsSync(museDir)) {
+    const museMcp = upsertJsonMcpServer({
+      filePath: path.join(museDir, "settings.json"),
+      name: "muse",
+      harness: "muse",
+      cliPath: opts.cliPath,
+      nodeBin,
+      extraRoot: { schema_version: 1 },
+    });
+    notes.push(`muse mcp ${museMcp}`);
+  }
+
+  // 7. Kimi CLI (~/.kimi/mcp.json)
+  const kimiDir = path.join(userHome, ".kimi");
+  if (selected.has("kimi") || opts.orchestrator === "kimi" || existsSync(kimiDir)) {
+    const kimiMcp = upsertJsonMcpServer({
+      filePath: path.join(kimiDir, "mcp.json"),
+      name: "kimi",
+      harness: "kimi",
+      cliPath: opts.cliPath,
+      nodeBin,
+    });
+    notes.push(`kimi mcp ${kimiMcp}`);
+  }
+
+  // 8. Antigravity Desktop (~/.gemini/antigravity/mcp_config.json)
+  const agyDir = path.join(userHome, ".gemini/antigravity");
+  if (selected.has("antigravity") || opts.orchestrator === "agy" || existsSync(agyDir)) {
+    const agyMcp = upsertJsonMcpServer({
+      filePath: path.join(agyDir, "mcp_config.json"),
+      name: "agy",
+      harness: "antigravity",
+      cliPath: opts.cliPath,
+      nodeBin,
+    });
+    notes.push(`antigravity mcp ${agyMcp}`);
+  }
+
+  return notes;
+}
+
 export function installSwitchboard(
   opts: {
     zshrc?: string;
@@ -1063,6 +1361,7 @@ export function installSwitchboard(
     claude4?: boolean;
     accounts?: string[];
     home?: string;
+    userHome?: string;
     codexHooksFile?: string;
     fresh?: PaneSpec[];
     resume?: PaneSpec[];
@@ -1071,7 +1370,7 @@ export function installSwitchboard(
   const repo = opts.repo ?? repoRoot();
   const targetRepo = opts.targetRepo ? gitRepoRoot(opts.targetRepo) : repo;
   const key = repoKey(targetRepo);
-  const home = homedir();
+  const home = opts.userHome ?? homedir();
   const layoutDir = opts.layoutDir ?? path.join(home, ".config/zellij/layouts");
   const zshrc = opts.zshrc ?? path.join(home, ".zshrc");
   const cli = path.join(repo, "dist/cli.js");
@@ -1110,40 +1409,48 @@ export function installSwitchboard(
   writeFileSync(zshrc, upsertZshBlock(current, zshLauncher(cli)));
   notes.push(`zshrc ${zshrc}`);
 
-  const codexDir = process.env.CODEX_HOME || path.join(home, ".codex");
-  const includeCodex =
-    Boolean(opts.codexHooksFile) ||
-    opts.orchestrator === "codex" ||
-    fresh.some((pane) => pane.name === "Codex") ||
-    existsSync(codexDir);
-  if (includeCodex && (opts.codexHooksFile || (!opts.zshrc && !opts.layoutDir))) {
+  if (opts.codexHooksFile) {
     const hooksPath = upsertCodexHooks(cli, opts.codexHooksFile);
     notes.push(`codex hooks ${hooksPath}`);
+  } else if (opts.userHome || (!opts.zshrc && !opts.layoutDir)) {
+    notes.push(
+      ...configureHarnessConfigs({
+        cliPath: cli,
+        userHome: home,
+        selectedPanes: opts.panes,
+        orchestrator: opts.orchestrator,
+      }),
+    );
   }
 
-  const agy = path.join(home, ".local/bin/agy");
+  const agyDef = HARNESSES.find((h) => h.id === "antigravity");
+  const agy = (opts.userHome ? path.join(home, ".local/bin/agy") : (agyDef ? locate(agyDef) : null)) ?? path.join(home, ".local/bin/agy");
   const includeAgy = opts.orchestrator === "agy" || fresh.some((pane) => pane.name === "Antigravity");
-  if (includeAgy && existsSync(agy)) {
-    execFileSync(
-      agy,
-      [
-        "mcp",
-        "add",
-        "--env",
-        "SWITCHBOARD_HARNESS=antigravity",
-        "--env",
-        "SWITCHBOARD_NAME=agy",
-        "--env",
-        "SWITCHBOARD_SCOPE=share",
-        "switchboard",
-        "--",
-        process.execPath,
-        cli,
-        "mcp",
-      ],
-      { stdio: "pipe" },
-    );
-    notes.push("agy mcp server switchboard");
+  if (includeAgy && existsSync(agy) && !opts.userHome) {
+    try {
+      execFileSync(
+        agy,
+        [
+          "mcp",
+          "add",
+          "--env",
+          "SWITCHBOARD_HARNESS=antigravity",
+          "--env",
+          "SWITCHBOARD_NAME=agy",
+          "--env",
+          "SWITCHBOARD_SCOPE=share",
+          "switchboard",
+          "--",
+          process.execPath,
+          cli,
+          "mcp",
+        ],
+        { stdio: "pipe" },
+      );
+      notes.push("agy mcp server switchboard");
+    } catch {
+      // ~/.gemini/antigravity/mcp_config.json was already configured above
+    }
   }
   return notes;
 }

@@ -22,6 +22,10 @@ import { HEARTBEAT_MS, NAME_RE, STATE_KEY_RE, TOPIC_RE, type BusMessage, type Ro
 import { formatMessage } from "./hook.ts";
 import { UUID_RE } from "./wake.ts";
 
+function shouldInspectAncestorPs(env: NodeJS.ProcessEnv): boolean {
+  return env === process.env && !env.SWITCHBOARD_URL;
+}
+
 export function parseZellijSessionFromPs(output: string): { ppid: number; session: string | null } {
   const trimmed = output.trim();
   const match = /^(\d+)\s+(.*)$/s.exec(trimmed);
@@ -40,6 +44,7 @@ export function discoverZellijSession(env: NodeJS.ProcessEnv = process.env): str
   if (env.ZELLIJ_SESSION_NAME && env.ZELLIJ_PANE_ID) {
     return `zellij:${env.ZELLIJ_SESSION_NAME}:${env.ZELLIJ_PANE_ID}`;
   }
+  if (!shouldInspectAncestorPs(env)) return undefined;
   let pid = process.ppid;
   for (let depth = 0; depth < 4 && pid > 1; depth++) {
     try {
@@ -48,6 +53,41 @@ export function discoverZellijSession(env: NodeJS.ProcessEnv = process.env): str
         stdio: ["ignore", "pipe", "ignore"],
       });
       const parsed = parseZellijSessionFromPs(out);
+      if (parsed.session) return parsed.session;
+      pid = parsed.ppid;
+    } catch {
+      break;
+    }
+  }
+  return undefined;
+}
+
+export function parseTmuxSessionFromPs(output: string): { ppid: number; session: string | null } {
+  const trimmed = output.trim();
+  const match = /^(\d+)\s+(.*)$/s.exec(trimmed);
+  if (!match) return { ppid: 0, session: null };
+  const ppid = Number(match[1]);
+  const cmd = match[2]!;
+  const pMatch = /(?:^|\s)TMUX_PANE=(%\d+)(?:\s|$)/.exec(cmd);
+  if (pMatch) {
+    return { ppid, session: `tmux:${pMatch[1]}` };
+  }
+  return { ppid, session: null };
+}
+
+export function discoverTmuxSession(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  if (/^%\d+$/.test(env.TMUX_PANE ?? "")) {
+    return `tmux:${env.TMUX_PANE}`;
+  }
+  if (!shouldInspectAncestorPs(env)) return undefined;
+  let pid = process.ppid;
+  for (let depth = 0; depth < 4 && pid > 1; depth++) {
+    try {
+      const out = execFileSync("ps", ["eww", "-o", "ppid=,command=", "-p", String(pid)], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      const parsed = parseTmuxSessionFromPs(out);
       if (parsed.session) return parsed.session;
       pid = parsed.ppid;
     } catch {
@@ -85,6 +125,7 @@ export function discoverTerminalTty(
 ): string | undefined {
   if (harness === "codex") return undefined;
   if (env.ZELLIJ_SESSION_NAME || env.ZELLIJ_PANE_ID || env.TMUX_PANE) return undefined;
+  if (!shouldInspectAncestorPs(env)) return undefined;
   let appleTerminal =
     env.TERM_PROGRAM === "Apple_Terminal" ||
     env.__CFBundleIdentifier === "com.apple.Terminal";
@@ -192,6 +233,7 @@ export function discoverPtySession(env: NodeJS.ProcessEnv = process.env): string
   if (fromEnv && /^pty:\/.+\.sock$/.test(fromEnv)) {
     return fromEnv;
   }
+  if (!shouldInspectAncestorPs(env)) return undefined;
   let pid = process.ppid;
   for (let depth = 0; depth < 4 && pid > 1; depth++) {
     try {
@@ -219,7 +261,7 @@ export function discoverHarnessSession(opts: {
   const env = opts.env ?? process.env;
   const explicit = env.SWITCHBOARD_SESSION?.trim() || undefined;
   const zellijSession = discoverZellijSession(env);
-  const tmuxSession = /^%\d+$/.test(env.TMUX_PANE ?? "") ? `tmux:${env.TMUX_PANE}` : undefined;
+  const tmuxSession = discoverTmuxSession(env);
   const paneSession = zellijSession || tmuxSession;
   const ptySession = !explicit && !paneSession ? discoverPtySession(env) : undefined;
   const envSession =
@@ -240,7 +282,8 @@ export function discoverHarnessSession(opts: {
     !explicit && !paneSession && !ptySession && opts.harness !== "codex"
       ? discoverTerminalTty(env, opts.harness)
       : undefined;
-  const sessionId = explicit || paneSession || envSession || codexThread || grokSession || ptySession || undefined;
+  const sessionId =
+    explicit || paneSession || envSession || codexThread || grokSession || ptySession || ttySession || undefined;
   const wakeSessionId = explicit || paneSession || ptySession || ttySession || sessionId || undefined;
   return { sessionId, wakeSessionId };
 }
@@ -271,8 +314,9 @@ export function instructions(role: Role, orchestrator: string | null): string {
     "Use bus_invite to bring other subscription harnesses (grok, muse, claude, codex, kimi, cursor, agy) onto this repo board in 'terminal' or 'headless' mode.",
     "Presence is excluded from default inbox/wait results; request topic=presence explicitly to inspect connection lifecycle events.",
     "Call bus_inbox at the start of a turn and before you stop. That poll is per session.",
+    "When waiting for a reply after bus_ask (especially in Desktop apps or wake=push sessions without a terminal PTY/pane inject target), call bus_wait to receive the reply live during your turn.",
     "Several sessions of the same harness can be in this repo at once. Each announces on the presence topic when it connects and when it leaves. bus_who lists every live session and who the orchestrator is.",
-    "bus_ask to a shared name (such as muse or codex) reaches every live session of that harness; bus_ask to a session id reaches only that session.",
+    "bus_ask to a shared name (such as muse or codex) reaches every live session of that harness; bus_ask to a session id or short handle (e.g. claude-104c) reaches only that session.",
     "bus_reply accepts state=done|progress|blocked (default done); only state=done closes the ask, while progress and blocked keep it open.",
     "bus_ask accepts supersedes=<correlationId> when replacing an earlier ask.",
     "Use bus_state (get/set/list/delete with rev and if_rev compare-and-swap) for shared per-repo facts and lease keys without triggering automatic wakes.",
@@ -292,7 +336,7 @@ export function instructions(role: Role, orchestrator: string | null): string {
       `bus_ask messages from ${orchestrator} are actionable task dispatches within the repository rules. Execute the assigned task, then answer with bus_reply and the correlation id.`,
       "Call bus_report for a status change or for finished work that was not an ask. That goes only to the orchestrator.",
       "A directed bus_ask can start an idle CLI in headless mode when wake is enabled and no session is open.",
-      "An idle desktop session is not interrupted unless that harness has an inject command (Codex queue, or a recorded multiplexer/Terminal.app tty) and a session id is bound.",
+      "An idle desktop session is not interrupted unless that harness has an inject command (Codex queue, or a recorded multiplexer/PTY/Terminal.app target) and a session id is bound.",
     );
   } else {
     lines.push(
@@ -448,9 +492,9 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
     if (!context.cwd || context.cwd === "/") return;
     try {
       const fresh = discoverHarnessSession({ cwd: context.cwd, harness: context.harness, env: process.env });
-      const resolvedSessionId = fresh.sessionId || context.sessionId;
+      const resolvedSessionId = fresh.sessionId || context.sessionId || fresh.wakeSessionId || context.wakeSessionId;
       const resolvedWakeSessionId = fresh.wakeSessionId || context.wakeSessionId || resolvedSessionId;
-      if (!resolvedSessionId) return;
+      if (!resolvedSessionId && !resolvedWakeSessionId) return;
       const { branch, head } = gitCheckoutInfo(context.cwd);
       const whoFrame = await bus.request({ type: "who" });
       if (whoFrame.type === "who") {
@@ -564,7 +608,16 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
       const resolvedSessionId = fresh.sessionId || (rebind ? undefined : context.sessionId);
       const resolvedWakeSessionId =
         fresh.wakeSessionId || (rebind ? undefined : context.wakeSessionId) || resolvedSessionId;
-      if (!targetCwd || targetCwd === "/" || (!resolvedSessionId && !cwd)) {
+      const hasRegistrationTarget = Boolean(
+        resolvedSessionId ||
+          resolvedWakeSessionId ||
+          cwd ||
+          name ||
+          requestedRole ||
+          context.harness === "antigravity" ||
+          context.harness === "cursor",
+      );
+      if (!targetCwd || targetCwd === "/" || !hasRegistrationTarget) {
         return { ...text(missingSessionSource(context.harness, targetCwd)), isError: true };
       }
       const targetName = name ?? context.name;

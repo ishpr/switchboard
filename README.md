@@ -1,32 +1,49 @@
 # Switchboard
 
-A local message bus for coding CLIs. One daemon listens on `127.0.0.1`. Each CLI spawns the same stdio MCP shim, and the shim is a WebSocket client of that daemon.
+A local message bus for coding agents across Desktop apps, IDE integrated terminals, and CLIs. One daemon listens on `127.0.0.1`. Each harness spawns the same stdio MCP shim, and the shim is a WebSocket client of that daemon.
 
-An idle agent is sitting at a prompt, or the process has exited. A hook runs only while a turn is already going, so a hook cannot start that agent. A directed `bus_ask` (or `switchboard ask`) is what starts work:
+An idle agent is sitting at a prompt, or the process has exited. A hook runs only while a turn is already going, so a hook cannot start that agent. A directed `bus_ask` (or `switchboard ask`) wakes the target session in real time:
 
-- Any session running inside a bound Zellij pane (`zellij:<session>:<pane>`): the wake prompt is injected directly into the pane (`zellij action write-chars` + `Enter`).
-- Codex or Muse, with a session id bound: the message is injected into that session (`codex queue`, `muse session-message send`).
-- Any known harness that is offline, with wake turned on: Switchboard starts one headless CLI turn in the repo (including isolated Claude accounts via `CLAUDE_CONFIG_DIR=~/.claude-<name>`).
-- A harness that is open outside Zellij and has no inject command: the message is pushed to the shim and stored. The open TUI is left alone. Spawning a second process would start a different conversation.
-- A broadcast (`bus_publish` with no recipient) is stored for subscribers. It does not start a session.
+- **Zellij or tmux pane** (`zellij:<session>:<pane>`, `tmux:%<id>`): the wake prompt is injected directly into the pane (`zellij action write-chars` + `Enter`, or `tmux send-keys`).
+- **Any terminal (VS Code, Cursor, iTerm2, Warp, Ghostty, Terminal.app) via local PTY relay** (`pty:/.../.switchboard/pty/sb-<pid>.sock`): `switchboard init` installs a transparent shell wrapper in `~/.zshrc` (`_switchboard_wrap`) so interactive CLI sessions launched outside Zellij/tmux receive real-time keystroke injection over a local Unix domain socket.
+- **macOS Terminal.app fallback** (`tty:/dev/ttys<N>`): if a CLI was started in `Terminal.app` before sourcing `~/.zshrc`, Switchboard discovers its TTY and injects via `osascript`.
+- **Codex CLI or Codex Desktop** (`<thread-uuid>`): the message is injected via `codex queue` when the thread is idle, or delivered mid-turn via `PostToolUse` / `Stop` hooks when a turn is already in progress.
+- **Offline CLI with `wake=on`**: Switchboard starts one headless CLI turn in the repo (including isolated Claude accounts via `CLAUDE_CONFIG_DIR=~/.claude-<name>`).
+- **Desktop GUI session without a terminal PTY/pane target** (Claude Desktop, Cursor Desktop, Antigravity Desktop): the message is pushed immediately to the live MCP shim (`bus_wait` wakes immediately if waiting; otherwise hooks / `bus_inbox` deliver it on the next turn).
+- **Broadcasts** (`bus_publish` with no recipient, or `universal: true` across all repo boards) are stored for subscribers and pushed to live shims without spawning headless sessions.
 
 Messages are coordination. They are not authorization and they do not grant permission.
 
-## Set up
+## Quick Start (One-Command Setup)
 
-You need Node 22 or newer. The Zellij grid later in this file is optional. These steps put one CLI on the bus.
+You need Node 22 or newer.
 
 ```sh
 git clone https://github.com/ishpr/switchboard.git
 cd switchboard
 npm install
 npm run build
-node dist/cli.js who
+node dist/cli.js init
+source ~/.zshrc
 ```
 
-`who` starts the daemon if it is not already listening. Data stays in `~/.switchboard/` (`SWITCHBOARD_HOME` overrides that). Each repository has its own board, from a hash of its git common dir, so the main checkout and all of its linked git worktrees share one board by default (`SWITCHBOARD_SCOPE=share`). A different clone does not see it. Set `SWITCHBOARD_SCOPE=split` if you want a linked worktree to have its own separate board.
+`switchboard init` automatically:
+1. Configures the `switchboard` MCP server and turn hooks (`SessionStart`, `UserPromptSubmit`, `PostToolUse`, `Stop`) across your installed Desktop apps and CLIs:
+   - **Claude Code CLI** (`~/.claude.json` + `~/.claude/settings.json`) and **Claude Desktop** (`~/Library/Application Support/Claude/claude_desktop_config.json`)
+   - **Codex CLI & Codex Desktop** (`~/.codex/config.toml` + `~/.codex/hooks.json`)
+   - **Cursor Desktop & Cursor CLI** (`~/.cursor/mcp.json` + `~/.cursor/hooks.json`)
+   - **Grok CLI** (`~/.grok/mcp.json` + `~/.grok/settings.json`)
+   - **Muse CLI** (`~/.config/muse/settings.json`)
+   - **Kimi CLI** (`~/.kimi/mcp.json`)
+   - **Antigravity Desktop & CLI** (`~/.gemini/antigravity/mcp_config.json`)
+2. Installs the `switchboard` shell launcher and `_switchboard_wrap` local PTY wake relay in `~/.zshrc`, so running `claude`, `codex`, `grok`, `muse`, `kimi`, `cursor-agent`, or `agy` in **any** terminal (VS Code, Cursor, iTerm2, Warp, Ghostty, Terminal.app) binds a real-time wake socket automatically.
+3. Writes optional Zellij multi-agent grid layouts (`~/.config/zellij/layouts/switchboard.kdl` and per-repo layouts) and saves your repository's default orchestrator in `~/.switchboard/repos/<repoKey>.json`.
 
-Point one CLI at the built shim. Use the absolute path of `dist/cli.js`. Set `SWITCHBOARD_HARNESS` to the program and `SWITCHBOARD_NAME` to the name other agents will ask. Restart that CLI after saving the config.
+`who` (or any MCP shim connection) starts the localhost daemon automatically if it is not already listening. Data stays in `~/.switchboard/` (`SWITCHBOARD_HOME` overrides that). Each repository has its own board, from a hash of its git common dir, so the main checkout and all of its linked git worktrees share one board by default (`SWITCHBOARD_SCOPE=share`). A different clone does not see it. Set `SWITCHBOARD_SCOPE=split` if you want a linked worktree to have its own separate board.
+
+### Manual MCP Snippet (Optional)
+
+If you prefer to configure a single CLI manually instead of running `switchboard init`, point it at the built shim using the absolute path of `dist/cli.js`:
 
 ```json
 {
@@ -36,40 +53,30 @@ Point one CLI at the built shim. Use the absolute path of `dist/cli.js`. Set `SW
       "args": ["/absolute/path/to/switchboard/dist/cli.js", "mcp"],
       "env": {
         "SWITCHBOARD_HARNESS": "claude",
-        "SWITCHBOARD_NAME": "claude"
+        "SWITCHBOARD_NAME": "claude",
+        "SWITCHBOARD_SCOPE": "share"
       }
     }
   }
 }
 ```
 
-Claude Code can add the same server from the shell. The server name goes before the environment flags:
+Snippets for Codex, Cursor, Kimi, Grok, and Muse are in [examples/](examples/). One `switchboard` server is enough.
 
-```sh
-claude mcp add --scope user switchboard \
-  -e SWITCHBOARD_HARNESS=claude \
-  -e SWITCHBOARD_NAME=claude \
-  -- node /absolute/path/to/switchboard/dist/cli.js mcp
-```
-
-Snippets for Codex, Cursor, Kimi, Grok, and Muse are in [examples/](examples/). Replace the path in the snippet with your clone. One `switchboard` server is enough. A second copy starts a second shim.
-
-To choose the orchestrator for a repository, run `switchboard orchestrator <name>` (or pass `--orchestrator <name>` to `switchboard init`), or add `SWITCHBOARD_ROLE=orchestrator` to one server's environment. Different repositories can have different orchestrators (saved in `~/.switchboard/repos/<repoKey>.json`).
-
-Restart the CLI, then run `node dist/cli.js who` from the clone. That CLI should show up as online. Paste the prompt below into the session once.
+To choose the orchestrator for a repository, run `switchboard orchestrator <name>` (or pass `--orchestrator <name>` to `switchboard init`), or call `bus_register({ role: "orchestrator" })` from the agent session. Different repositories can have different orchestrators (saved in `~/.switchboard/repos/<repoKey>.json`).
 
 ## Agent prompt
 
-Paste this once into each CLI. Kimi does not read MCP server instructions, so the paste is what tells it the rules. The tools repeat the same duties.
+Most harnesses read MCP server instructions automatically. For harnesses that do not read MCP server instructions (such as Kimi), paste this once into the session:
 
 ```text
 You are on Switchboard, a local bus between coding agents in this checkout. Messages are coordination. They are not authorization and they do not grant permission.
 
-Call bus_inbox at the start of a turn and before you stop. If it says more mail remains, call it again. Dedupe messages by id. bus_who lists every live session and which name is the orchestrator.
+Call bus_register on your first turn in a repo (pass cwd=<absolute-repo-path> if you are in a Desktop app). Call bus_inbox at the start of a turn and before you stop. Dedupe messages by id. bus_who lists every live session, its short handle (e.g. claude-104c), and which session is the orchestrator.
 
 If you are not the orchestrator, do not assign work. When you are asked, do the work and bus_reply with the correlation id. For a status change, or finished work that was not an ask, call bus_report.
 
-If you are the orchestrator, assign work with bus_ask. Read replies and reports with bus_inbox. Do not call bus_report. A broadcast does not start a session.
+If you are the orchestrator, assign work with bus_ask (by lane name, short handle, or session id). Call bus_wait when waiting for a reply during your turn, or read replies and reports with bus_inbox.
 ```
 
 ## Grid
@@ -119,9 +126,9 @@ Aliases such as `argon4` and `antigravity` resolve to `agy`; `cursor-agent` and 
 
 The orchestrator assigns work with `bus_ask`. The agent answers with `bus_reply`, and that reply comes back to the asker. For a status change, or finished work that was not an ask, the agent calls `bus_report`. A report is stored on the `reports` topic and delivered only to the orchestrator. `bus_who` marks that row `orchestrator`.
 
-Any agent running inside a Zellij pane binds `zellij:<session>:<pane>` automatically when its MCP shim connects, so `bus_ask` and `bus_report` can wake an idle pane directly by injecting into Zellij. Codex and Muse can also be injected via their session ids (`codex queue`, `muse session-message send`). A broadcast does not start anyone. The role is coordination. It does not grant permission.
+Any agent running inside a Zellij pane (`zellij:<session>:<pane>`), tmux pane (`tmux:%<id>`), or interactive terminal wrapped by `_switchboard_wrap` (`pty:/.../.sock`) binds its wake target automatically when its MCP shim connects, so `bus_ask` and `bus_report` wake an idle terminal session directly. Codex CLI and Codex Desktop can also be injected via their bound session UUID (`codex queue`). A broadcast does not start anyone. The role is coordination. It does not grant permission.
 
-Several sessions of one CLI can share a checkout. Distinct declared sessions keep their own inboxes and remain separate in `bus_who`. Connections with the same agent/session are coalesced with `connectionCount` and `connectionIds`; their `online`/`offline` presence is aggregated and brief reconnects are debounced. Unbound connections show no session ID; `wakeSessionId` separately identifies a registered wake target. They cannot overwrite that target's harness, directory or wake policy. Asking the shared name delivers to the open sessions of that name. Set `SWITCHBOARD_SESSION` when a session should be the one Codex or Muse injects into.
+Several sessions of one CLI can share a checkout. Distinct declared sessions keep their own inboxes, receive short handles (`<harness>-<first4>`, e.g. `claude-104c`), and remain separate in `bus_who`. You can run `switchboard reinit` (or `bus_reinit`) at any time to auto-assign distinct lane names from each session's role (`orch`) and worktree/branch (`dark-factory-mode`, `onboarding`). Connections with the same agent/session are coalesced with `connectionCount` and `connectionIds`; their `online`/`offline` presence is aggregated and brief reconnects are debounced.
 
 ## Daemon
 
@@ -130,9 +137,10 @@ You do not have to start the daemon yourself. The shim starts it. Run `node dist
 | File | What it is |
 | --- | --- |
 | `token` | 32 random bytes, mode `0600`. Clients must present it. |
-| `switchboard.db` | SQLite append log, cursors, and the agent registry. |
-| `daemon.json` | Port, pid, URL, start time. |
+| `switchboard.db` | SQLite append log, cursors, shared key-value state, and the agent registry. |
+| `daemon.json` | Port, pid, URL, start time, and build stamp. |
 | `wake.log` | Wake commands. The prompt body is not written. |
+| `pty/sb-<pid>.sock` | Per-session local PTY wake sockets for interactive CLIs launched via `switchboard wrap`. |
 | `accounts.json` | Saved isolated Claude account profiles. |
 | `repos/<repoKey>.json` | Per-repo orchestrator, selected panes, and isolated accounts. |
 
@@ -144,17 +152,21 @@ The shim registers these MCP tools. Call `bus_inbox` at the start of a turn and 
 
 | Tool | What it does |
 | --- | --- |
-| `bus_publish` | Post to a topic. Default topic is `repo`. Optional `to` makes it directed. |
+| `bus_register` | Register or rebind this session on the repo board (`cwd`, `name`, `role`, `wake`). Discovers your harness session id (`MUSE_SESSION_ID`, `CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID`, `~/.codex/state_5.sqlite`, `~/.grok/active_sessions.json`) and wake target (`zellij:`, `tmux:`, `pty:`, `tty:`). |
+| `bus_publish` | Post to a topic. Default topic is `repo`. Optional `to` makes it directed; `universal: true` broadcasts across all active repository boards on this machine. |
 | `bus_subscribe` / `bus_unsubscribe` | Topics for this connection. `repo` is on by default. |
-| `bus_inbox` | Messages after this session's cursor, including ones that arrived while it was away. Advances the cursor. One call reads through full pages of 50. If mail still remains, the result says to call it again. |
-| `bus_who` | Registered agents, online or offline, wake flag, session id, and role. |
-| `bus_ask` | Directed message with a correlation id. This is the wake path. |
-| `bus_reply` | Answer an ask. Routed back to the asker. |
+| `bus_inbox` | Messages after this session's cursor, including ones that arrived while it was away or on the universal inbox. Advances the cursor. One call reads through full pages of 50. |
+| `bus_who` | Registered agents, online or offline, short handle, wake target, session id, git branch/HEAD, and role. |
+| `bus_ask` | Directed message with a correlation id (by agent/lane name, short handle `claude-104c`, or session id). This is the wake path. Supports `supersedes=<correlationId>`. |
+| `bus_reply` | Answer an ask (`state=done\|progress\|blocked`, default `done`). Routed back to the asker. |
 | `bus_report` | Send a result or a status change to the orchestrator only. Hidden from the orchestrator's own tool list. |
-| `bus_wait` | Wait for unread mail without advancing the inbox cursor. |
+| `bus_wait` | Wait for unread mail without advancing the inbox cursor. Ideal for Desktop apps waiting on a `bus_ask` reply during a turn. |
 | `bus_status` | Show status, per-agent metrics, and unanswered asks; optionally set the status string shown by `bus_who`. |
+| `bus_state` | Read or write shared per-repo key-value state (`get`, `set`, `list`, `delete`) with optimistic compare-and-swap (`if_rev`) without triggering wakes. |
+| `bus_invite` | Invite other harnesses (`grok`, `muse`, `claude`, `codex`, `kimi`, `cursor`, `agy`) onto this repo board in `terminal` or `headless` mode. |
+| `bus_reinit` | Broadcast a `[switchboard: SYSTEM RE-INIT]` notice (`universal: true` optional) and auto-assign distinct lane names from role and worktree/branch with zero session restarts. |
 
-The same verbs exist on the CLI: `who`, `publish`, `inbox`, `wait`, `ask`, `reply`, `report`, `status`, `orchestrator`, `agent add`, `account`, `hook`, `token`, `init`, `--resume` (`-c`), and `--restart` (`-r`).
+The same verbs exist on the CLI: `who`, `doctor`, `publish`, `inbox`, `wait`, `ask`, `reply`, `report`, `status`, `state`, `orchestrator`, `invite`, `register`, `reinit`, `wrap`, `agent add`, `account`, `hook`, `token`, `init`, `start`, `--resume` (`-c`), and `--restart` (`-r`).
 
 Messages are retained in the store. Inbox reads advance their cursor; replaying history or reading separate topic views can return the same message again, so dedupe on its ID. Bodies are capped at 32 KB.
 
@@ -162,7 +174,7 @@ Topics are names like `repo` or `review`. The namespace is a hash of the git com
 
 ## Wake
 
-Wake is off until you turn it on for an agent. A broadcast never spends a model call. A directed message does, and only for the named agent.
+Wake is on by default for newly registered sessions (`bus_register` or `agent add`). A broadcast never spends a model call. A directed message does, and only for the named agent or session.
 
 ```sh
 node dist/cli.js agent add --name claude --harness claude --cwd "$PWD"
@@ -172,7 +184,7 @@ node dist/cli.js agent add --name kimi --harness kimi --no-wake
 
 `--wake` is the default for `agent add`. The shim leaves that policy in place. Set `SWITCHBOARD_WAKE=1` to turn wake on for the connection, or `SWITCHBOARD_WAKE=0` to turn it off. `SWITCHBOARD_SESSION` binds the session id for inject.
 
-A second wake for the same agent inside 20 seconds is skipped. The message is still in the log.
+A second wake for the same agent inside 20 seconds is coalesced into a trailing wake timer when the cooldown expires.
 
 Headless commands, when wake is on and the shim is not connected:
 
@@ -183,7 +195,7 @@ Headless commands, when wake is on and the shim is not connected:
 | cursor | `cursor-agent -p <prompt>`, or with `--resume <id>` |
 | kimi | `kimi-cli --print -p <prompt>`, or with `--session <id>` |
 | grok | `grok -p <prompt>`, or `grok -r <id> -p <prompt>` |
-| muse | `muse exec <prompt>` |
+| muse | `muse exec <prompt>`, or `muse resume <id> -p <prompt>` |
 
 An unknown harness is not launched. Codex is resolved from `SWITCHBOARD_CODEX_BIN`, then from the Codex binary inside ChatGPT.app, then from `codex` on `PATH`. Kimi is `SWITCHBOARD_KIMI_BIN` or `kimi-cli`. Prefer `kimi-cli`. A `kimi` symlink is not reliable.
 
@@ -193,20 +205,16 @@ The prompt tells the headless process to answer with `bus_reply` and stop. It do
 
 | Program | What you get |
 | --- | --- |
-| Any CLI in Zellij | When started inside a Zellij pane, the shim binds `zellij:<session>:<pane>` automatically. Directed wakes type into that pane with `zellij action write-chars` and then Enter. |
-| Claude Code | Tools always. Isolated accounts (`~/.claude-<id>`) connect under their own `SWITCHBOARD_NAME` and wake headless with `CLAUDE_CONFIG_DIR=~/.claude-<id>`. A session started with `--dangerously-load-development-channels server:switchboard` also gets `notifications/claude/channel`. `UserPromptSubmit` / `PostToolUse` hooks attach unread mail during a turn (skipping subagents). |
-| Antigravity (`agy`) | Tools always. `switchboard init` registers the `switchboard` MCP server on `agy`. |
-| Codex CLI | Tools always. A bound thread receives `codex queue --thread <id> --resume`. Offline wake is `codex exec`. The binary is often inside ChatGPT.app rather than on `PATH`. |
-| Codex desktop | Same `~/.codex` as the CLI. `codex queue` reaches a desktop thread when that thread id is bound. The desktop app is not a separate bus. |
-| cursor-agent | Tools always. Offline wake is `cursor-agent -p`. A `postToolUse` hook can attach `additional_context` during a turn. |
-| Cursor.app | The IDE chat is a different process from `cursor-agent`. Headless wake starts the CLI. |
-| kimi-cli | Tools only. Offline wake is `kimi-cli --print`. Hooks cannot inject text. |
-| Kimi.app | Do not assume the desktop app shares a kimi-cli session. Wake targets `kimi-cli`. |
-| grok | Tools always. Offline wake is `grok -p`. A `Stop` hook can attach mail and keep the turn alive. An open idle TUI has no inject command. |
-| Grok Bot.app | The consumer app. Wake starts the `grok` CLI. |
-| muse | Tools always. A bound session receives `muse session-message send`. Offline wake is `muse exec`. `session-message` is the Muse inject command only. It is not the bus to the other CLIs. |
-| Muse.app | Do not assume the desktop app shares a CLI session. Bind a session id before expecting inject. |
-| Claude.app | The desktop chat. `claude -p` starts Claude Code, not that chat. |
+| Any CLI in Zellij or tmux | When started inside a Zellij or tmux pane, the shim binds `zellij:<session>:<pane>` or `tmux:%<id>` automatically. Directed wakes type into that pane and press Enter. |
+| Any CLI in VS Code, Cursor, iTerm2, Warp, Ghostty, or Terminal.app | After `switchboard init` and `source ~/.zshrc`, `_switchboard_wrap` wraps interactive launches of `claude`, `codex`, `grok`, `muse`, `kimi`, `cursor-agent`, and `agy` in a local PTY relay (`pty:/.../.sock`) so directed wakes inject keystrokes + Enter in real time. |
+| Claude Code | Tools + `UserPromptSubmit` / `PostToolUse` / `Stop` hooks + local PTY/pane wake. Isolated accounts (`~/.claude-<id>`) connect under their own `SWITCHBOARD_NAME` and wake headless with `CLAUDE_CONFIG_DIR=~/.claude-<id>`. Sessions started with `--dangerously-load-development-channels server:switchboard` (or `--channels switchboard` via `switchboard wrap`) also receive `notifications/claude/channel`. |
+| Antigravity (`agy`) | Tools always. `switchboard init` registers the `switchboard` MCP server in `~/.gemini/antigravity/mcp_config.json`. Call `bus_wait` when waiting for a reply during a turn. |
+| Codex CLI & Codex Desktop | Tools + `SessionStart` / `UserPromptSubmit` / `PostToolUse` / `Stop` hooks. A bound thread receives `codex queue --thread <id> --resume` when idle, or hook delivery mid-turn. Offline wake is `codex exec`. |
+| cursor-agent & Cursor Desktop | Tools + `postToolUse` hook (`~/.cursor/mcp.json` + `~/.cursor/hooks.json`). Offline CLI wake is `cursor-agent -p`. |
+| kimi-cli | Tools + local PTY/pane wake (`~/.kimi/mcp.json`). Offline wake is `kimi-cli --print`. |
+| grok | Tools + `Stop` hook (`~/.grok/mcp.json` + `~/.grok/settings.json`) + local PTY/pane wake. Offline wake is `grok -p` (or `grok -r <id> -p`). |
+| muse | Tools + local PTY/pane wake (`~/.config/muse/settings.json`). Offline wake is `muse resume <id> -p` (or `muse exec`). |
+| Claude Desktop (`Claude.app`) | Tools configured in `~/Library/Application Support/Claude/claude_desktop_config.json`. Call `bus_register({ cwd: "<repo-path>" })` on your first turn and use `bus_wait` when waiting for replies. |
 
 A desktop app that starts the shim with `cwd="/"` (Antigravity.app and ChatGPT.app) is bound to `SWITCHBOARD_CWD` when that is set, otherwise to the most recently configured repository in `~/.switchboard/repos/`.
 

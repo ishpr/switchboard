@@ -12,6 +12,7 @@ import {
 import {
   chosenIds,
   claudeAccountPanes,
+  configureHarnessConfigs,
   discoverRatioBinding,
   formatRatioBinding,
   gridPlan,
@@ -51,8 +52,8 @@ test("the grid layout opens every harness in the repo", () => {
 
 test("resume layout continues the latest session of each harness", () => {
   const layout = switchboardLayout("/Users/ishprasad/Switchboard", harnessPanes(true));
-  assert.match(layout, /args "--always-approve" "--model" "grok-4.7" "--reasoning-effort" "xhigh" "--continue"/);
-  assert.match(layout, /args "--dangerously-bypass-approvals-and-sandbox" "--model" "gpt-6.1-sol" "resume" "--last"/);
+  assert.match(layout, /args "--always-approve" "--continue"/);
+  assert.match(layout, /args "--dangerously-bypass-approvals-and-sandbox" "resume" "--last"/);
   assert.match(layout, /args "--yolo" "--approve-mcps" "--trust" "--continue"/);
   assert.match(layout, /args "--yolo" "--continue"/);
   assert.match(layout, /args "--dangerously-skip-permissions" "--mode" "auto" "--continue"/);
@@ -445,4 +446,87 @@ test("discoverRatioBinding resolves repo-local and home-level Ratio project/prof
   ]);
   assert.ok(layoutKdl.includes('cwd="/tmp/my \\"repo\\"\\\\path"'));
   assert.ok(layoutKdl.includes('pane name="Pane \\"A\\"" command="/bin/my \\"cmd\\""'));
+});
+
+test("configureHarnessConfigs idempotently wires MCP servers and hooks across Desktop and CLI harnesses", () => {
+  const fakeHome = mkdtempSync(path.join(tmpdir(), "sb-all-harnesses-"));
+  for (const dir of [
+    ".claude",
+    path.join("Library", "Application Support", "Claude"),
+    ".codex",
+    ".cursor",
+    ".grok",
+    path.join(".config", "muse"),
+    ".kimi",
+    path.join(".gemini", "antigravity"),
+  ]) {
+    mkdirSync(path.join(fakeHome, dir), { recursive: true });
+  }
+  // Seed Muse settings with legacy mcp_servers key to verify it is cleaned up
+  writeFileSync(
+    path.join(fakeHome, ".config", "muse", "settings.json"),
+    JSON.stringify({ mcp_servers: { legacy: true } }),
+  );
+  // Seed Codex config.toml with an existing section
+  writeFileSync(
+    path.join(fakeHome, ".codex", "config.toml"),
+    `model = "o3"\n\n[mcp_servers.ratio]\nurl = "https://ratio.servsys.com"\n`,
+  );
+
+  const cliPath = "/opt/switchboard/dist/cli.js";
+  const nodePath = "/usr/local/bin/node";
+  const first = configureHarnessConfigs({
+    cliPath,
+    nodeBin: nodePath,
+    userHome: fakeHome,
+    selectedPanes: ["orchestrator", "grok", "claude", "codex", "kimi", "muse", "antigravity"],
+  });
+  const second = configureHarnessConfigs({
+    cliPath,
+    nodeBin: nodePath,
+    userHome: fakeHome,
+    selectedPanes: ["orchestrator", "grok", "claude", "codex", "kimi", "muse", "antigravity"],
+  });
+  assert.deepEqual(second, first);
+
+  const claudeJson = JSON.parse(readFileSync(path.join(fakeHome, ".claude.json"), "utf8"));
+  assert.equal(claudeJson.mcpServers.switchboard.command, nodePath);
+  assert.equal(claudeJson.mcpServers.switchboard.env.SWITCHBOARD_HARNESS, "claude");
+
+  const claudeHooks = JSON.parse(readFileSync(path.join(fakeHome, ".claude", "settings.json"), "utf8"));
+  assert.equal(claudeHooks.hooks.UserPromptSubmit.length, 1);
+  assert.equal(claudeHooks.hooks.PostToolUse.length, 1);
+  assert.equal(claudeHooks.hooks.Stop.length, 1);
+
+  const claudeDesktop = JSON.parse(
+    readFileSync(path.join(fakeHome, "Library", "Application Support", "Claude", "claude_desktop_config.json"), "utf8"),
+  );
+  assert.equal(claudeDesktop.mcpServers.switchboard.env.SWITCHBOARD_HARNESS, "claude");
+
+  const codexToml = readFileSync(path.join(fakeHome, ".codex", "config.toml"), "utf8");
+  assert.equal(codexToml.match(/\[mcp_servers\.switchboard\]/g)?.length, 1);
+  assert.match(codexToml, /SWITCHBOARD_HARNESS = "codex"/);
+  assert.match(codexToml, /\[mcp_servers\.ratio\]/);
+
+  const cursorMcp = JSON.parse(readFileSync(path.join(fakeHome, ".cursor", "mcp.json"), "utf8"));
+  assert.equal(cursorMcp.mcpServers.switchboard.env.SWITCHBOARD_HARNESS, "cursor");
+  const cursorHooks = JSON.parse(readFileSync(path.join(fakeHome, ".cursor", "hooks.json"), "utf8"));
+  assert.equal(cursorHooks.hooks.postToolUse.length, 1);
+
+  const grokMcp = JSON.parse(readFileSync(path.join(fakeHome, ".grok", "mcp.json"), "utf8"));
+  assert.equal(grokMcp.mcpServers.switchboard.env.SWITCHBOARD_HARNESS, "grok");
+  const grokSettings = JSON.parse(readFileSync(path.join(fakeHome, ".grok", "settings.json"), "utf8"));
+  assert.equal(grokSettings.hooks.Stop.length, 1);
+
+  const museSettings = JSON.parse(readFileSync(path.join(fakeHome, ".config", "muse", "settings.json"), "utf8"));
+  assert.equal(museSettings.schema_version, 1);
+  assert.equal(museSettings.mcp_servers, undefined);
+  assert.equal(museSettings.mcpServers.switchboard.env.SWITCHBOARD_HARNESS, "muse");
+
+  const kimiMcp = JSON.parse(readFileSync(path.join(fakeHome, ".kimi", "mcp.json"), "utf8"));
+  assert.equal(kimiMcp.mcpServers.switchboard.env.SWITCHBOARD_HARNESS, "kimi");
+
+  const agyMcp = JSON.parse(readFileSync(path.join(fakeHome, ".gemini", "antigravity", "mcp_config.json"), "utf8"));
+  assert.equal(agyMcp.mcpServers.switchboard.env.SWITCHBOARD_HARNESS, "antigravity");
+  assert.equal(agyMcp.mcpServers.switchboard.env.SWITCHBOARD_NAME, "agy");
 });
