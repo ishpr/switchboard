@@ -28,6 +28,7 @@ import { runShim } from "./shim.ts";
 import { ensureToken, readToken } from "./token.ts";
 import { DEFAULT_PORT, HEARTBEAT_MS, NAME_RE, type ClientHello, type InviteMode, type ReplyState } from "./types.ts";
 import { formatRatioBinding, GRID_SESSION, gridPlan, gridSessionName, init, resolveOrchestratorName, writeRepoConfig } from "./init.ts";
+import { runPtyWrap } from "./pty.ts";
 import { spawnWake } from "./wake.ts";
 
 const command = process.argv[2];
@@ -84,6 +85,9 @@ try {
       break;
     case "reinit":
       await reinitCmd();
+      break;
+    case "wrap":
+      await wrapCmd();
       break;
     case "hook":
       await hook();
@@ -924,8 +928,9 @@ async function inviteCmd(): Promise<void> {
 }
 
 async function reinitCmd(): Promise<void> {
-  const { values } = parseArgs({
+  const { values, positionals } = parseArgs({
     args: process.argv.slice(3),
+    allowPositionals: true,
     options: {
       universal: { type: "boolean", default: false },
       all: { type: "boolean", default: false },
@@ -939,13 +944,14 @@ async function reinitCmd(): Promise<void> {
   const cwd = values.cwd ? path.resolve(values.cwd) : process.cwd();
   const assignNames = values["no-assign-names"] ? false : Boolean(values["assign-names"]);
   const universal = Boolean(values.universal || values.all);
+  const message = values.message ?? (positionals.length > 0 ? positionals.join(" ").trim() : undefined);
   const client = await connectCli(cwd);
   try {
     const frame = await client.request({
       type: "reinit",
       universal,
       assignNames,
-      message: values.message,
+      message,
     });
     if (frame.type !== "reinited") throw new Error("unexpected response");
     if (values.json) {
@@ -961,6 +967,16 @@ async function reinitCmd(): Promise<void> {
   } finally {
     client.close();
   }
+}
+
+async function wrapCmd(): Promise<void> {
+  const targetCmd = process.argv[3];
+  if (!targetCmd) {
+    throw new Error("usage: switchboard wrap <command> [args...]");
+  }
+  const targetArgs = process.argv.slice(4);
+  const code = await runPtyWrap(targetCmd, targetArgs);
+  process.exitCode = code;
 }
 
 async function accountCmd(): Promise<void> {

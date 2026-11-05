@@ -1925,6 +1925,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
           existingOffline?.sessionId &&
           !TTY_RE.test(existingOffline.sessionId) &&
           !existingOffline.sessionId.startsWith("zellij:") &&
+          !existingOffline.sessionId.startsWith("pty:") &&
           !existingOffline.sessionId.startsWith("tmux:") &&
           !/^%\d+$/.test(existingOffline.sessionId)
             ? existingOffline.sessionId
@@ -2133,12 +2134,23 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       store.clearDeferredWake(repo, message.to);
       return { mode: "skip", detail: "session is active in another repository" };
     }
+    const hasActiveWaiter = [...conns].some(
+      (c) =>
+        c.authed &&
+        c.repo === repo &&
+        c.waitOnly &&
+        (c.name === target.name ||
+          (target.declaredSession && (c.sessionId === target.declaredSession || c.declaredSession === target.declaredSession)) ||
+          (target.sessionId && (c.sessionId === target.sessionId || c.declaredSession === target.sessionId))),
+    );
     const info = decideWake({
       directed: true,
       online: target.online,
       harness: target.harness,
       sessionId: target.sessionId,
       wakeEnabled: target.wake,
+      recipient: target.name,
+      hasActiveWaiter,
     });
     if (info.mode !== "inject" && info.mode !== "headless") {
       store.clearDeferredWake(repo, message.to);
@@ -2353,6 +2365,7 @@ function looksLikeSessionTarget(to: string): boolean {
     UUID_RE.test(to) ||
     TTY_RE.test(to) ||
     to.startsWith("zellij:") ||
+    to.startsWith("pty:") ||
     to.startsWith("tmux:") ||
     /^%\d+$/.test(to)
   );

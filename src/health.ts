@@ -1,10 +1,11 @@
 import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
 import { promisify } from "node:util";
 import type { AgentRecord, SessionDiagnostics } from "./types.ts";
-import { decideWake } from "./wake.ts";
+import { decideWake, PTY_RE } from "./wake.ts";
 
 export const SESSION_STALE_MS = 10 * 60_000;
-export type PaneTarget = { kind: "tmux" | "zellij"; pane: string; session?: string };
+export type PaneTarget = { kind: "tmux" | "zellij" | "pty"; pane: string; session?: string };
 export type PaneProbe = (target: PaneTarget) => Promise<boolean | null>;
 export type CommandRunner = (command: string, args: string[]) => Promise<string>;
 const exec = promisify(execFile);
@@ -16,13 +17,16 @@ export function paneTarget(sessionId: string | null): PaneTarget | null {
   const tmux = /^(?:tmux:)?(%\d+)$/.exec(sessionId ?? "");
   if (tmux) return { kind: "tmux", pane: tmux[1]! };
   const zellij = /^zellij:([^:]+):(\d+)$/.exec(sessionId ?? "");
-  return zellij ? { kind: "zellij", session: zellij[1]!, pane: zellij[2]! } : null;
+  if (zellij) return { kind: "zellij", session: zellij[1]!, pane: zellij[2]! };
+  const pty = PTY_RE.exec(sessionId ?? "");
+  return pty ? { kind: "pty", pane: pty[1]! } : null;
 }
 
 /** One snapshot per multiplexer/session per report. Errors mean unknown, never dead. */
 export function createPaneProbe(run: CommandRunner = runCommand): PaneProbe {
   const snapshots = new Map<string, Promise<Set<string> | null>>();
   return async (target) => {
+    if (target.kind === "pty") return existsSync(target.pane);
     const key = `${target.kind}:${target.session ?? ""}`;
     if (!snapshots.has(key)) snapshots.set(key, snapshot(target));
     const panes = await snapshots.get(key)!;
