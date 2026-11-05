@@ -1,6 +1,7 @@
 /** Wire types shared by the daemon, the MCP shim, and the CLI. */
 
 export const PROTOCOL_VERSION = 2;
+export const UNIVERSAL_REPO = "*";
 export const TOPIC_RE = /^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,127}$/;
 export const STATE_KEY_RE = /^[a-zA-Z0-9][a-zA-Z0-9._/:-]{0,127}$/;
 export const NAME_RE = /^[a-zA-Z0-9%][a-zA-Z0-9._:%-]{0,63}$/;
@@ -150,7 +151,8 @@ export type ClientHello = {
 
 export type ClientFrame = (
   | ClientHello
-  | { type: "publish"; topic: string; body: string; id?: string; to?: string }
+  | { type: "publish"; topic: string; body: string; id?: string; to?: string; universal?: boolean }
+  | { type: "reinit"; universal?: boolean; assignNames?: boolean; message?: string }
   | { type: "subscribe"; topics: string[] }
   | { type: "unsubscribe"; topics: string[] }
   | { type: "inbox"; since?: number; topic?: string; limit?: number; ack?: boolean; hook?: boolean }
@@ -230,6 +232,22 @@ export type ServerFrame = (
       cwd: string;
       orchestrator: string | null;
       invited: InvitedAgent[];
+    }
+  | {
+      type: "reinited";
+      repos: string[];
+      updatedAgents: Array<{
+        repo: string;
+        sessionId: string | null;
+        oldName: string;
+        newName: string;
+        handle: string;
+        cwd: string;
+        branch: string | null;
+        role: Role;
+      }>;
+      notifiedSockets: number;
+      detail: string;
     }
   | {
       type: "state";

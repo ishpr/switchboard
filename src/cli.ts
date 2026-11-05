@@ -82,6 +82,9 @@ try {
     case "invite":
       await inviteCmd();
       break;
+    case "reinit":
+      await reinitCmd();
+      break;
     case "hook":
       await hook();
       break;
@@ -351,7 +354,11 @@ async function who(doctor = false): Promise<void> {
     for (const agent of frame.agents) {
       const state = agent.online ? "online" : "offline";
       const wake = agent.wake ? "wake" : "no-wake";
-      const session = `${agent.sessionId ? ` session=${agent.sessionId}` : ""}${agent.wakeSessionId && agent.wakeSessionId !== agent.sessionId ? ` wake_session=${agent.wakeSessionId}` : ""} connections=${agent.connectionCount ?? (agent.online ? 1 : 0)}`;
+      const handle =
+        agent.sessionId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(agent.sessionId)
+          ? ` handle=${agent.harness}-${agent.sessionId.slice(0, 4).toLowerCase()}`
+          : "";
+      const session = `${handle}${agent.sessionId ? ` session=${agent.sessionId}` : ""}${agent.wakeSessionId && agent.wakeSessionId !== agent.sessionId ? ` wake_session=${agent.wakeSessionId}` : ""} connections=${agent.connectionCount ?? (agent.online ? 1 : 0)}`;
       const git = agent.branch || agent.head ? ` git=${agent.branch ?? "detached"}@${agent.head ?? "unknown"}` : "";
       const ratioStr = formatRatioBinding(agent.ratio);
       const ratio = ratioStr ? ` ${ratioStr}` : "";
@@ -469,6 +476,7 @@ async function publish(): Promise<void> {
       session: { type: "string" },
       cwd: { type: "string" },
       role: { type: "string" },
+      universal: { type: "boolean", default: false },
     },
   });
   if (!values.message) throw new Error("publish requires --message");
@@ -485,6 +493,7 @@ async function publish(): Promise<void> {
       topic: values.topic ?? "repo",
       body: values.message,
       to: values.to,
+      ...(values.universal ? { universal: true } : {}),
     });
     if (frame.type !== "published") throw new Error("unexpected response");
     process.stdout.write(`id=${frame.id} seq=${frame.seq}\n${frame.wake.mode}: ${frame.wake.detail}\n`);
@@ -907,6 +916,46 @@ async function inviteCmd(): Promise<void> {
     for (const item of frame.invited) {
       process.stdout.write(
         `${item.name}\t${item.harness}\t${item.action}\twake=${item.wakeMode}${item.wakeSessionId ? ` wake_session=${item.wakeSessionId}` : ""}\t${item.detail}\n`,
+      );
+    }
+  } finally {
+    client.close();
+  }
+}
+
+async function reinitCmd(): Promise<void> {
+  const { values } = parseArgs({
+    args: process.argv.slice(3),
+    options: {
+      universal: { type: "boolean", default: false },
+      all: { type: "boolean", default: false },
+      "assign-names": { type: "boolean", default: true },
+      "no-assign-names": { type: "boolean", default: false },
+      message: { type: "string" },
+      cwd: { type: "string" },
+      json: { type: "boolean", default: false },
+    },
+  });
+  const cwd = values.cwd ? path.resolve(values.cwd) : process.cwd();
+  const assignNames = values["no-assign-names"] ? false : Boolean(values["assign-names"]);
+  const universal = Boolean(values.universal || values.all);
+  const client = await connectCli(cwd);
+  try {
+    const frame = await client.request({
+      type: "reinit",
+      universal,
+      assignNames,
+      message: values.message,
+    });
+    if (frame.type !== "reinited") throw new Error("unexpected response");
+    if (values.json) {
+      process.stdout.write(`${JSON.stringify(frame, null, 2)}\n`);
+      return;
+    }
+    process.stdout.write(`${frame.detail}\n`);
+    for (const item of frame.updatedAgents) {
+      process.stdout.write(
+        `${item.repo}\t${item.newName}${item.oldName !== item.newName ? ` (was ${item.oldName})` : ""}\thandle=${item.handle}\trole=${item.role}\tbranch=${item.branch ?? "-"}\tsession=${item.sessionId ?? "unbound"}\tcwd=${item.cwd}\n`,
       );
     }
   } finally {

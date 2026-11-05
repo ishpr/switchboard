@@ -2447,3 +2447,167 @@ test("short session handles resolve targets, bare ambiguous harness names are re
     await fx.daemon.close();
   }
 });
+
+test("universal publish delivers across all repo boards, and reinit auto-assigns distinct lane names from role and branch while migrating cursors", async () => {
+  const fx = await fixture();
+  const repoA = mkdtempSync(path.join(tmpdir(), "switchboard-reinit-a-"));
+  const repoB = mkdtempSync(path.join(tmpdir(), "switchboard-reinit-b-"));
+  mkdirSync(path.join(repoA, ".git"), { recursive: true });
+  mkdirSync(path.join(repoB, ".git"), { recursive: true });
+
+  const orchUuid = "dd09f9b0-41e0-40c8-b7c4-ecfd0407549a";
+  const worker1Uuid = "104c6460-a8d4-424a-9533-2640ba973657";
+  const worker2Uuid = "2997a9a0-8741-49e8-a9e6-1e808637513f";
+  const repoBUuid = "63906089-9835-4983-aa6f-22f436e6a107";
+
+  const orch = await join(fx, "claude", "repo-a", {
+    harness: "claude",
+    cwd: repoA,
+    sessionId: orchUuid,
+    boundSession: true,
+    wake: false,
+    branch: "feature/onboarding-needs-no-terminal-2",
+  });
+  const w1 = await join(fx, "claude", "repo-a", {
+    harness: "claude",
+    cwd: repoA,
+    sessionId: worker1Uuid,
+    boundSession: true,
+    wake: false,
+    branch: "worktree-dark-factory-mode",
+  });
+  const w2 = await join(fx, "claude", "repo-a", {
+    harness: "claude",
+    cwd: repoA,
+    sessionId: worker2Uuid,
+    boundSession: true,
+    wake: false,
+    branch: "chore/onboarding",
+  });
+  const otherRepoAgent = await join(fx, "claude", "repo-b", {
+    harness: "claude",
+    cwd: repoB,
+    sessionId: repoBUuid,
+    boundSession: true,
+    wake: false,
+    branch: "chore/onboard-factory",
+  });
+
+  try {
+    await orch.request({
+      type: "register",
+      name: "claude",
+      harness: "claude",
+      cwd: repoA,
+      sessionId: orchUuid,
+      role: "orchestrator",
+      branch: "feature/onboarding-needs-no-terminal-2",
+      wake: false,
+    });
+    await w1.request({
+      type: "register",
+      name: "claude",
+      harness: "claude",
+      cwd: repoA,
+      sessionId: worker1Uuid,
+      branch: "worktree-dark-factory-mode",
+      wake: false,
+    });
+    await w2.request({
+      type: "register",
+      name: "claude",
+      harness: "claude",
+      cwd: repoA,
+      sessionId: worker2Uuid,
+      branch: "chore/onboarding",
+      wake: false,
+    });
+    await otherRepoAgent.request({
+      type: "register",
+      name: "claude",
+      harness: "claude",
+      cwd: repoB,
+      sessionId: repoBUuid,
+      branch: "chore/onboard-factory",
+      wake: false,
+    });
+
+    // 1. Universal publish reaches both repo-a and repo-b default inboxes
+    const uPub = await orch.request({
+      type: "publish",
+      topic: "repo",
+      body: "global build announcement",
+      universal: true,
+    });
+    assert.equal(uPub.type, "published");
+
+    const w1InboxBefore = await w1.request({ type: "inbox" });
+    assert.equal(w1InboxBefore.type, "inbox");
+    if (w1InboxBefore.type === "inbox") {
+      assert.equal(w1InboxBefore.messages.some((m) => m.body === "global build announcement"), true);
+    }
+    const bInboxBefore = await otherRepoAgent.request({ type: "inbox" });
+    assert.equal(bInboxBefore.type, "inbox");
+    if (bInboxBefore.type === "inbox") {
+      assert.equal(bInboxBefore.messages.some((m) => m.body === "global build announcement"), true);
+    }
+
+    // 2. Run universal reinit with assignNames=true: renames orch -> "orch", w1 -> "dark-factory-mode", w2 -> "onboarding"
+    const reinitRes = await orch.request({
+      type: "reinit",
+      universal: true,
+      assignNames: true,
+      message: "Please use your assigned lane names.",
+    });
+    assert.equal(reinitRes.type, "reinited");
+    if (reinitRes.type !== "reinited") return;
+
+    const bySession = new Map(reinitRes.updatedAgents.map((a) => [a.sessionId, a]));
+    assert.equal(bySession.get(orchUuid)?.newName, "orch");
+    assert.equal(bySession.get(worker1Uuid)?.newName, "dark-factory-mode");
+    assert.equal(bySession.get(worker2Uuid)?.newName, "onboarding");
+    assert.equal(bySession.get(repoBUuid)?.newName, "onboard-factory");
+
+    // 3. Each session receives the [switchboard: SYSTEM RE-INIT] broadcast in its inbox without re-reading earlier messages
+    const w1AfterReinit = await w1.request({ type: "inbox" });
+    assert.equal(w1AfterReinit.type, "inbox");
+    if (w1AfterReinit.type === "inbox") {
+      assert.equal(w1AfterReinit.messages.length, 1);
+      assert.match(w1AfterReinit.messages[0]!.body, /\[switchboard: SYSTEM RE-INIT\]/);
+      assert.match(w1AfterReinit.messages[0]!.body, /dark-factory-mode \(renamed from claude\) handle=claude-104c/);
+    }
+
+    // 4. Bare "claude" is still rejected in repo-a even after renaming, listing the new lane names & handles
+    await assert.rejects(
+      () => orch.request({ type: "ask", to: "claude", body: "still ambiguous" }),
+      /ambiguous target "claude": 3 claude sessions are online in this repo.*dark-factory-mode.*onboarding.*orch/,
+    );
+
+    // 5. Addressing by newly assigned lane name ("dark-factory-mode") OR short handle ("claude-104c") both deliver to w1
+    const askByLane = await orch.request({
+      type: "ask",
+      to: "dark-factory-mode",
+      body: "task via auto-assigned lane name",
+    });
+    assert.equal(askByLane.type, "published");
+    const askByHandle = await orch.request({
+      type: "ask",
+      to: "claude-104c",
+      body: "task via short handle",
+    });
+    assert.equal(askByHandle.type, "published");
+    const w1LaneInbox = await w1.request({ type: "inbox" });
+    assert.equal(w1LaneInbox.type, "inbox");
+    if (w1LaneInbox.type === "inbox") {
+      assert.equal(w1LaneInbox.messages.length, 2);
+      assert.equal(w1LaneInbox.messages[0]?.body, "task via auto-assigned lane name");
+      assert.equal(w1LaneInbox.messages[1]?.to, worker1Uuid);
+    }
+  } finally {
+    orch.close();
+    w1.close();
+    w2.close();
+    otherRepoAgent.close();
+    await fx.daemon.close();
+  }
+});
