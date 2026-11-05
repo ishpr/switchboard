@@ -258,11 +258,31 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       case "inbox":
         inbox(conn, frame.since, frame.topic, frame.limit, frame.ack, respond);
         break;
-      case "ack":
+      case "ack": {
         requireBoundRepo(conn);
-        store.ack(conn.repo, clientKey(conn), frame.cursor);
+        const key = clientKey(conn);
+        store.ack(conn.repo, key, frame.cursor);
+        const primary = store.getAgent(conn.repo, conn.name)?.sessionId;
+        const multiSession = [...conns].some(
+          (peer) =>
+            peer.authed &&
+            peer.repo === conn.repo &&
+            peer.name === conn.name &&
+            peer.declaredSession &&
+            peer.declaredSession !== (conn.declaredSession ?? primary),
+        );
+        if (!multiSession && primary && !primary.startsWith("zellij:")) {
+          const companionBase = conn.declaredSession === primary ? conn.name : `${conn.name}:${primary}`;
+          if (store.cursor(conn.repo, companionBase) < frame.cursor) {
+            store.ack(conn.repo, companionBase, frame.cursor);
+          }
+        }
+        clearPendingWakeTarget(conn.repo, conn.name, frame.cursor);
+        if (conn.sessionId) clearPendingWakeTarget(conn.repo, conn.sessionId, frame.cursor);
+        if (primary) clearPendingWakeTarget(conn.repo, primary, frame.cursor);
         respond({ type: "ok", detail: "acked" });
         break;
+      }
       case "doctor":
         await sendDoctor(conn, frame, respond);
         break;

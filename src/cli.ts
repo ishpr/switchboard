@@ -1130,14 +1130,16 @@ async function hook(): Promise<void> {
   try {
     const frame = await client.request({
       type: "inbox",
-      ...(nonAckingHook ? { ack: false } : {}),
+      ack: false,
     });
     if (frame.type !== "inbox") return;
     const filtered = filterHookMessages(frame.messages, callerName, stdinSessionId);
     const stopHookActive = Boolean(stdinJson && stdinJson.stop_hook_active === true);
-    process.stdout.write(
-      hookStdout(harness, event, filtered, frame.pendingAsk ?? null, stopHookActive),
-    );
+    const out = hookStdout(harness, event, filtered, frame.pendingAsk ?? null, stopHookActive);
+    if (!nonAckingHook && filtered.length > 0 && out.length > 0) {
+      await client.request({ type: "ack", cursor: filtered[filtered.length - 1]!.seq });
+    }
+    process.stdout.write(out);
   } finally {
     client.close();
   }

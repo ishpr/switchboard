@@ -578,6 +578,7 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
     async ({ since, topic }) => {
       const messages: BusMessage[] = [];
       let more = false;
+      let pendingAsk: BusMessage | null = null;
       for (let page = 0; page < 8; page++) {
         const frame = await bus.request({
           type: "inbox",
@@ -586,8 +587,17 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
         });
         if (frame.type !== "inbox") return text("inbox unavailable");
         messages.push(...frame.messages);
+        if (frame.pendingAsk !== undefined) pendingAsk = frame.pendingAsk ?? null;
         more = frame.more;
         if (!more) break;
+      }
+      if (
+        !topic &&
+        since === undefined &&
+        pendingAsk &&
+        !messages.some((m) => m.id === pendingAsk!.id)
+      ) {
+        messages.push(pendingAsk);
       }
       if (messages.length === 0) return text("inbox empty");
       const body = messages.map(formatMessage).join("\n\n");
