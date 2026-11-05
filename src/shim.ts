@@ -609,7 +609,7 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
         messages.push(pendingAsk);
       }
       if (messages.length === 0) return text("inbox empty");
-      const body = messages.map(formatMessage).join("\n\n");
+      const body = messages.map(formatInboxMessage).join("\n\n");
       return text(more ? `${body}\n\ninbox has more messages. Call bus_inbox again.` : body);
     },
   );
@@ -634,7 +634,7 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
           orchHeader,
           ...frame.agents.map((agent) => {
             const state = agent.online ? "online" : "offline";
-            const wake = agent.wake ? "wake=on" : "wake=off";
+            const wake = agent.wake ? "headless_wake=on" : "headless_wake=off";
             const session = `${agent.sessionId ? ` session=${agent.sessionId}` : ""}${agent.wakeSessionId && agent.wakeSessionId !== agent.sessionId ? ` wake_session=${agent.wakeSessionId}` : ""} connections=${agent.connectionCount ?? (agent.online ? 1 : 0)}`;
             const git = agent.branch || agent.head ? ` git=${agent.branch ?? "detached"}@${agent.head ?? "unknown"}` : "";
             const ratioStr = formatRatioBinding(agent.ratio);
@@ -706,13 +706,19 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
     "bus_wait",
     {
       description:
-        "Wait without consuming inbox messages. Defaults to your own session inbox; orchestrators may monitor another recipient by name or session id. Broadcasts also match. Timeout defaults to 30 seconds (1..600); if your MCP client enforces a 120s tool timeout (e.g. Claude Code), pass timeout_seconds <= 90 so bus_wait returns before the client backgrounds the tool call. Use bus_inbox after a wake to consume mail.",
+        "Wait for unread inbox messages (seq > your current inbox cursor) without consuming them. Already-read messages are never returned by bus_wait; to inspect already-read history, call bus_inbox({ since: 0 }). Defaults to your own session inbox; orchestrators may monitor another recipient by name or session id. Broadcasts also match. Timeout defaults to 30 seconds (1..600); if your MCP client enforces a 120s tool timeout (e.g. Claude Code), pass timeout_seconds <= 90 so bus_wait returns before the client backgrounds the tool call. Use bus_inbox after a wake to consume mail.",
       annotations: { readOnlyHint: true, idempotentHint: true },
       inputSchema: {
         to: z.string().regex(NAME_RE).or(z.literal("*")).optional(),
         timeout_seconds: z.number().int().min(1).max(600).default(30),
         interval_ms: z.number().int().min(1).max(60_000).default(1500),
-        since_seq: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
+        since_seq: z
+          .number()
+          .int()
+          .min(0)
+          .max(Number.MAX_SAFE_INTEGER)
+          .optional()
+          .describe("Additional lower-bound sequence number; only unread messages with seq > max(since_seq, your_inbox_cursor) match"),
         wake_existing: z.boolean().optional(),
         topic: z.string().regex(TOPIC_RE).optional(),
       },
@@ -924,6 +930,25 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
       };
     },
   );
+}
+
+function formatInboxMessage(message: BusMessage): string {
+  const fromSessionTag =
+    message.fromId && message.fromId !== message.fromName ? ` from_session=${message.fromId}` : "";
+  const stateTag =
+    (message.kind === "reply" || message.kind === "ask") && message.replyState
+      ? ` state=${message.replyState}`
+      : "";
+  const supersedesTag =
+    message.kind === "ask" && message.supersedes ? ` supersedes=${message.supersedes}` : "";
+  const head = `[switchboard] ${message.fromName} on ${message.topic} id=${message.id}${fromSessionTag}${
+    message.correlationId ? ` correlation=${message.correlationId}` : ""
+  }${stateTag}${supersedesTag}`;
+  const footer =
+    message.kind === "ask" && message.correlationId && message.replyState !== "done"
+      ? `\n[switchboard: REQUIRED — when finished, call bus_reply with correlationId="${message.correlationId}" to deliver your response to ${message.fromName}. Inline terminal output is not sent over the bus.]`
+      : "";
+  return `${head}\n${message.body}${footer}`;
 }
 
 function text(value: string) {
