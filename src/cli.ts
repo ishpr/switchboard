@@ -1143,10 +1143,15 @@ async function hook(): Promise<void> {
     const filtered = filterHookMessages(frame.messages, callerName, stdinSessionId);
     const stopHookActive = Boolean(stdinJson && stdinJson.stop_hook_active === true);
     const out = hookStdout(harness, event, filtered, frame.pendingAsk ?? null, stopHookActive);
-    if (!nonAckingHook && filtered.length > 0 && out.length > 0) {
-      await client.request({ type: "ack", cursor: filtered[filtered.length - 1]!.seq, hook: true });
-    } else if (event === "Stop" && !out && frame.cursor > 0) {
-      await client.request({ type: "ack", cursor: frame.cursor, hook: false });
+    const lastPageSeq = frame.messages.length > 0 ? frame.messages[frame.messages.length - 1]!.seq : 0;
+    if (!nonAckingHook && lastPageSeq > 0 && (out.length > 0 || filtered.length === 0)) {
+      await client.request({ type: "ack", cursor: lastPageSeq, hook: true });
+    }
+    if (event === "Stop" && !out) {
+      const syncSeq = Math.max(frame.cursor, lastPageSeq);
+      if (syncSeq > 0) {
+        await client.request({ type: "ack", cursor: syncSeq, hook: false });
+      }
     }
     process.stdout.write(out);
   } finally {
