@@ -2127,3 +2127,151 @@ test("four same-name Claude sessions support directed custom-topic delivery, hoo
     await fx.daemon.close();
   }
 });
+
+test("turn hooks do not hide direct messages from bus_inbox, default inbox marks dm topic read, and answered asks omit REQUIRED footer", async () => {
+  const fx = await fixture();
+  const repoDir = mkdtempSync(path.join(tmpdir(), "switchboard-lathe-dm-"));
+  execFileSync("git", ["init", "-b", "main"], { cwd: repoDir, stdio: "ignore" });
+  writeFileSync(path.join(repoDir, "README.md"), "# Lathe\n");
+  execFileSync("git", ["add", "README.md"], { cwd: repoDir, stdio: "ignore" });
+  execFileSync(
+    "git",
+    ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "init"],
+    { cwd: repoDir, stdio: "ignore" },
+  );
+
+  const orchUuid = "dd09f9b0-41e0-40c8-b7c4-ecfd0407549a";
+  const workerUuid = "104c6460-a8d4-424a-9533-2640ba973657";
+
+  const orch = await join(fx, "claude", "lathe-dm", {
+    harness: "claude",
+    cwd: repoDir,
+    sessionId: orchUuid,
+    boundSession: true,
+    wake: false,
+  });
+  const worker = await join(fx, "claude", "lathe-dm", {
+    harness: "claude",
+    cwd: repoDir,
+    sessionId: workerUuid,
+    boundSession: true,
+    wake: false,
+  });
+  const hookClient = await join(fx, "claude", "lathe-dm", {
+    harness: "cli",
+    cwd: repoDir,
+    sessionId: workerUuid,
+  });
+
+  try {
+    await orch.request({
+      type: "register",
+      name: "claude",
+      harness: "claude",
+      cwd: repoDir,
+      sessionId: orchUuid,
+      role: "orchestrator",
+      wake: false,
+    });
+
+    // 1. Orchestrator sends an ask on dm to workerUuid
+    const askRes = await orch.request({
+      type: "ask",
+      to: workerUuid,
+      body: "1.0.7 merged — verify dark-factory-mode",
+    });
+    assert.equal(askRes.type, "published");
+    if (askRes.type !== "published") return;
+    const cid = askRes.correlationId!;
+
+    // 2. UserPromptSubmit hook runs at turn start with hook: true and acks hook: true
+    const hookInbox1 = await hookClient.request({ type: "inbox", ack: false, hook: true });
+    assert.equal(hookInbox1.type, "inbox");
+    if (hookInbox1.type !== "inbox") return;
+    const hookFiltered1 = filterHookMessages(hookInbox1.messages, "claude", workerUuid);
+    assert.equal(hookFiltered1.length, 1);
+    await hookClient.request({
+      type: "ack",
+      cursor: hookFiltered1[0]!.seq,
+      hook: true,
+    });
+
+    // Subsequent PostToolUse hook during the same turn does NOT re-inject the same message
+    const hookInbox2 = await hookClient.request({ type: "inbox", ack: false, hook: true });
+    assert.equal(hookInbox2.type, "inbox");
+    if (hookInbox2.type === "inbox") {
+      assert.equal(hookInbox2.messages.length, 0);
+    }
+
+    // 3. Worker calls default bus_inbox() during the turn: still sees the dm ask (not hidden by hook!)
+    const workerDefaultInbox = await worker.request({ type: "inbox" });
+    assert.equal(workerDefaultInbox.type, "inbox");
+    if (workerDefaultInbox.type === "inbox") {
+      assert.equal(workerDefaultInbox.messages.length, 1);
+      const msg = workerDefaultInbox.messages[0]!;
+      assert.equal(msg.correlationId, cid);
+      assert.equal(msg.replyState, undefined);
+      assert.match(formatMessage(msg), /REQUIRED — when finished, call bus_reply/);
+    }
+
+    // 4. Worker immediately calls bus_inbox({ topic: "dm" }): returns empty (dm already marked read!)
+    const workerDmInbox = await worker.request({ type: "inbox", topic: "dm" });
+    assert.equal(workerDmInbox.type, "inbox");
+    if (workerDmInbox.type === "inbox") {
+      assert.equal(workerDmInbox.messages.length, 0);
+    }
+
+    // 5. Worker replies to the ask with state=done
+    const replyRes = await worker.request({
+      type: "reply",
+      correlationId: cid,
+      body: "dark-factory-mode verified",
+    });
+    assert.equal(replyRes.type, "published");
+
+    // 6. Re-reading historical dm messages (since: 0) shows the ask with state=done and NO REQUIRED footer
+    const historyDm = await worker.request({ type: "inbox", topic: "dm", since: 0 });
+    assert.equal(historyDm.type, "inbox");
+    if (historyDm.type === "inbox") {
+      const answeredAsk = historyDm.messages.find((m) => m.kind === "ask" && m.correlationId === cid);
+      assert.ok(answeredAsk);
+      assert.equal(answeredAsk.replyState, "done");
+      const formattedAsk = formatMessage(answeredAsk);
+      assert.match(formattedAsk, /state=done/);
+      assert.doesNotMatch(formattedAsk, /REQUIRED — when finished, call bus_reply/);
+    }
+
+    // 7. Orchestrator receives the worker's reply in default bus_inbox() even if an orchestrator hook ran first
+    const orchHook = await join(fx, "claude", "lathe-dm", {
+      harness: "cli",
+      cwd: repoDir,
+      sessionId: orchUuid,
+    });
+    try {
+      const ohInbox = await orchHook.request({ type: "inbox", ack: false, hook: true });
+      assert.equal(ohInbox.type, "inbox");
+      if (ohInbox.type === "inbox" && ohInbox.messages.length > 0) {
+        await orchHook.request({
+          type: "ack",
+          cursor: ohInbox.messages[ohInbox.messages.length - 1]!.seq,
+          hook: true,
+        });
+      }
+    } finally {
+      orchHook.close();
+    }
+
+    const orchDefaultInbox = await orch.request({ type: "inbox" });
+    assert.equal(orchDefaultInbox.type, "inbox");
+    if (orchDefaultInbox.type === "inbox") {
+      const replyMsg = orchDefaultInbox.messages.find((m) => m.kind === "reply" && m.correlationId === cid);
+      assert.ok(replyMsg, "orchestrator default bus_inbox must see the worker's reply");
+      assert.equal(replyMsg.replyState, "done");
+    }
+  } finally {
+    orch.close();
+    worker.close();
+    hookClient.close();
+    await fx.daemon.close();
+  }
+});

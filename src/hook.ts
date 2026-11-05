@@ -110,14 +110,16 @@ export function formatMessage(message: BusMessage): string {
   const fromSessionTag =
     message.fromId && message.fromId !== message.fromName ? ` from_session=${message.fromId}` : "";
   const stateTag =
-    message.kind === "reply" && message.replyState ? ` state=${message.replyState}` : "";
+    (message.kind === "reply" || message.kind === "ask") && message.replyState
+      ? ` state=${message.replyState}`
+      : "";
   const supersedesTag =
     message.kind === "ask" && message.supersedes ? ` supersedes=${message.supersedes}` : "";
   const head = `[switchboard] ${message.fromName} on ${message.topic} id=${message.id}${fromSessionTag}${
     message.correlationId ? ` correlation=${message.correlationId}` : ""
   }${stateTag}${supersedesTag}`;
   const footer =
-    message.kind === "ask" && message.correlationId
+    message.kind === "ask" && message.correlationId && message.replyState !== "done"
       ? `\n[switchboard: REQUIRED — when finished, call bus_reply with correlationId="${message.correlationId}" to deliver your response to ${message.fromName}. Inline terminal output is not sent over the bus.]`
       : "";
   return `${head}\n${message.body}${footer}`;

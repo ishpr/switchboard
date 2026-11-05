@@ -85,7 +85,8 @@ export function decideWake(input: {
   if (input.online && harness === "claude") {
     return {
       mode: "push",
-      detail: "claude session is open; the shim emits a channel notification if this session enabled channels",
+      detail:
+        "claude session is open (no pane/tty inject target); delivered to session inbox and turn hooks (idle prompt wakes only if started with --channels)",
     };
   }
   if (input.online) {

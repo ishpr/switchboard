@@ -84,8 +84,8 @@ test("bus_wait validates bounds, supports timeout/existing mail, and protects ot
     assert.ok((lifecycle.structuredContent!.messages as { topic: string }[]).every((message) => message.topic === "presence"));
     const properties = wait.inputSchema.properties as Record<string, { minimum?: number; maximum?: number }>;
     assert.equal(properties.timeout_seconds!.minimum, 1);
-    assert.equal(properties.timeout_seconds!.maximum, 120);
-    for (const args of [{ timeout_seconds: 0 }, { timeout_seconds: 121 }, { interval_ms: 0 }, { since_seq: -1 }]) {
+    assert.equal(properties.timeout_seconds!.maximum, 600);
+    for (const args of [{ timeout_seconds: 0 }, { timeout_seconds: 601 }, { interval_ms: 0 }, { since_seq: -1 }]) {
       const invalid = await fx.mcp.callTool({ name: "bus_wait", arguments: args });
       assert.equal(invalid.isError, true);
     }

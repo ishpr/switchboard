@@ -151,10 +151,10 @@ function usage(): void {
   mcp                   Stdio MCP shim (what harnesses spawn)
   doctor                Diagnose sessions [--prune] [--all | --share | --scope share|split] [--json]
   who                   List agents in this repo
-  publish               Publish a message
+  publish               Publish a message [--to agent-or-session-id] [--topic name]
   inbox                 Print messages since your cursor
-  wait                  Wait for new unread messages [--to agent] [--timeout seconds] [--wake-existing] [--json]
-  ask                   Ask one agent (may wake a headless CLI)
+  wait                  Wait for new unread messages [--to agent-or-session-id] [--timeout seconds] [--wake-existing] [--json]
+  ask                   Ask one agent or session [--to agent-or-session-id] (may wake a headless CLI)
   reply                 Reply to an ask
   report                Report a result or status to the repo's orchestrator
   status                Show status and pending asks [--pending] [--json] [--limit 1..200] [--status text]
@@ -466,6 +466,7 @@ async function publish(): Promise<void> {
       message: { type: "string" },
       to: { type: "string" },
       name: { type: "string" },
+      session: { type: "string" },
       cwd: { type: "string" },
       role: { type: "string" },
     },
@@ -475,6 +476,8 @@ async function publish(): Promise<void> {
     values.cwd || process.cwd(),
     values.name || process.env.SWITCHBOARD_NAME || "cli",
     values.role,
+    undefined,
+    values.session,
   );
   try {
     const frame = await client.request({
@@ -497,6 +500,7 @@ async function inbox(): Promise<void> {
       since: { type: "string" },
       topic: { type: "string" },
       name: { type: "string" },
+      session: { type: "string" },
       cwd: { type: "string" },
       role: { type: "string" },
       json: { type: "boolean", default: false },
@@ -506,6 +510,8 @@ async function inbox(): Promise<void> {
     values.cwd || process.cwd(),
     values.name || process.env.SWITCHBOARD_NAME || "cli",
     values.role,
+    undefined,
+    values.session,
   );
   try {
     const messages = [];
@@ -1131,13 +1137,16 @@ async function hook(): Promise<void> {
     const frame = await client.request({
       type: "inbox",
       ack: false,
+      hook: true,
     });
     if (frame.type !== "inbox") return;
     const filtered = filterHookMessages(frame.messages, callerName, stdinSessionId);
     const stopHookActive = Boolean(stdinJson && stdinJson.stop_hook_active === true);
     const out = hookStdout(harness, event, filtered, frame.pendingAsk ?? null, stopHookActive);
     if (!nonAckingHook && filtered.length > 0 && out.length > 0) {
-      await client.request({ type: "ack", cursor: filtered[filtered.length - 1]!.seq });
+      await client.request({ type: "ack", cursor: filtered[filtered.length - 1]!.seq, hook: true });
+    } else if (event === "Stop" && !out && frame.cursor > 0) {
+      await client.request({ type: "ack", cursor: frame.cursor, hook: false });
     }
     process.stdout.write(out);
   } finally {

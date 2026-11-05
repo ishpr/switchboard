@@ -153,8 +153,8 @@ export type ClientFrame = (
   | { type: "publish"; topic: string; body: string; id?: string; to?: string }
   | { type: "subscribe"; topics: string[] }
   | { type: "unsubscribe"; topics: string[] }
-  | { type: "inbox"; since?: number; topic?: string; limit?: number; ack?: boolean }
-  | { type: "ack"; cursor: number }
+  | { type: "inbox"; since?: number; topic?: string; limit?: number; ack?: boolean; hook?: boolean }
+  | { type: "ack"; cursor: number; hook?: boolean }
   | { type: "who" }
   | { type: "doctor"; all?: boolean; prune?: boolean }
   | { type: "ask"; to: string; body: string; topic?: string; supersedes?: string; ratioProject?: string }
@@ -211,7 +211,7 @@ export type ServerFrame = (
   | { type: "ok"; detail: string; pending_asks?: PendingAsk[]; agent_metrics?: AgentMetrics[]; board_state?: StateEntry[]; daemon?: RuntimeInfo }
   | { type: "message"; message: BusMessage }
   | { type: "inbox"; messages: BusMessage[]; cursor: number; more: boolean; pendingAsk?: BusMessage | null }
-  | { type: "who"; agents: AgentRecord[]; daemon?: RuntimeInfo }
+  | { type: "who"; agents: AgentRecord[]; orchestrator?: string | null; daemon?: RuntimeInfo }
   | { type: "doctor"; agents: AgentRecord[]; pruned: PrunedAgent[]; daemon?: RuntimeInfo }
   | { type: "orchestrator"; orchestrator: string | null }
   | {
