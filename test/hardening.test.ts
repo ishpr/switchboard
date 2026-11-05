@@ -258,6 +258,10 @@ test("unsupported hooks leave cursors untouched, supported hooks still attach an
       assert.equal(await run(harness!, event!), ""); assert.equal(fx.store.cursor("board", "receiver"), 0);
     }
     assert.match(await run("claude", "PostToolUse"), /keep this/);
+    assert.ok(fx.store.cursor("board", "hook:receiver") > 0);
+    assert.equal(fx.store.cursor("board", "receiver"), 0);
+    assert.equal(await run("claude", "PostToolUse"), "");
+    assert.equal(await run("claude", "Stop"), "");
     assert.ok(fx.store.cursor("board", "receiver") > 0);
   } finally { await fx.close(); }
 });

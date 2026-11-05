@@ -346,6 +346,7 @@ export async function runShim(): Promise<void> {
   heartbeat.unref?.();
 
   let activeBuild = BUILD;
+  let currentRole: Role = welcome.role;
   const toolContext = {
     home,
     name,
@@ -361,7 +362,15 @@ export async function runShim(): Promise<void> {
     },
   };
 
-  registerTools(mcp, bus, welcome.role, toolContext);
+  bus.onWelcome = (w) => {
+    currentRole = w.role;
+    toolContext.orchestrator = w.orchestrator;
+    if (mcp) {
+      (mcp.server as unknown as { _instructions?: string })._instructions = instructions(w.role, w.orchestrator);
+    }
+  };
+
+  registerTools(mcp, bus, currentRole, toolContext);
 
   bus.reloadOnReconnect = async () => {
     const diskBuild = loadBuild();
@@ -375,7 +384,7 @@ export async function runShim(): Promise<void> {
         if (regMap) {
           for (const key of Object.keys(regMap)) delete regMap[key];
         }
-        freshModule.registerTools(mcp, bus, welcome.role, toolContext);
+        freshModule.registerTools(mcp, bus, currentRole, toolContext);
         mcp.sendToolListChanged();
         activeBuild = diskBuild;
       }
@@ -615,10 +624,15 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
     async () => {
       const frame = await bus.request({ type: "who" });
       if (frame.type !== "who") return text("who unavailable");
+      if (frame.orchestrator !== undefined) {
+        context.orchestrator = frame.orchestrator;
+      }
       if (frame.agents.length === 0) return text("nobody registered");
+      const orchHeader = `orchestrator=${frame.orchestrator || "none"}${!frame.orchestrator ? " (claim with bus_register({ role: 'orchestrator' }))" : ""}`;
       return text(
-        frame.agents
-          .map((agent) => {
+        [
+          orchHeader,
+          ...frame.agents.map((agent) => {
             const state = agent.online ? "online" : "offline";
             const wake = agent.wake ? "wake=on" : "wake=off";
             const session = `${agent.sessionId ? ` session=${agent.sessionId}` : ""}${agent.wakeSessionId && agent.wakeSessionId !== agent.sessionId ? ` wake_session=${agent.wakeSessionId}` : ""} connections=${agent.connectionCount ?? (agent.online ? 1 : 0)}`;
@@ -626,8 +640,8 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
             const ratioStr = formatRatioBinding(agent.ratio);
             const ratio = ratioStr ? ` ${ratioStr}` : "";
             return `${agent.name} ${agent.harness} ${state} ${wake}${session}${git}${ratio} ${agent.role} ${agent.status} ${formatDiagnostics(agent.diagnostics)}`;
-          })
-          .join("\n"),
+          }),
+        ].join("\n"),
       );
     },
   );
@@ -691,11 +705,12 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
   mcp.registerTool(
     "bus_wait",
     {
-      description: "Wait without consuming inbox messages. Defaults to your own session inbox; orchestrators may monitor another recipient by name. Broadcasts also match. Timeout defaults to 30 seconds (1..120); set the MCP client timeout above the requested wait. Use bus_inbox after a wake to consume mail.",
+      description:
+        "Wait without consuming inbox messages. Defaults to your own session inbox; orchestrators may monitor another recipient by name or session id. Broadcasts also match. Timeout defaults to 30 seconds (1..600); if your MCP client enforces a 120s tool timeout (e.g. Claude Code), pass timeout_seconds <= 90 so bus_wait returns before the client backgrounds the tool call. Use bus_inbox after a wake to consume mail.",
       annotations: { readOnlyHint: true, idempotentHint: true },
       inputSchema: {
         to: z.string().regex(NAME_RE).or(z.literal("*")).optional(),
-        timeout_seconds: z.number().int().min(1).max(120).default(30),
+        timeout_seconds: z.number().int().min(1).max(600).default(30),
         interval_ms: z.number().int().min(1).max(60_000).default(1500),
         since_seq: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
         wake_existing: z.boolean().optional(),
@@ -703,7 +718,8 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
       },
     },
     async ({ to, timeout_seconds, interval_ms, since_seq, wake_existing, topic }, extra) => {
-      const recipient = to ?? context.name;
+      const isOwnSessionTarget = Boolean(context.sessionId && to === context.sessionId);
+      const rawRecipient = isOwnSessionTarget ? context.name : (to ?? context.name);
       const store = new Store(dbPath(context.home));
       try {
         const currentOrch = store.getOrchestrator(context.repo);
@@ -711,12 +727,19 @@ export function registerTools(mcp: McpServer, bus: BusClient, role: Role,
           role === "orchestrator" ||
           currentOrch === context.name ||
           (Boolean(context.sessionId) && currentOrch === context.sessionId);
-        if (recipient !== context.name && recipient !== "*" && !callerIsOrchestrator) {
+        if (rawRecipient !== context.name && !isOwnSessionTarget && rawRecipient !== "*" && !callerIsOrchestrator) {
           return { ...text("Only the orchestrator can wait on another agent's inbox."), isError: true };
         }
-        const ownSession = recipient === context.name ? context.sessionId : undefined;
-        const cursorKey = ownSession && !ownSession.startsWith("zellij:") ? `${recipient}:${ownSession}` : recipient;
-        const storedRecipient = recipient !== "*" ? store.getAgent(context.repo, ownSession || recipient) : undefined;
+        const bySession = rawRecipient !== "*" ? store.getAgentBySession(context.repo, rawRecipient) : undefined;
+        const recipient = bySession ? bySession.name : rawRecipient;
+        const ownSession =
+          rawRecipient === context.name
+            ? context.sessionId
+            : bySession?.sessionId ?? (UUID_RE.test(rawRecipient) ? rawRecipient : undefined);
+        const cursorKey =
+          ownSession && !ownSession.startsWith("zellij:") ? `${recipient}:${ownSession}` : recipient;
+        const storedRecipient =
+          rawRecipient !== "*" ? (bySession ?? store.getAgent(context.repo, ownSession || recipient)) : undefined;
         const subscriptionKey = ownSession || storedRecipient?.sessionId || `name:${recipient}`;
         const isOrchestrator =
           currentOrch === recipient || (Boolean(ownSession) && currentOrch === ownSession);

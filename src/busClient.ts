@@ -19,6 +19,7 @@ export class BusClient {
   private reconnecting: Promise<void> | null = null;
   endpointResolver: (() => Promise<{ url: string; token: string }>) | null = null;
   reloadOnReconnect: (() => Promise<BuildInfo | undefined>) | null = null;
+  onWelcome: ((frame: Extract<ServerFrame, { type: "welcome" }>) => void) | null = null;
   onMessage: ((frame: Extract<ServerFrame, { type: "message" }>) => void) | null = null;
 
   constructor(options: { requestTimeoutMs?: number } = {}) {
@@ -88,6 +89,7 @@ export class BusClient {
     socket.on("error", () => drop("socket error"));
     const welcome = await this.rawRequest(socket, hello);
     if (welcome.type !== "welcome") throw new Error("expected welcome");
+    this.onWelcome?.(welcome);
     if (this.subscribedTopics.size) await this.rawRequest(socket, { type: "subscribe", topics: [...this.subscribedTopics] });
     return welcome;
   }

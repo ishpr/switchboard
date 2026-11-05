@@ -34,6 +34,15 @@ const ANSWERED_ASK = `
     AND s.supersedes = a.correlation_id AND s.seq > a.seq
 `;
 
+const SELECT_MESSAGE_WITH_ASK_STATE = `
+  SELECT a.*,
+    CASE
+      WHEN a.kind = 'ask' AND a.correlation_id IS NOT NULL AND EXISTS (${ANSWERED_ASK}) THEN 'done'
+      ELSE a.reply_state
+    END AS effective_reply_state
+  FROM messages a
+`;
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS messages (
   repo TEXT NOT NULL,
@@ -261,14 +270,14 @@ export class Store {
 
   bySeq(repo: string, seq: number): BusMessage | undefined {
     const row = this.db
-      .prepare("SELECT * FROM messages WHERE repo = ? AND seq = ?")
+      .prepare(`${SELECT_MESSAGE_WITH_ASK_STATE} WHERE a.repo = ? AND a.seq = ?`)
       .get(repo, seq) as Row | undefined;
     return row ? mapMessage(row) : undefined;
   }
 
   byId(repo: string, id: string): BusMessage | undefined {
     const row = this.db
-      .prepare("SELECT * FROM messages WHERE repo = ? AND id = ?")
+      .prepare(`${SELECT_MESSAGE_WITH_ASK_STATE} WHERE a.repo = ? AND a.id = ?`)
       .get(repo, id) as Row | undefined;
     return row ? mapMessage(row) : undefined;
   }
@@ -276,7 +285,7 @@ export class Store {
   byCorrelation(repo: string, correlationId: string): BusMessage | undefined {
     const row = this.db
       .prepare(
-        "SELECT * FROM messages WHERE repo = ? AND correlation_id = ? AND kind = 'ask' ORDER BY seq DESC LIMIT 1",
+        `${SELECT_MESSAGE_WITH_ASK_STATE} WHERE a.repo = ? AND a.correlation_id = ? AND a.kind = 'ask' ORDER BY a.seq DESC LIMIT 1`,
       )
       .get(repo, correlationId) as Row | undefined;
     return row ? mapMessage(row) : undefined;
@@ -453,19 +462,19 @@ export class Store {
     if (topic !== null) {
       const rows = this.db
         .prepare(
-          `SELECT * FROM messages
-           WHERE repo = ? AND seq > ?
-             AND topic = ?
+          `${SELECT_MESSAGE_WITH_ASK_STATE}
+           WHERE a.repo = ? AND a.seq > ?
+             AND a.topic = ?
              AND (
-               to_name IS NULL
-               OR to_name = '*'
-               OR to_name = ?
-               OR (? IS NOT NULL AND to_name = ?)
+               a.to_name IS NULL
+               OR a.to_name = '*'
+               OR a.to_name = ?
+               OR (? IS NOT NULL AND a.to_name = ?)
                OR (? IS NULL AND EXISTS (
-                 SELECT 1 FROM agents ag WHERE ag.repo = messages.repo AND ag.session_id = messages.to_name AND ag.name = ?
+                 SELECT 1 FROM agents ag WHERE ag.repo = a.repo AND ag.session_id = a.to_name AND ag.name = ?
                ))
              )
-           ORDER BY seq ASC
+           ORDER BY a.seq ASC
            LIMIT ?`,
         )
         .all(repo, since, topic, opts.to ?? "", session, session, session, opts.to ?? "", limit) as Row[];
@@ -475,30 +484,30 @@ export class Store {
     const isOrch = opts.isOrchestrator ? 1 : 0;
     const rows = this.db
       .prepare(
-        `SELECT * FROM messages m
-         WHERE m.repo = ? AND m.seq > ? AND m.topic != 'presence'
+        `${SELECT_MESSAGE_WITH_ASK_STATE}
+         WHERE a.repo = ? AND a.seq > ? AND a.topic != 'presence'
            AND (
-             (m.to_name IS NOT NULL AND m.to_name != '*' AND (
-               m.to_name = ?
-               OR (? IS NOT NULL AND m.to_name = ?)
+             (a.to_name IS NOT NULL AND a.to_name != '*' AND (
+               a.to_name = ?
+               OR (? IS NOT NULL AND a.to_name = ?)
                OR (? IS NULL AND EXISTS (
-                 SELECT 1 FROM agents ag WHERE ag.repo = m.repo AND ag.session_id = m.to_name AND ag.name = ?
+                 SELECT 1 FROM agents ag WHERE ag.repo = a.repo AND ag.session_id = a.to_name AND ag.name = ?
                ))
              ))
              OR
-             ((m.to_name IS NULL OR m.to_name = '*') AND (
-               m.topic = 'repo'
-               OR (? = 1 AND m.topic = 'reports')
+             ((a.to_name IS NULL OR a.to_name = '*') AND (
+               a.topic IN ('repo', 'dm')
+               OR (? = 1 AND a.topic = 'reports')
                OR EXISTS (
                  SELECT 1 FROM subscriptions sub
-                 WHERE sub.repo = m.repo
+                 WHERE sub.repo = a.repo
                    AND sub.session_key = ?
-                   AND sub.topic = m.topic
-                   AND m.seq > sub.since_seq
+                   AND sub.topic = a.topic
+                   AND a.seq > sub.since_seq
                )
              ))
            )
-         ORDER BY m.seq ASC
+         ORDER BY a.seq ASC
          LIMIT ?`,
       )
       .all(repo, since, opts.to ?? "", session, session, session, opts.to ?? "", isOrch, subKey, limit) as Row[];
@@ -520,33 +529,33 @@ export class Store {
       opts?.subscriptionKey ?? (session || this.getAgent(repo, to)?.sessionId || `name:${to}`);
     const isOrch = (opts?.isOrchestrator ?? (this.getOrchestrator(repo) === to)) ? 1 : 0;
     const rows = this.db.prepare(
-      `SELECT * FROM messages WHERE repo = ?
-         AND seq > MAX(?, COALESCE((SELECT MAX(cursor) FROM cursors WHERE repo = ? AND client_key = ?), 0))
+      `${SELECT_MESSAGE_WITH_ASK_STATE} WHERE a.repo = ?
+         AND a.seq > MAX(?, COALESCE((SELECT MAX(cursor) FROM cursors WHERE repo = ? AND client_key = ?), 0))
          AND (
-           (to_name IS NOT NULL AND to_name != '*' AND (
-             to_name = ?
-             OR (? IS NOT NULL AND to_name = ?)
+           (a.to_name IS NOT NULL AND a.to_name != '*' AND (
+             a.to_name = ?
+             OR (? IS NOT NULL AND a.to_name = ?)
              OR (? IS NULL AND EXISTS (
-               SELECT 1 FROM agents ag WHERE ag.repo = messages.repo AND ag.session_id = messages.to_name AND ag.name = ?
+               SELECT 1 FROM agents ag WHERE ag.repo = a.repo AND ag.session_id = a.to_name AND ag.name = ?
              ))
            ))
            OR
-           ((to_name IS NULL OR to_name = '*') AND (
+           ((a.to_name IS NULL OR a.to_name = '*') AND (
              ? IS NOT NULL
              OR ? = '*'
-             OR topic IN ('repo', 'dm')
-             OR (? = 1 AND topic = 'reports')
+             OR a.topic IN ('repo', 'dm')
+             OR (? = 1 AND a.topic = 'reports')
              OR EXISTS (
                SELECT 1 FROM subscriptions sub
-               WHERE sub.repo = messages.repo
+               WHERE sub.repo = a.repo
                  AND sub.session_key = ?
-                 AND sub.topic = messages.topic
-                 AND messages.seq > sub.since_seq
+                 AND sub.topic = a.topic
+                 AND a.seq > sub.since_seq
              )
            ))
          )
-         AND ((? IS NULL AND topic != 'presence') OR topic = ?)
-       ORDER BY seq ASC LIMIT 200`,
+         AND ((? IS NULL AND a.topic != 'presence') OR a.topic = ?)
+       ORDER BY a.seq ASC LIMIT 200`,
     ).all(
       repo,
       since,
@@ -1051,6 +1060,7 @@ type Row = {
   correlation_id: string | null;
   to_name: string | null;
   reply_state: string | null;
+  effective_reply_state?: string | null;
   supersedes: string | null;
 };
 
@@ -1070,9 +1080,10 @@ type AgentRow = {
 };
 
 function mapMessage(row: Row): BusMessage {
+  const rawState = row.effective_reply_state ?? row.reply_state;
   const replyState =
-    row.reply_state === "done" || row.reply_state === "progress" || row.reply_state === "blocked"
-      ? row.reply_state
+    rawState === "done" || rawState === "progress" || rawState === "blocked"
+      ? rawState
       : null;
   return {
     id: row.id,

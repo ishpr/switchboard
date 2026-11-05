@@ -256,12 +256,22 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         break;
       }
       case "inbox":
-        inbox(conn, frame.since, frame.topic, frame.limit, frame.ack, respond);
+        inbox(conn, frame.since, frame.topic, frame.limit, frame.ack, Boolean(frame.hook), respond);
         break;
       case "ack": {
         requireBoundRepo(conn);
-        const key = clientKey(conn);
-        store.ack(conn.repo, key, frame.cursor);
+        const baseKey = clientKey(conn);
+        const isHook = Boolean(frame.hook);
+        const targetKey = isHook ? `hook:${baseKey}` : baseKey;
+        store.ack(conn.repo, targetKey, frame.cursor);
+        if (!isHook) {
+          store.ack(conn.repo, `hook:${baseKey}`, frame.cursor);
+          store.ack(conn.repo, inboxCursorKey(baseKey, "dm"), frame.cursor);
+          store.ack(conn.repo, inboxCursorKey(baseKey, "repo"), frame.cursor);
+          if (conn.role === "orchestrator") {
+            store.ack(conn.repo, inboxCursorKey(baseKey, "reports"), frame.cursor);
+          }
+        }
         const primary = store.getAgent(conn.repo, conn.name)?.sessionId;
         const multiSession = [...conns].some(
           (peer) =>
@@ -273,8 +283,17 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
         );
         if (!multiSession && primary && !primary.startsWith("zellij:")) {
           const companionBase = conn.declaredSession === primary ? conn.name : `${conn.name}:${primary}`;
-          if (store.cursor(conn.repo, companionBase) < frame.cursor) {
-            store.ack(conn.repo, companionBase, frame.cursor);
+          const companionTarget = isHook ? `hook:${companionBase}` : companionBase;
+          if (store.cursor(conn.repo, companionTarget) < frame.cursor) {
+            store.ack(conn.repo, companionTarget, frame.cursor);
+          }
+          if (!isHook) {
+            store.ack(conn.repo, `hook:${companionBase}`, frame.cursor);
+            store.ack(conn.repo, inboxCursorKey(companionBase, "dm"), frame.cursor);
+            store.ack(conn.repo, inboxCursorKey(companionBase, "repo"), frame.cursor);
+            if (conn.role === "orchestrator") {
+              store.ack(conn.repo, inboxCursorKey(companionBase, "reports"), frame.cursor);
+            }
           }
         }
         clearPendingWakeTarget(conn.repo, conn.name, frame.cursor);
@@ -387,7 +406,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     const rows = await Promise.all(baseRows.map(async (agent) => ({
       ...agent, diagnostics: await diagnostics(agent, probe, ratioCheck),
     })));
-    respond({ type: "who", agents: rows, daemon: daemonInfo });
+    respond({ type: "who", agents: rows, orchestrator: store.getOrchestrator(conn.repo), daemon: daemonInfo });
   }
 
   async function sendDoctor(conn: Conn, frame: Extract<ClientFrame, { type: "doctor" }>, respond: Respond): Promise<void> {
@@ -1092,13 +1111,24 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     topic: string | undefined,
     limit: number | undefined,
     ack: boolean | undefined,
+    isHook: boolean,
     respond: Respond,
   ): void {
     requireBoundRepo(conn);
     if (topic) requireTopic(topic);
     const baseKey = clientKey(conn);
     const key = inboxCursorKey(baseKey, topic);
-    const cursor = since ?? store.cursor(conn.repo, key);
+    const hookKey = `hook:${key}`;
+    const isDefaultIncludedTopic =
+      topic === "dm" ||
+      topic === "repo" ||
+      (conn.role === "orchestrator" && topic === "reports");
+    const storedCursor = isHook
+      ? Math.max(store.cursor(conn.repo, key), store.cursor(conn.repo, hookKey))
+      : isDefaultIncludedTopic
+        ? Math.max(store.cursor(conn.repo, key), store.cursor(conn.repo, baseKey))
+        : store.cursor(conn.repo, key);
+    const cursor = since ?? storedCursor;
     if (since !== undefined && (!Number.isSafeInteger(since) || since < 0)) throw new Error("invalid inbox sequence");
     const pageSize = limit ?? 50;
     if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 200) throw new Error("inbox limit must be 1..200");
@@ -1113,7 +1143,19 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     const shouldAck = ack !== false;
     const next = messages.length ? messages[messages.length - 1]!.seq : cursor;
     if (shouldAck && messages.length) {
-      store.ack(conn.repo, key, next);
+      if (isHook) {
+        store.ack(conn.repo, hookKey, next);
+      } else {
+        store.ack(conn.repo, key, next);
+        store.ack(conn.repo, hookKey, next);
+        if (!topic) {
+          store.ack(conn.repo, inboxCursorKey(baseKey, "dm"), next);
+          store.ack(conn.repo, inboxCursorKey(baseKey, "repo"), next);
+          if (conn.role === "orchestrator") {
+            store.ack(conn.repo, inboxCursorKey(baseKey, "reports"), next);
+          }
+        }
+      }
       const primary = store.getAgent(conn.repo, conn.name)?.sessionId;
       const multiSession = [...conns].some(
         (peer) =>
@@ -1126,8 +1168,25 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       if (!multiSession && primary && !primary.startsWith("zellij:")) {
         const companionBase = conn.declaredSession === primary ? conn.name : `${conn.name}:${primary}`;
         const companionKey = inboxCursorKey(companionBase, topic);
-        if (store.cursor(conn.repo, companionKey) < next) {
-          store.ack(conn.repo, companionKey, next);
+        const companionHookKey = `hook:${companionKey}`;
+        if (isHook) {
+          if (store.cursor(conn.repo, companionHookKey) < next) {
+            store.ack(conn.repo, companionHookKey, next);
+          }
+        } else {
+          if (store.cursor(conn.repo, companionKey) < next) {
+            store.ack(conn.repo, companionKey, next);
+          }
+          if (store.cursor(conn.repo, companionHookKey) < next) {
+            store.ack(conn.repo, companionHookKey, next);
+          }
+          if (!topic) {
+            store.ack(conn.repo, inboxCursorKey(companionBase, "dm"), next);
+            store.ack(conn.repo, inboxCursorKey(companionBase, "repo"), next);
+            if (conn.role === "orchestrator") {
+              store.ack(conn.repo, inboxCursorKey(companionBase, "reports"), next);
+            }
+          }
         }
       }
       clearPendingWakeTarget(conn.repo, conn.name, next);
@@ -1135,12 +1194,17 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
       if (primary) clearPendingWakeTarget(conn.repo, primary, next);
     }
     store.touchAgent(conn.repo, conn.name, undefined, conn.sessionId);
-    const updatedCursor = shouldAck ? store.cursor(conn.repo, key) : next;
+    const effectiveCursor = isHook
+      ? Math.max(store.cursor(conn.repo, key), store.cursor(conn.repo, hookKey))
+      : isDefaultIncludedTopic && since === undefined
+        ? Math.max(store.cursor(conn.repo, key), store.cursor(conn.repo, baseKey))
+        : store.cursor(conn.repo, key);
+    const updatedCursor = shouldAck ? effectiveCursor : next;
     const pendingAsk = store.unansweredAsk(conn.repo, conn.name, updatedCursor, 0, conn.sessionId);
     respond({
       type: "inbox",
       messages,
-      cursor: store.cursor(conn.repo, key),
+      cursor: effectiveCursor,
       more: messages.length === pageSize,
       pendingAsk,
     });
@@ -1518,6 +1582,7 @@ export async function startDaemon(options: DaemonOptions): Promise<DaemonHandle>
     }
     for (const cKey of cursorKeys) {
       if (store.cursor(repo, cKey) >= message.seq) return false;
+      if (store.cursor(repo, `hook:${cKey}`) >= message.seq) return false;
       if (store.cursor(repo, inboxCursorKey(cKey, message.topic)) >= message.seq) return false;
     }
     return true;
